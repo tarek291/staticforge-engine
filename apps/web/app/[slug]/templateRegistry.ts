@@ -7,8 +7,10 @@ import { LuxuryLandingView } from "./LuxuryLandingView";
 export type TemplateView = (props: { page: GeneratedPage }) => ReactElement;
 
 /**
- * Maps a page-level `templateId` to its presentation view. Currently a single
- * `"default"` entry; unknown ids fall back to the default view.
+ * Route-local registry mapping a page-level `templateId` to its presentation
+ * view. Registered templates are `default` and `luxuryLanding`; an unknown
+ * `templateId` throws a clear error (see {@link getTemplateView}). The
+ * generator only emits `templateId` strings and stays registry-agnostic.
  */
 const TEMPLATE_REGISTRY: Record<string, TemplateView> = {
   default: GeneratedPageView,
