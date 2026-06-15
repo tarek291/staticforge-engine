@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   GeneratedPageSchema,
   type GeneratedPage,
+  type Manifest,
 } from "@staticforge/schemas";
 import { ValidationError, type ValidationIssue } from "./errors.js";
 
@@ -30,20 +31,6 @@ function mapPageIssues(error: z.ZodError, slug: string): ValidationIssue[] {
     path: formatPath(issue.path, `pages[${slug}]`),
     message: issue.message,
   }));
-}
-
-/** A single entry in the output manifest. */
-interface ManifestEntry {
-  slug: string;
-  locale: string;
-  title: string;
-  metaDescription: string;
-}
-
-/** Top-level shape of `manifest.json`. */
-interface Manifest {
-  count: number;
-  pages: ManifestEntry[];
 }
 
 /**
