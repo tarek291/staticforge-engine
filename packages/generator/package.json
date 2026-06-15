@@ -10,6 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/build-pages.test.ts",
     "validate:input": "tsx src/validate-input.cli.ts",
     "preview:pages": "tsx src/preview-pages.cli.ts",
     "generate": "tsx src/generate-pages.cli.ts --locale de"
