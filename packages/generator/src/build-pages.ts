@@ -17,8 +17,7 @@ import type { BuildPagesOptions, ValidatedInputData } from "./types.js";
 
 /**
  * Values available to template placeholders. The keys mirror exactly the
- * placeholders currently present in the content templates: `{{service}}`,
- * `{{city}}`, `{{business}}`. No other placeholders are supported.
+ * supported placeholders: `{{service}}`, `{{city}}`, `{{business}}`.
  */
 interface InterpolationValues {
   service: string;
@@ -26,20 +25,72 @@ interface InterpolationValues {
   business: string;
 }
 
+/** The only placeholder names supported in interpolated content fields. */
+const PLACEHOLDER_KEYS = ["service", "city", "business"] as const;
+type PlaceholderKey = (typeof PLACEHOLDER_KEYS)[number];
+
+function isPlaceholderKey(key: string): key is PlaceholderKey {
+  return (PLACEHOLDER_KEYS as readonly string[]).includes(key);
+}
+
 /** Matches `{{ key }}` placeholders (optional surrounding whitespace). */
 const PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 
 /**
  * Replace `{{key}}` placeholders in a template using the supplied values.
- * Only known keys are substituted; any unknown placeholder is left untouched.
+ * Only known keys are substituted; unknown placeholders are left untouched
+ * (they are rejected separately by {@link collectUnknownPlaceholders}).
  * Pure — does not mutate inputs.
  */
 function interpolate(template: string, values: InterpolationValues): string {
-  return template.replace(PLACEHOLDER_PATTERN, (match, key: string) => {
-    if (key === "service" || key === "city" || key === "business") {
-      return values[key];
+  return template.replace(PLACEHOLDER_PATTERN, (match, key: string) =>
+    isPlaceholderKey(key) ? values[key] : match,
+  );
+}
+
+/**
+ * Collect a {@link ValidationIssue} for every unknown `{{placeholder}}` in a
+ * single interpolated template field. Known placeholders are ignored.
+ */
+function collectUnknownPlaceholders(
+  template: string,
+  path: string,
+  issues: ValidationIssue[],
+): void {
+  for (const match of template.matchAll(PLACEHOLDER_PATTERN)) {
+    const key = match[1];
+    if (key !== undefined && !isPlaceholderKey(key)) {
+      issues.push({
+        path,
+        message: `Unknown placeholder "{{${key}}}" in ${path}. Supported placeholders: ${PLACEHOLDER_KEYS.join(", ")}.`,
+      });
     }
-    return match;
+  }
+}
+
+/**
+ * Validate placeholders in the *interpolated* content fields only — hero
+ * title/subtitle and each FAQ question/answer. Non-interpolated fields (CTA,
+ * sections) are intentionally not scanned. The content template is shared, so
+ * this is checked once rather than per generated page.
+ */
+function collectContentPlaceholderIssues(
+  content: ValidatedInputData["content"],
+  issues: ValidationIssue[],
+): void {
+  collectUnknownPlaceholders(
+    content.hero.titleTemplate,
+    "content.hero.titleTemplate",
+    issues,
+  );
+  collectUnknownPlaceholders(
+    content.hero.subtitleTemplate,
+    "content.hero.subtitleTemplate",
+    issues,
+  );
+  content.faqs.forEach((faq, index) => {
+    collectUnknownPlaceholders(faq.q, `content.faqs[${index}].q`, issues);
+    collectUnknownPlaceholders(faq.a, `content.faqs[${index}].a`, issues);
   });
 }
 
@@ -200,6 +251,9 @@ export function buildPages(
   const pages: GeneratedPage[] = [];
   const issues: ValidationIssue[] = [];
   const seenSlugs = new Set<string>();
+
+  // Reject unknown placeholders in interpolated content fields up front.
+  collectContentPlaceholderIssues(input.content, issues);
 
   for (const business of input.businesses) {
     const eligibleServices = selectEligible(

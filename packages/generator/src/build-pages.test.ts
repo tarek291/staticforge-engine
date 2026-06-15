@@ -199,3 +199,95 @@ test("eligibility: unknown locationIds throws ValidationError", () => {
     },
   );
 });
+
+// --- Placeholder validation (interpolated content fields only) ---
+
+function contentInput(contentOverride: StaticContentTemplate): ValidatedInputData {
+  return {
+    businesses: [business],
+    services: [svcA],
+    locations: [locA],
+    content: contentOverride,
+  };
+}
+
+test("placeholders: unknown placeholder in hero.titleTemplate throws", () => {
+  const bad: StaticContentTemplate = {
+    ...content,
+    hero: { ...content.hero, titleTemplate: "{{region}} in {{city}}" },
+  };
+  assert.throws(
+    () => buildPages(contentInput(bad), { locale: "en" }),
+    (error: unknown) => {
+      assert.ok(error instanceof ValidationError);
+      assert.ok(
+        error.issues.some(
+          (issue) =>
+            issue.path === "content.hero.titleTemplate" &&
+            issue.message.includes('Unknown placeholder "{{region}}"'),
+        ),
+        "expected an unknown-placeholder issue on titleTemplate",
+      );
+      return true;
+    },
+  );
+});
+
+test("placeholders: unknown placeholder in hero.subtitleTemplate throws", () => {
+  const bad: StaticContentTemplate = {
+    ...content,
+    hero: { ...content.hero, subtitleTemplate: "About {{unknown}}." },
+  };
+  assert.throws(
+    () => buildPages(contentInput(bad), { locale: "en" }),
+    (error: unknown) => {
+      assert.ok(error instanceof ValidationError);
+      assert.ok(
+        error.issues.some(
+          (issue) =>
+            issue.path === "content.hero.subtitleTemplate" &&
+            issue.message.includes('Unknown placeholder "{{unknown}}"'),
+        ),
+        "expected an unknown-placeholder issue on subtitleTemplate",
+      );
+      return true;
+    },
+  );
+});
+
+test("placeholders: unknown placeholder in a FAQ question or answer throws", () => {
+  const bad: StaticContentTemplate = {
+    ...content,
+    faqs: [
+      { q: "What about {{region}}?", a: "A1" },
+      { q: "Q2", a: "A2" },
+      { q: "Q3", a: "A3" },
+    ],
+  };
+  assert.throws(
+    () => buildPages(contentInput(bad), { locale: "en" }),
+    (error: unknown) => {
+      assert.ok(error instanceof ValidationError);
+      assert.ok(
+        error.issues.some(
+          (issue) =>
+            issue.path === "content.faqs[0].q" &&
+            issue.message.includes('Unknown placeholder "{{region}}"'),
+        ),
+        "expected an unknown-placeholder issue on a FAQ field",
+      );
+      return true;
+    },
+  );
+});
+
+test("placeholders: valid placeholders interpolate without residual tokens", () => {
+  const pages = buildPages(contentInput(content), { locale: "en" });
+  assert.equal(pages.length, 1);
+  const [page] = pages;
+  assert.ok(page);
+  assert.ok(!page.title.includes("{{"));
+  assert.ok(!page.h1.includes("{{"));
+  assert.ok(!page.metaDescription.includes("{{"));
+  assert.ok(!page.content.hero.subheading?.includes("{{"));
+});
