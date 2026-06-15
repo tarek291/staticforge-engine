@@ -513,3 +513,45 @@ last validation gap (generated pages were already validated per file).
 > **Step 18B added shared manifest validation; Step 18C proved it via a reversible
 > negative test.** No manifest-structure, generator-output, route, sample-data, or
 > template/rendering changes; German content remains demo data only.
+
+---
+
+## Template preview route
+
+A static preview route lets any generated page be viewed through any registered
+template, without touching the canonical site.
+
+- **Route:** `/preview/[template]/[slug]`
+- **Examples:**
+  - `/preview/default/bueroreinigung-duisburg`
+  - `/preview/luxuryLanding/bueroreinigung-duisburg`
+- **Registered templates:** `default`, `luxuryLanding`.
+
+### Static behavior
+
+- `generateStaticParams` combines the registered template ids (`getTemplateIds()`)
+  with the generated slugs — current sample → **18 preview pages** (2 × 9).
+- `dynamicParams = false`: only those enumerated combinations exist; any other
+  template/slug 404s.
+- Canonical `/` and `/[slug]` routes are unchanged.
+
+### Safety
+
+- Server-only (no `"use client"`), reusing the existing output helpers.
+- Preview pages are `noindex` (`robots: { index: false, follow: false }`).
+- Rendering **ignores the page's own `templateId`** and uses the template from
+  the URL — that's the point of the preview.
+- No sample-data, generated-output, schema, manifest, or template-component
+  changes; the only registry change is an additive `getTemplateIds()` export.
+
+### Out of scope
+
+- Visual polish of `LuxuryLandingView`
+- Navigation links to the preview route
+- Changing canonical pages
+- Adding more templates or extracting a `templates` package
+- Multi-business routing changes
+
+> **Step 21B added a static, additive template preview route** — it makes the
+> registry's templates viewable in real builds while leaving canonical output and
+> sample data untouched.

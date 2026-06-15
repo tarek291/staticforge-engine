@@ -37,3 +37,8 @@ export function getTemplateView(templateId: string): TemplateView {
   }
   return view;
 }
+
+/** List every registered template id (e.g. for enumerating preview routes). */
+export function getTemplateIds(): string[] {
+  return Object.keys(TEMPLATE_REGISTRY);
+}
