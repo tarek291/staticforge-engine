@@ -360,3 +360,23 @@ content-level default.
 
 > **Step 13B was a zero-visible-behavior-change capability step** — it added
 > optional per-service template selection while keeping output identical.
+
+---
+
+## Service-level template activation smoke test (reversible)
+
+A temporary verification confirmed service-level `templateId` resolution:
+
+- **Test:** temporarily activated `luxuryLanding` on service `svc-bueroreinigung`.
+- **Result:** exactly 3 pages (`bueroreinigung-duisburg`, `bueroreinigung-essen`,
+  `bueroreinigung-dusseldorf`) switched to `luxuryLanding`, while the other 6
+  pages stayed `"default"`.
+- **Conclusion:** granular per-service selection works; the active precedence is
+  `service.templateId → content.templateId → "default"`.
+- **Reverted:** the change was fully undone. `luxuryLanding` remains available but
+  inactive, and the canonical sample state stays `templateId: "default"`. Slugs,
+  routes, manifest structure, sample data, renderer files, and registry behavior
+  are unchanged.
+
+> **Step 14A was a reversible verification step** — it proved per-service
+> activation works, then restored the default-template state (net-zero change).
