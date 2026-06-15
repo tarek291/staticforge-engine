@@ -194,20 +194,25 @@ language-agnostic — no language is hardcoded in either file.
 
 ---
 
-## Template registry (default-only)
+## Template registry
 
-A minimal, route-local registry now resolves which view renders a page:
+A minimal, route-local registry resolves which view renders a page.
+
+> This section originally introduced a **default-only** registry; it has since
+> been superseded by an additional template and strict unknown-template handling
+> (see “Strict unknown-template handling” below).
 
 - **Location:** `apps/web/app/[slug]/templateRegistry.ts` — strictly route-local,
   server-only, pure (no JSX, no `"use client"`).
-- **Mapping:** currently `templateId: "default"` → `GeneratedPageView`.
+- **Mapping:** `default` → `GeneratedPageView`; `luxuryLanding` → `LuxuryLandingView`.
 - **Dispatch:** `page.tsx` still owns all framework concerns
   (`dynamicParams`, `generateStaticParams`, `generateMetadata`, data lookup,
-  `notFound()`), and now resolves the view dynamically via
+  `notFound()`), and resolves the view dynamically via
   `getTemplateView(page.templateId)`.
-- **Exclusive view:** `GeneratedPageView` remains the only presentation layout.
-- **Safe fallback:** any unknown / unmapped `templateId` falls back to
-  `GeneratedPageView`.
+- **Default view:** `GeneratedPageView` renders all current pages
+  (`templateId: "default"`); `LuxuryLandingView` is registered but inactive.
+- **Strict resolution:** an unknown / unregistered `templateId` now **throws** a
+  clear error rather than silently falling back.
 
 ### Registry guardrails
 

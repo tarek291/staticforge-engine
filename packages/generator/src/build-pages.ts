@@ -143,9 +143,12 @@ function assemblePage(
 }
 
 /**
- * Build one {@link GeneratedPage} for every business × service × location
- * combination, in memory. With the current sample input (1 business, 3
- * services, 3 locations) this produces 9 pages.
+ * Build pages in memory — one {@link GeneratedPage} per *eligible*
+ * business × service × location combination. A business with no eligibility
+ * fields covers all services and locations; its optional `serviceIds` /
+ * `locationIds` narrow the eligible set. Duplicate slugs across combinations
+ * are rejected. With the current sample input (1 business, 3 services, 3
+ * locations, no eligibility fields) this produces 9 pages.
  *
  * Page text is derived entirely from the content template and entity data —
  * no language is hardcoded. Every page is validated against
