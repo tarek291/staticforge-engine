@@ -1,0 +1,330 @@
+# StaticForge Engine
+
+A schema-driven static site generation engine, organized as a pnpm monorepo.
+
+> **Status:** 🟢 MVP — end-to-end pipeline working: structured data → validated pages → static HTML routes.
+
+---
+
+## Overview
+
+StaticForge Engine takes structured input data, validates it against shared schemas,
+and generates static sites from templates. The pipeline is split into focused
+packages so each concern (validation, core logic, generation, templating, AI) can
+evolve independently.
+
+---
+
+## Workspace layout
+
+```txt
+staticforge-engine/
+├─ apps/
+│  └─ web/              # Next.js front-end / preview app
+├─ packages/
+│  ├─ schemas/          # Shared data schemas & validation
+│  ├─ core/             # Core engine logic
+│  ├─ generator/        # Static site generation pipeline
+│  ├─ templates/        # Site templates
+│  └─ ai/               # AI-assisted generation helpers
+├─ data/
+│  ├─ input/            # Source input data
+│  └─ output/           # Generated site output (git-ignored)
+├─ package.json         # Root workspace manifest
+├─ pnpm-workspace.yaml  # pnpm workspace globs
+└─ tsconfig.json        # Base TypeScript config (strict) to extend
+```
+
+---
+
+## Tooling
+
+- **Package manager:** pnpm (workspaces)
+- **Language:** TypeScript (strict mode)
+- **Node:** >= 20
+
+---
+
+## Getting started
+
+```bash
+# from the staticforge-engine/ directory
+pnpm install
+```
+
+> pnpm is provided via Corepack on this machine. If the global `pnpm` shim is
+> unavailable, prefix commands with `corepack`, e.g. `corepack pnpm install`.
+
+---
+
+## Conventions
+
+- Each package extends the root [`tsconfig.json`](tsconfig.json) and enables strict mode.
+- Generated output lives in `data/output/` and is never committed.
+
+---
+
+## MVP checkpoint
+
+### Current status
+
+- ✅ Generator pipeline works (load → validate → build → save).
+- ✅ Output files are written to `data/output/`.
+- ✅ The Next.js app reads `manifest.json` at build time.
+- ✅ 9 generated static routes build into production-ready static HTML.
+
+### Commands
+
+```bash
+corepack pnpm install     # install workspace dependencies
+corepack pnpm generate    # run the generator pipeline → data/output/
+corepack pnpm dev:web     # start the Next.js dev server
+corepack pnpm build:web   # build the static site
+corepack pnpm verify      # generate + typecheck (generator & web) + build
+```
+
+### Generated output structure
+
+```txt
+data/output/
+├─ manifest.json          # summary index of all generated pages
+└─ pages/
+   └─ {slug}.json         # one validated page per file
+```
+
+### Example verified static routes
+
+- `/` — home (reads the manifest, lists sample slugs)
+- `/bueroreinigung-duisburg`
+- `/grundreinigung-essen`
+
+### Scope & architecture reminders
+
+- **Language-agnostic:** the German sample data is strictly demo content. The
+  engine itself hardcodes no language — all page text comes from the input data
+  and content templates.
+- **Out of scope at this step:** AI, dashboard, auth, database, Stripe, and
+  deploy logic are intentionally not part of the current MVP.
+
+---
+
+## Generated page rendering coverage
+
+The generated slug page (`apps/web/app/[slug]/page.tsx`) maps validated page
+fields to the rendered output as follows:
+
+| Source field | Rendered as |
+|---|---|
+| `page.title`, `page.metaDescription` | Next.js `generateMetadata` (`<title>` / `<meta name="description">`) |
+| `page.h1` | visible `<h1>` |
+| `page.content.hero.subheading` | visible intro paragraph (falls back to `page.metaDescription`) |
+| `page.content.sections[]` | visible content sections |
+| `page.content.faq[]` | visible FAQ block |
+| `page.content.cta` | visible CTA block |
+| `page.schemaOrg` | server-rendered JSON-LD `<script type="application/ld+json">` |
+| `page.locale` | `lang` attribute on the slug page container element |
+
+### Intentionally deferred
+
+These are recognized and deferred to keep the current step minimal:
+
+- Root `<html>` `lang` tag handling (in `app/layout.tsx`)
+- Locale routing via dynamic path segments
+- OpenGraph / canonical / alternates SEO tags
+- `content.hero.image` rendering layer
+- `content.hero.heading` rendering (H1 currently uses `page.h1`)
+- `templates` package isolation
+- `ai` package implementation
+- Database / auth / dashboard / Stripe / deployment configuration
+
+---
+
+## Route / view separation
+
+The generated slug page is split into two co-located files with distinct
+responsibilities:
+
+- **`apps/web/app/[slug]/page.tsx`** — owns route-level concerns only:
+  - `dynamicParams = false`
+  - `generateStaticParams`
+  - `generateMetadata`
+  - slug / page lookup
+  - `notFound()` handling
+
+  After loading and null-checking the page, it renders
+  `<GeneratedPageView page={page} />`.
+
+- **`apps/web/app/[slug]/GeneratedPageView.tsx`** — owns presentation only. It
+  receives an already-validated `GeneratedPage` object as a prop and renders
+  JSX. It does **not** fetch data, read files, access route params, call
+  `notFound()`, import `next/navigation`, or use any client-side behavior (no
+  `"use client"`).
+
+This is a plain Server Component split, **not** a `templates` package yet. The
+view renders purely from the injected data, so the separation keeps the project
+language-agnostic — no language is hardcoded in either file.
+
+---
+
+## Template readiness: `templateId`
+
+`templateId` is now officially part of the generated page payload data contract
+(`GeneratedPageSchema`), defined as `z.string().min(1).default("default")`.
+
+- **Contract:** every generated page carries a page-level `templateId`.
+- **Current value:** strictly `"default"` for all generated pages.
+- **Language-agnostic:** `templateId` is a generic identifier, fully decoupled
+  from the German demo content.
+- **Slug-blind:** `templateId` is never used in or derived from route slugs.
+- **Not yet rendered:** the frontend does not read or match `templateId`;
+  `GeneratedPageView` remains the exclusive presentation view layer.
+- **Backward compatible:** the `.default("default")` chain means older payloads
+  without the field still validate.
+
+> **Step 7B was a pure, zero-visible-behavior-change architectural preparation
+> checkpoint** — it only introduced the identifier in the data contract.
+
+### Intentionally deferred
+
+- A centralized template component registry
+- A frontend template rendering switch / dispatch layer
+- Multiple distinct visual template components (e.g. a Dark Luxury landing page)
+- A standalone dynamic `templates` package workspace
+- Input-level `templateId` overrides and `templateId` exposure in the manifest
+
+---
+
+## Template registry (default-only)
+
+A minimal, route-local registry now resolves which view renders a page:
+
+- **Location:** `apps/web/app/[slug]/templateRegistry.ts` — strictly route-local,
+  server-only, pure (no JSX, no `"use client"`).
+- **Mapping:** currently `templateId: "default"` → `GeneratedPageView`.
+- **Dispatch:** `page.tsx` still owns all framework concerns
+  (`dynamicParams`, `generateStaticParams`, `generateMetadata`, data lookup,
+  `notFound()`), and now resolves the view dynamically via
+  `getTemplateView(page.templateId)`.
+- **Exclusive view:** `GeneratedPageView` remains the only presentation layout.
+- **Safe fallback:** any unknown / unmapped `templateId` falls back to
+  `GeneratedPageView`.
+
+### Registry guardrails
+
+The registry is intentionally inert — it must never:
+
+- fetch data or call any API
+- perform file-system I/O
+- inspect dynamic route params
+- run framework methods like `notFound()`
+- import routing modules like `next/navigation`
+- include client component hooks or any hydration footprint
+
+### Intentionally deferred
+
+- Multiple distinct visual template UIs (e.g. a high-ticket Dark Luxury layout)
+- Moving the registry into a standalone `templates` workspace package
+- Template-specific variations inside the core validation schemas
+- Input-source template descriptor overrides
+- Tracking `templateId` directly in `manifest.json`
+- A stricter error / `notFound()` policy for unknown template requests
+
+> **Step 8B was a pure, zero-visible-behavior-change architectural decoupling
+> step** — all pages use `templateId: "default"`, so rendering is unchanged.
+
+---
+
+## Optional input-level `templateId` override
+
+The input content config (`data/input/content.json`) may **optionally** declare a
+top-level `templateId` to select which template renders the generated pages.
+
+- **Optional:** if `templateId` is absent, the generator resolves it to
+  `"default"` (`content.templateId ?? "default"`).
+- **Non-empty:** validation uses `z.string().min(1).optional()`, so a present
+  but empty string is rejected.
+- **Sample data unchanged:** the current input intentionally omits `templateId`,
+  so generated output still uses `"templateId": "default"`.
+- **Language-agnostic:** `templateId` selects a rendering shape only — it is not
+  tied to the German demo content, locale, service, location, or city.
+- **Slug-blind:** `templateId` is never used in route slugs.
+- **Render path:** the web registry still maps `"default"` → `GeneratedPageView`.
+
+### Intentionally deferred
+
+- Adding a second visual template
+- Adding template-specific input examples
+- Exposing `templateId` in `manifest.json`
+- Stricter unknown-template handling
+- A standalone `templates` package
+- AI-driven template selection
+
+> **Step 9B was a zero-visible-behavior-change input-contract step** — it only
+> made `templateId` an accepted optional input, defaulting to `"default"`.
+
+---
+
+## Inactive alternate template: `luxuryLanding`
+
+A first alternate template now exists, registered but not yet used:
+
+- **Component:** `apps/web/app/[slug]/LuxuryLandingView.tsx` — a route-local
+  Server Component rendered purely from page data.
+- **Registered:** the registry maps `"default"` → `GeneratedPageView` and
+  `"luxuryLanding"` → `LuxuryLandingView`.
+- **Inactive:** all generated pages still use `templateId: "default"`, so current
+  routes continue to render through `GeneratedPageView`.
+- **Capable:** the registry can now resolve a non-default template if future
+  input data opts into it via the optional `templateId` override.
+- **Language-agnostic:** `luxuryLanding` names a rendering shape only — it is not
+  tied to the German demo content.
+
+### Guardrails
+
+- No `templates` package yet — the component stays route-local
+- No client components (pure Server Component, no `"use client"`)
+- No sample-data activation — input is unchanged
+- No route, slug, or manifest changes
+- No visible behavior change for current pages
+
+### Intentionally deferred
+
+- Activating `luxuryLanding` through input data
+- Comparing visual output between templates
+- Adding more templates
+- Moving templates into a shared package
+- Stricter unknown-template handling
+- Template-specific content contracts
+
+> **Step 10B was a zero-visible-behavior-change step** — it added an inactive
+> alternate template and registered it, leaving current rendering untouched.
+
+---
+
+## Template activation smoke test (reversible)
+
+A temporary smoke test verified the end-to-end template activation path:
+
+- **What was tested:** `templateId: "luxuryLanding"` was added to
+  `data/input/content.json`, then regenerated and rebuilt.
+- **Path proven:** input `content.templateId` → generator output `templateId`
+  → web registry → `LuxuryLandingView`.
+- **Scope during activation:** all 9 pages switched, because `content.json` is a
+  single shared content object (one `templateId` applies to every page).
+- **Reverted:** the field was removed afterwards. The canonical sample state
+  remains `templateId: "default"`, and current pages render through
+  `GeneratedPageView`.
+
+No permanent non-default activation is committed. `luxuryLanding` remains
+available but inactive by default.
+
+### Intentionally deferred
+
+- A permanent non-default sample dataset
+- Per-page / per-service template selection
+- Visual comparison tooling
+- A standalone `templates` package
+- A stricter unknown-template policy
+
+> **Step 11B was a reversible verification step** — it proved activation works
+> end-to-end, then restored the default-template state (net-zero change).

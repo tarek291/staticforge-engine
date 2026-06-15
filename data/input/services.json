@@ -1,0 +1,45 @@
+[
+  {
+    "id": "svc-bueroreinigung",
+    "name": "Büroreinigung",
+    "slug": "bueroreinigung",
+    "description": "Unsere professionelle Büroreinigung sorgt für ein hygienisches und gepflegtes Arbeitsumfeld. Wir reinigen Schreibtische, Böden, Sanitäranlagen und Gemeinschaftsräume zuverlässig nach Ihrem individuellen Zeitplan – auch außerhalb der Geschäftszeiten.",
+    "benefits": [
+      "Flexible Reinigung außerhalb der Arbeitszeiten",
+      "Geschultes und festes Reinigungspersonal",
+      "Umweltfreundliche Reinigungsmittel"
+    ],
+    "pricing": {
+      "from": 25,
+      "to": 45,
+      "currency": "EUR"
+    }
+  },
+  {
+    "id": "svc-grundreinigung",
+    "name": "Grundreinigung",
+    "slug": "grundreinigung",
+    "description": "Die Grundreinigung entfernt hartnäckigen Schmutz, der sich über die Zeit angesammelt hat. Wir behandeln Böden, Fugen und schwer zugängliche Bereiche intensiv und bringen Ihre Räume wieder in einen makellosen Zustand.",
+    "benefits": [
+      "Tiefenreinigung auch schwer zugänglicher Bereiche",
+      "Geeignet für Umzug, Renovierung und Saisonstart",
+      "Sichtbar bessere Ergebnisse als bei der Unterhaltsreinigung"
+    ],
+    "pricing": {
+      "from": 35,
+      "to": 60,
+      "currency": "EUR"
+    }
+  },
+  {
+    "id": "svc-treppenhausreinigung",
+    "name": "Treppenhausreinigung",
+    "slug": "treppenhausreinigung",
+    "description": "Mit unserer regelmäßigen Treppenhausreinigung bleibt der gemeinschaftliche Eingangsbereich Ihres Wohn- oder Geschäftshauses stets sauber. Wir wischen Stufen, Geländer und Briefkastenanlagen nach einem festen, verlässlichen Turnus.",
+    "benefits": [
+      "Feste wöchentliche oder monatliche Intervalle",
+      "Pflege von Treppen, Geländern und Eingangsbereich",
+      "Ideal für Hausverwaltungen und Eigentümergemeinschaften"
+    ]
+  }
+]

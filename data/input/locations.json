@@ -1,0 +1,35 @@
+[
+  {
+    "id": "loc-duisburg",
+    "city": "Duisburg",
+    "state": "Nordrhein-Westfalen",
+    "country": "DE",
+    "postalCode": "47051",
+    "coordinates": {
+      "lat": 51.4344,
+      "lng": 6.7623
+    }
+  },
+  {
+    "id": "loc-essen",
+    "city": "Essen",
+    "state": "Nordrhein-Westfalen",
+    "country": "DE",
+    "postalCode": "45127",
+    "coordinates": {
+      "lat": 51.4556,
+      "lng": 7.0116
+    }
+  },
+  {
+    "id": "loc-duesseldorf",
+    "city": "Düsseldorf",
+    "state": "Nordrhein-Westfalen",
+    "country": "DE",
+    "postalCode": "40213",
+    "coordinates": {
+      "lat": 51.2277,
+      "lng": 6.7735
+    }
+  }
+]

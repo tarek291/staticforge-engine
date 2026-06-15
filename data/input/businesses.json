@@ -1,0 +1,19 @@
+[
+  {
+    "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "name": "GlanzFix Reinigungsservice",
+    "slug": "glanzfix-reinigungsservice",
+    "niche": "cleaning",
+    "description": "GlanzFix Reinigungsservice steht für gründliche und zuverlässige Gebäudereinigung im gesamten Ruhrgebiet. Vom Büro über die Grundreinigung bis zum Treppenhaus sorgen unsere geschulten Teams für makellose Sauberkeit – pünktlich, diskret und mit umweltfreundlichen Reinigungsmitteln.",
+    "foundedYear": 2014,
+    "contactEmail": "kontakt@glanzfix.de",
+    "contactPhone": "+49 203 1234567",
+    "address": {
+      "street": "Königstraße 12",
+      "city": "Duisburg",
+      "state": "Nordrhein-Westfalen",
+      "postalCode": "47051",
+      "country": "DE"
+    }
+  }
+]

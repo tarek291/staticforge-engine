@@ -1,0 +1,23 @@
+{
+  "name": "staticforge-engine",
+  "version": "0.0.0",
+  "private": true,
+  "description": "StaticForge Engine — schema-driven static site generation monorepo.",
+  "packageManager": "pnpm@11.6.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "echo \"No build configured yet\" && exit 0",
+    "typecheck": "echo \"No packages to typecheck yet\" && exit 0",
+    "generate": "corepack pnpm --filter @staticforge/generator generate",
+    "dev:web": "corepack pnpm --filter @staticforge/web dev",
+    "build:web": "corepack pnpm --filter @staticforge/web build",
+    "typecheck:web": "corepack pnpm --filter @staticforge/web typecheck",
+    "verify": "corepack pnpm generate && corepack pnpm --filter @staticforge/generator typecheck && corepack pnpm --filter @staticforge/web typecheck && corepack pnpm --filter @staticforge/web build"
+  }
+}

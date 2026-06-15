@@ -1,0 +1,28 @@
+{
+  "hero": {
+    "titleTemplate": "{{service}} in {{city}} – {{business}}",
+    "subtitleTemplate": "Professionelle {{service}} für Privat- und Geschäftskunden in {{city}} und Umgebung – zuverlässig, gründlich und fair."
+  },
+  "cta": {
+    "primary": "Kostenloses Angebot anfordern",
+    "secondary": "Jetzt anrufen"
+  },
+  "faqs": [
+    {
+      "q": "Wie schnell ist ein Termin möglich?",
+      "a": "In der Regel können wir innerhalb weniger Tage einen passenden Termin in Ihrer Stadt anbieten."
+    },
+    {
+      "q": "Sind die verwendeten Reinigungsmittel umweltfreundlich?",
+      "a": "Ja, wir setzen ausschließlich auf umweltschonende und zertifizierte Reinigungsmittel."
+    },
+    {
+      "q": "Erhalte ich ein verbindliches Festpreisangebot?",
+      "a": "Nach einer kurzen Bestandsaufnahme erstellen wir Ihnen ein transparentes und verbindliches Angebot ohne versteckte Kosten."
+    },
+    {
+      "q": "Ist Ihr Reinigungspersonal versichert?",
+      "a": "Alle Mitarbeiterinnen und Mitarbeiter sind fest angestellt, geschult und vollständig versichert."
+    }
+  ]
+}
