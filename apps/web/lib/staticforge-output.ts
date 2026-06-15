@@ -1,20 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { GeneratedPageSchema, type GeneratedPage } from "@staticforge/schemas";
-
-/** A single entry in the generator's output manifest. */
-export interface OutputManifestEntry {
-  slug: string;
-  locale: string;
-  title: string;
-  metaDescription: string;
-}
-
-/** Shape of `data/output/manifest.json` produced by @staticforge/generator. */
-export interface OutputManifest {
-  count: number;
-  pages: OutputManifestEntry[];
-}
+import {
+  GeneratedPageSchema,
+  ManifestSchema,
+  type GeneratedPage,
+  type Manifest,
+} from "@staticforge/schemas";
 
 /** Narrow an unknown error to a Node system error carrying a `code`. */
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
@@ -43,8 +34,9 @@ function resolveOutputDir(): string {
  * neutral fallback. Other read/parse errors are propagated.
  *
  * @returns The parsed manifest, or `null` if it is missing.
+ * @throws {Error} If the manifest exists but fails schema validation.
  */
-export async function getOutputManifest(): Promise<OutputManifest | null> {
+export async function getOutputManifest(): Promise<Manifest | null> {
   const manifestPath = join(resolveOutputDir(), "manifest.json");
 
   let raw: string;
@@ -57,7 +49,14 @@ export async function getOutputManifest(): Promise<OutputManifest | null> {
     throw error;
   }
 
-  return JSON.parse(raw) as OutputManifest;
+  const parsed = ManifestSchema.safeParse(JSON.parse(raw));
+  if (!parsed.success) {
+    const summary = parsed.error.issues
+      .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+      .join("; ");
+    throw new Error(`Invalid manifest.json: ${summary}`);
+  }
+  return parsed.data;
 }
 
 /**

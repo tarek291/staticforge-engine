@@ -476,3 +476,35 @@ generator no longer assumes the full cartesian product applies to every business
 > **Step 17B added optional business-level eligibility; Step 17C proved it via a
 > reversible smoke test.** No route, manifest-structure, web-renderer, or template
 > changes; no language-specific coupling — German content remains demo data only.
+
+---
+
+## Manifest validation
+
+`manifest.json` is now runtime-validated when the web app reads it, closing the
+last validation gap (generated pages were already validated per file).
+
+- **Shared schema:** `ManifestSchema` lives in `packages/schemas`.
+  `ManifestEntrySchema` is derived from `GeneratedPageSchema` (picking `slug`,
+  `locale`, `title`, `metaDescription`) so entry shapes — including `locale` —
+  stay aligned with generated pages.
+- **Constraints:** `count` is a non-negative integer, `pages` is an array of
+  entries, and `count` must equal `pages.length`.
+- **Web validation:** `apps/web/lib/staticforge-output.ts` runs
+  `ManifestSchema.safeParse` after reading `data/output/manifest.json`. A missing
+  manifest still returns `null` (unchanged); a **present but malformed** manifest
+  now fails loudly with a clear `Invalid manifest.json: …` error. Valid manifests
+  behave exactly as before.
+
+### Negative smoke test (reversible)
+
+- The valid manifest had `count: 9` / `pages.length: 9`.
+- `count` was temporarily changed to `999` (valid JSON, schema-invalid).
+- `corepack pnpm build:web` **failed** with
+  `Invalid manifest.json: count: count (999) does not match pages.length (9)`.
+- Output was regenerated to restore the manifest, and full `corepack pnpm verify`
+  passed again (9 pages).
+
+> **Step 18B added shared manifest validation; Step 18C proved it via a reversible
+> negative test.** No manifest-structure, generator-output, route, sample-data, or
+> template/rendering changes; German content remains demo data only.
