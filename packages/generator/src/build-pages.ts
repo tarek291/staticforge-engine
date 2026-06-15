@@ -89,7 +89,7 @@ function assemblePage(
   const titleText = interpolate(content.hero.titleTemplate, values);
   const subtitleText = interpolate(content.hero.subtitleTemplate, values);
   const slug = combineSlug([generateSlug(service.slug), location.city]);
-  const templateId = content.templateId ?? "default";
+  const templateId = service.templateId ?? content.templateId ?? "default";
 
   return {
     slug,

@@ -328,3 +328,35 @@ available but inactive by default.
 
 > **Step 11B was a reversible verification step** — it proved activation works
 > end-to-end, then restored the default-template state (net-zero change).
+
+---
+
+## Service-level `templateId` override
+
+Templates can now be selected per service, more granularly than the global
+content-level default.
+
+- **Optional per service:** each entry in `data/input/services.json` may define
+  `templateId` (`z.string().min(1).optional()` — empty strings rejected).
+- **Precedence:** the generator resolves
+  `service.templateId ?? content.templateId ?? "default"`, so a service-level
+  value wins over the content-level value.
+- **Sample unchanged:** current services and `content.json` intentionally omit
+  `templateId`, so generated pages still resolve to `"templateId": "default"`.
+- **Inactive alternate:** `luxuryLanding` remains registered but inactive.
+- **Language-agnostic & decoupled:** `templateId` is a generic rendering
+  identifier — never tied to the German demo content, and never used in slugs,
+  routes, locale, city, or the manifest.
+
+### Intentionally deferred
+
+- Activating `luxuryLanding` on a sample service
+- Per-location template overrides
+- Per-business template overrides
+- Page-combination template overrides
+- A separate template mapping file
+- Exposing `templateId` in `manifest.json`
+- A stricter unknown-template policy
+
+> **Step 13B was a zero-visible-behavior-change capability step** — it added
+> optional per-service template selection while keeping output identical.

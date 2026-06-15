@@ -21,5 +21,8 @@ export const ServiceSchema = z.object({
   description: z.string().min(100),
   benefits: z.array(z.string().min(1)).min(3),
   pricing: PricingSchema.optional(),
+  // Optional per-service template override. Absent → the generator falls back
+  // to the content-level default. Empty string is rejected.
+  templateId: z.string().min(1).optional(),
 });
 export type Service = z.infer<typeof ServiceSchema>;
