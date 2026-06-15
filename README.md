@@ -380,3 +380,33 @@ A temporary verification confirmed service-level `templateId` resolution:
 
 > **Step 14A was a reversible verification step** — it proved per-service
 > activation works, then restored the default-template state (net-zero change).
+
+---
+
+## Strict unknown-template handling
+
+The web template registry now fails loudly on an unrecognized `templateId`:
+
+- **Throws, not falls back:** `getTemplateView` throws when the `templateId` is
+  not registered, e.g. `Unknown templateId "<id>". Registered templates:
+  default, luxuryLanding.` — the message names the bad id and the registered ids.
+- **Catches typos early:** a mistyped service-level `templateId` now fails the
+  build during prerender instead of silently rendering the default view.
+- **Layering preserved:** the generator stays template-name agnostic (it only
+  emits a string); schemas still validate `templateId` as a non-empty string,
+  while registry *membership* is enforced in the web renderer.
+- **Registered templates:** `default` and `luxuryLanding` remain the only two.
+
+### Negative smoke test (reversible)
+
+- One service was temporarily set to `templateId: "notRegisteredTemplate"`.
+- Generation succeeded (9 pages), but the web build **failed during prerender**
+  with the expected `Unknown templateId "notRegisteredTemplate". Registered
+  templates: default, luxuryLanding.` error.
+- The temporary input change was reverted; final `corepack pnpm verify` passed
+  and the canonical sample returned to `templateId: "default"`.
+- Slugs, routes, manifest, layout, renderer views, generator logic, and sample
+  data are unchanged after revert.
+
+> **Step 15B added strict validation; Step 15C proved it via a reversible
+> negative test** — invalid ids now fail loudly, valid pages build unchanged.
