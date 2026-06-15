@@ -410,3 +410,37 @@ The web template registry now fails loudly on an unrecognized `templateId`:
 
 > **Step 15B added strict validation; Step 15C proved it via a reversible
 > negative test** — invalid ids now fail loudly, valid pages build unchanged.
+
+---
+
+## Duplicate slug collision protection
+
+Generated slugs are now guarded against duplicates **before** `savePages` writes
+anything:
+
+- **Fails loudly:** `buildPages` tracks seen slugs and collects a validation
+  issue for any collision, throwing a single `ValidationError` at the end of the
+  generation pass (consistent with existing validation behavior).
+- **Why it matters:** a duplicate slug would otherwise silently overwrite one
+  page's `pages/{slug}.json`, leave duplicate rows in `manifest.json`, and create
+  ambiguous `/[slug]` routes — all without any error.
+- **Slug source unchanged:** slugs are still `service slug + location city`
+  (`combineSlug([generateSlug(service.slug), location.city])`). **Business is
+  still not part of the slug** in this step.
+- **No behavior change for valid input:** valid slug generation, routes, manifest
+  structure, schemas, sample data, and web app behavior are all unchanged; the
+  guard only adds detection.
+
+### Negative smoke test (reversible)
+
+- A temporary duplicate location `loc-duisburg-dup` (city `Duisburg`, same as the
+  existing `loc-duisburg`) was added to `data/input/locations.json`.
+- `corepack pnpm generate` **failed** with **3 duplicate-slug issues** — the
+  Duisburg service-location pages (`bueroreinigung-duisburg`,
+  `grundreinigung-duisburg`, `treppenhausreinigung-duisburg`), each naming the
+  colliding business/service/location.
+- The temporary location was reverted; final `corepack pnpm verify` passed and
+  the canonical output returned to the normal 9 pages.
+
+> **Step 15E added the collision guard; Step 15F proved it via a reversible
+> negative test** — duplicate slugs now fail loudly before any files are written.
