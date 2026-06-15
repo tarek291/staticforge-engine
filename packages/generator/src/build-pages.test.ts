@@ -87,3 +87,115 @@ test("buildPages succeeds when generated slugs are unique", () => {
   const pages = buildPages(uniqueInput, { locale: "en" });
   assert.equal(pages.length, 1);
 });
+
+// --- Business-level eligibility (serviceIds / locationIds) ---
+
+// Distinct slugs (2 services × 2 locations → 4 unique pages by default).
+const svcA: Service = {
+  id: "svc-a",
+  name: "Service A",
+  slug: "service-a",
+  description: "A".repeat(120),
+  benefits: ["b1", "b2", "b3"],
+};
+const svcB: Service = {
+  id: "svc-b",
+  name: "Service B",
+  slug: "service-b",
+  description: "B".repeat(120),
+  benefits: ["b1", "b2", "b3"],
+};
+const locA: Location = {
+  id: "loc-a",
+  city: "Alphaville",
+  state: "Sample State",
+  country: "DE",
+};
+const locB: Location = {
+  id: "loc-b",
+  city: "Betatown",
+  state: "Sample State",
+  country: "DE",
+};
+
+function eligibilityInput(overrides: Partial<Business>): ValidatedInputData {
+  return {
+    businesses: [{ ...business, ...overrides }],
+    services: [svcA, svcB],
+    locations: [locA, locB],
+    content,
+  };
+}
+
+test("eligibility: serviceIds narrows pages to the selected services", () => {
+  const pages = buildPages(eligibilityInput({ serviceIds: ["svc-a"] }), {
+    locale: "en",
+  });
+  assert.equal(pages.length, 2); // svc-a × 2 locations
+  assert.ok(pages.every((page) => page.serviceId === "svc-a"));
+});
+
+test("eligibility: locationIds narrows pages to the selected locations", () => {
+  const pages = buildPages(eligibilityInput({ locationIds: ["loc-a"] }), {
+    locale: "en",
+  });
+  assert.equal(pages.length, 2); // 2 services × loc-a
+  assert.ok(pages.every((page) => page.locationId === "loc-a"));
+});
+
+test("eligibility: undefined serviceIds/locationIds keeps all combinations", () => {
+  const pages = buildPages(eligibilityInput({}), { locale: "en" });
+  assert.equal(pages.length, 4);
+});
+
+test("eligibility: empty serviceIds produces zero pages", () => {
+  const pages = buildPages(eligibilityInput({ serviceIds: [] }), {
+    locale: "en",
+  });
+  assert.equal(pages.length, 0);
+});
+
+test("eligibility: empty locationIds produces zero pages", () => {
+  const pages = buildPages(eligibilityInput({ locationIds: [] }), {
+    locale: "en",
+  });
+  assert.equal(pages.length, 0);
+});
+
+test("eligibility: unknown serviceIds throws ValidationError", () => {
+  assert.throws(
+    () =>
+      buildPages(eligibilityInput({ serviceIds: ["svc-missing"] }), {
+        locale: "en",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ValidationError);
+      assert.ok(
+        error.issues.some((issue) =>
+          issue.message.includes("Unknown service id"),
+        ),
+        "expected an unknown-service-id issue",
+      );
+      return true;
+    },
+  );
+});
+
+test("eligibility: unknown locationIds throws ValidationError", () => {
+  assert.throws(
+    () =>
+      buildPages(eligibilityInput({ locationIds: ["loc-missing"] }), {
+        locale: "en",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ValidationError);
+      assert.ok(
+        error.issues.some((issue) =>
+          issue.message.includes("Unknown location id"),
+        ),
+        "expected an unknown-location-id issue",
+      );
+      return true;
+    },
+  );
+});
