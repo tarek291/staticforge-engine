@@ -39,5 +39,10 @@ export const BusinessSchema = z.object({
   contactEmail: z.string().email(),
   contactPhone: z.string().min(1),
   address: AddressSchema,
+  // Optional eligibility: which services/locations this business covers.
+  // undefined → unconstrained (all); [] → explicitly none. Items are
+  // referenced ids validated by the generator.
+  serviceIds: z.array(z.string().min(1)).optional(),
+  locationIds: z.array(z.string().min(1)).optional(),
 });
 export type Business = z.infer<typeof BusinessSchema>;

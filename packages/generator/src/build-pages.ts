@@ -159,6 +159,37 @@ function assemblePage(
  * @returns The generated pages.
  * @throws {ValidationError} If any assembled page fails schema validation.
  */
+/**
+ * Select the entities a business is eligible for.
+ *
+ * `undefined` ids → unconstrained (all items). Otherwise only items whose id is
+ * listed are kept (preserving input order); an empty list yields none. Any
+ * referenced id that does not exist is collected as a {@link ValidationIssue}.
+ */
+function selectEligible<T extends { id: string }>(
+  items: T[],
+  ids: string[] | undefined,
+  businessId: string,
+  field: "serviceIds" | "locationIds",
+  label: "service" | "location",
+  issues: ValidationIssue[],
+): T[] {
+  if (ids === undefined) {
+    return items;
+  }
+  const known = new Set(items.map((item) => item.id));
+  for (const id of ids) {
+    if (!known.has(id)) {
+      issues.push({
+        path: `businesses[${businessId}].${field}`,
+        message: `Unknown ${label} id "${id}" referenced by business="${businessId}".`,
+      });
+    }
+  }
+  const allowed = new Set(ids);
+  return items.filter((item) => allowed.has(item.id));
+}
+
 export function buildPages(
   input: ValidatedInputData,
   options: BuildPagesOptions,
@@ -168,8 +199,25 @@ export function buildPages(
   const seenSlugs = new Set<string>();
 
   for (const business of input.businesses) {
-    for (const service of input.services) {
-      for (const location of input.locations) {
+    const eligibleServices = selectEligible(
+      input.services,
+      business.serviceIds,
+      business.id,
+      "serviceIds",
+      "service",
+      issues,
+    );
+    const eligibleLocations = selectEligible(
+      input.locations,
+      business.locationIds,
+      business.id,
+      "locationIds",
+      "location",
+      issues,
+    );
+
+    for (const service of eligibleServices) {
+      for (const location of eligibleLocations) {
         const page = assemblePage(
           business,
           service,

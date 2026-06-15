@@ -444,3 +444,35 @@ anything:
 
 > **Step 15E added the collision guard; Step 15F proved it via a reversible
 > negative test** — duplicate slugs now fail loudly before any files are written.
+
+---
+
+## Business-level page eligibility
+
+A business may optionally declare which services and locations it covers, so the
+generator no longer assumes the full cartesian product applies to every business.
+
+- **Fields (optional):** `business.serviceIds?: string[]` and
+  `business.locationIds?: string[]`.
+- **Semantics:** `undefined` → unconstrained (all services / all locations);
+  `[]` → explicitly none; ids must be non-empty and **must reference existing**
+  services/locations. An unknown referenced id fails validation loudly (collected
+  into a single `ValidationError`, consistent with the existing pattern).
+- **Generator behavior:** a business's pages are generated from
+  `eligibleServices × eligibleLocations`. The current sample data declares neither
+  field, so it still generates **9 pages**.
+- **Slugs unchanged:** slugs remain `service slug + location city`; **business is
+  not added to the slug**, and the Step 15 duplicate-slug protection stays active.
+
+### Eligibility smoke test (reversible)
+
+- The sample business was temporarily restricted to service `svc-grundreinigung`
+  and location `loc-essen`.
+- Generation produced **exactly one page** — `grundreinigung-essen` (manifest
+  count 1), with matching `businessId`/`serviceId`/`locationId`.
+- After revert, generation returned to **9 pages**, final `corepack pnpm verify`
+  passed, and no `serviceIds`/`locationIds` remain in the sample data.
+
+> **Step 17B added optional business-level eligibility; Step 17C proved it via a
+> reversible smoke test.** No route, manifest-structure, web-renderer, or template
+> changes; no language-specific coupling — German content remains demo data only.
