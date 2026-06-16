@@ -18,6 +18,6 @@
     "dev:web": "corepack pnpm --filter @staticforge/web dev",
     "build:web": "corepack pnpm --filter @staticforge/web build",
     "typecheck:web": "corepack pnpm --filter @staticforge/web typecheck",
-    "verify": "corepack pnpm generate && corepack pnpm --filter @staticforge/generator typecheck && corepack pnpm --filter @staticforge/web typecheck && corepack pnpm --filter @staticforge/web build"
+    "verify": "corepack pnpm generate && corepack pnpm --filter @staticforge/generator typecheck && corepack pnpm --filter @staticforge/generator test && corepack pnpm --filter @staticforge/web typecheck && corepack pnpm --filter @staticforge/web build"
   }
 }
