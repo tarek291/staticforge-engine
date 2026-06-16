@@ -291,3 +291,42 @@ test("placeholders: valid placeholders interpolate without residual tokens", () 
   assert.ok(!page.metaDescription.includes("{{"));
   assert.ok(!page.content.hero.subheading?.includes("{{"));
 });
+
+// --- SEO output invariants (current/default generated path) ---
+
+test("seo: generated pages carry valid title/metaDescription/h1 and schemaOrg basics", () => {
+  // Multi-page set with placeholder-driven distinct titles (2 services × 2 locations).
+  const pages = buildPages(eligibilityInput({}), { locale: "en" });
+  assert.ok(pages.length >= 2);
+
+  for (const page of pages) {
+    assert.ok(page.title.length > 0, "title is non-empty");
+    assert.ok(page.title.length <= 70, "title within 70 chars");
+    assert.ok(page.metaDescription.length > 0, "metaDescription is non-empty");
+    assert.ok(
+      page.metaDescription.length <= 160,
+      "metaDescription within 160 chars",
+    );
+    assert.ok(page.h1.length > 0, "h1 is non-empty");
+
+    const { schemaOrg } = page;
+    assert.ok(
+      typeof schemaOrg === "object" &&
+        schemaOrg !== null &&
+        Object.keys(schemaOrg).length > 0,
+      "schemaOrg is a non-empty object",
+    );
+    assert.ok("@context" in schemaOrg, "schemaOrg has @context");
+    assert.ok("@type" in schemaOrg, "schemaOrg has @type");
+  }
+
+  // For this default placeholder-driven set, SEO text is unique per page.
+  const titles = pages.map((page) => page.title);
+  assert.equal(new Set(titles).size, titles.length, "titles are unique");
+  const metaDescriptions = pages.map((page) => page.metaDescription);
+  assert.equal(
+    new Set(metaDescriptions).size,
+    metaDescriptions.length,
+    "metaDescriptions are unique",
+  );
+});
