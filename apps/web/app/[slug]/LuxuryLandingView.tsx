@@ -70,7 +70,10 @@ export function LuxuryLandingView({
         </dl>
       )}
 
-      <section className="flex flex-col items-center gap-5 rounded-2xl border border-neutral-200 bg-neutral-50 p-12 text-center dark:border-neutral-800 dark:bg-neutral-900">
+      <section
+        id="contact"
+        className="flex flex-col items-center gap-5 rounded-2xl border border-neutral-200 bg-neutral-50 p-12 text-center dark:border-neutral-800 dark:bg-neutral-900"
+      >
         <h2 className="text-2xl font-semibold tracking-tight">
           {content.cta.heading}
         </h2>
