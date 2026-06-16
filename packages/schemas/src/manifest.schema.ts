@@ -10,6 +10,7 @@ export const ManifestEntrySchema = GeneratedPageSchema.pick({
   locale: true,
   title: true,
   metaDescription: true,
+  templateId: true,
 });
 export type ManifestEntry = z.infer<typeof ManifestEntrySchema>;
 

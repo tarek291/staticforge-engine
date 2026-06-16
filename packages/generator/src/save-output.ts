@@ -100,6 +100,7 @@ export async function savePages(
       locale: page.locale,
       title: page.title,
       metaDescription: page.metaDescription,
+      templateId: page.templateId,
     })),
   };
   await writeFile(

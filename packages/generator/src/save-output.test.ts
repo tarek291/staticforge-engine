@@ -92,11 +92,16 @@ test("savePages keeps manifest entries and page files consistent", async () => {
     );
     assert.equal(pageFiles.length, manifest.pages.length);
 
+    // Each manifest entry carries the page's templateId.
+    const templateBySlug = new Map(
+      pages.map((page) => [page.slug, page.templateId]),
+    );
     for (const entry of manifest.pages) {
       assert.ok(
         pageFiles.includes(`${entry.slug}.json`),
         `missing page file for slug "${entry.slug}"`,
       );
+      assert.equal(entry.templateId, templateBySlug.get(entry.slug));
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
