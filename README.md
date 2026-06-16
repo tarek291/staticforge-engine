@@ -80,7 +80,7 @@ corepack pnpm install     # install workspace dependencies
 corepack pnpm generate    # run the generator pipeline → data/output/
 corepack pnpm dev:web     # start the Next.js dev server
 corepack pnpm build:web   # build the static site
-corepack pnpm verify      # generate + typecheck (generator & web) + build
+corepack pnpm verify      # generate + generator typecheck + generator tests + web typecheck + build
 ```
 
 ### Generated output structure
