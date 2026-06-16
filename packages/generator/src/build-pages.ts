@@ -166,7 +166,7 @@ function assemblePage(
       cta: {
         heading: titleText,
         buttonLabel: content.cta.primary,
-        href: "#contact",
+        href: `mailto:${business.contactEmail}`,
       },
     },
     schemaOrg: {

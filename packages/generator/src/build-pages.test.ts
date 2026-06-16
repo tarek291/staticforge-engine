@@ -330,3 +330,18 @@ test("seo: generated pages carry valid title/metaDescription/h1 and schemaOrg ba
     "metaDescriptions are unique",
   );
 });
+
+// --- CTA href derives from the business contact email ---
+
+test("cta: generated cta.href is a mailto link to the business contact email", () => {
+  const pages = buildPages(eligibilityInput({}), { locale: "en" });
+  assert.ok(pages.length >= 1);
+
+  for (const page of pages) {
+    const href = page.content.cta.href;
+    assert.equal(href, `mailto:${business.contactEmail}`);
+    assert.notEqual(href, "#contact");
+    assert.ok(href.startsWith("mailto:"), "href starts with mailto:");
+    assert.ok(href.length > 0, "href is non-empty");
+  }
+});
