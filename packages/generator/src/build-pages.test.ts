@@ -347,7 +347,7 @@ test("cta: generated cta.href is a mailto link to the business contact email", (
   }
 });
 
-// --- Optional secondary (tel) CTA in generated output (not rendered yet) ---
+// --- Optional secondary (tel) CTA in generated output ---
 
 test("cta: secondary tel CTA is emitted for a valid phone + non-empty label", () => {
   const pages = buildPages(eligibilityInput({}), { locale: "en" });

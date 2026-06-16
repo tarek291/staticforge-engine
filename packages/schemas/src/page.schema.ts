@@ -32,7 +32,7 @@ export const CtaSchema = z.object({
   buttonLabel: z.string().min(1),
   href: z.string().min(1),
   // Optional secondary action (e.g. a tel: link). Backward compatible: absent
-  // when not applicable. Not rendered by the views yet.
+  // when not applicable; rendered by the views when present.
   secondary: z
     .object({
       buttonLabel: z.string().min(1),

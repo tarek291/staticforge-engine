@@ -144,7 +144,8 @@ function assemblePage(
   const templateId = service.templateId ?? content.templateId ?? "default";
 
   // Optional secondary CTA: a tel: link, only when the phone normalizes to a
-  // valid tel href and a secondary label is provided. Not rendered yet.
+  // valid tel href and a secondary label is provided. Rendered by the views
+  // when present.
   const telHref = toTelHref(business.contactPhone);
   const secondaryCta =
     telHref !== null && content.cta.secondary.trim().length > 0

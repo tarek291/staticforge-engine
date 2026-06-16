@@ -31,8 +31,8 @@ const StaticContentTemplateSchema = z.object({
   }),
   cta: z.object({
     primary: z.string(),
-    // Reserved for a future secondary CTA: accepted in input but not yet
-    // rendered or written to generated output.
+    // Label for an optional secondary CTA. Emitted as a tel: action when the
+    // business phone normalizes and this label is non-empty.
     secondary: z.string(),
   }),
   faqs: z

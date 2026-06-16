@@ -27,8 +27,9 @@ export interface InputPaths {
  */
 export interface StaticContentTemplate {
   hero: { titleTemplate: string; subtitleTemplate: string };
-  // `cta.secondary` is reserved for a future secondary CTA: accepted in input
-  // but not yet rendered or written to generated output.
+  // `cta.primary` is the primary CTA label; `cta.secondary` is the label for an
+  // optional secondary CTA (emitted as a tel: action when the phone normalizes
+  // and the label is non-empty, then rendered by the views).
   cta: { primary: string; secondary: string };
   faqs: Array<{ q: string; a: string }>;
   templateId?: string;
