@@ -78,10 +78,7 @@ export function GeneratedPageView({
         </section>
       )}
 
-      <section
-        id="contact"
-        className="flex flex-col items-start gap-4 rounded-lg border border-neutral-200 p-6 dark:border-neutral-800"
-      >
+      <section className="flex flex-col items-start gap-4 rounded-lg border border-neutral-200 p-6 dark:border-neutral-800">
         <h2 className="text-lg font-medium">{content.cta.heading}</h2>
         <a
           href={content.cta.href}
