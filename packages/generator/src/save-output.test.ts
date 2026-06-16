@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -91,6 +98,47 @@ test("savePages keeps manifest entries and page files consistent", async () => {
         `missing page file for slug "${entry.slug}"`,
       );
     }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("savePages removes stale page files from a previous generation", async () => {
+  const pages = buildPages(input, { locale: "en" });
+  const currentSlugs = pages.map((page) => page.slug);
+  assert.equal(pages.length, 2);
+
+  const dir = await mkdtemp(join(tmpdir(), "staticforge-stale-"));
+  try {
+    // Pre-seed a stale page file as if left over from an earlier generation.
+    const pagesDir = join(dir, "pages");
+    await mkdir(pagesDir, { recursive: true });
+    await writeFile(join(pagesDir, "old-slug.json"), "{}\n", "utf-8");
+
+    await savePages(pages, dir);
+
+    const pageFiles = (await readdir(pagesDir)).filter((name) =>
+      name.endsWith(".json"),
+    );
+
+    // Stale file gone; only the current page files remain.
+    assert.ok(!pageFiles.includes("old-slug.json"), "stale file was not removed");
+    assert.equal(pageFiles.length, currentSlugs.length);
+    for (const slug of currentSlugs) {
+      assert.ok(
+        pageFiles.includes(`${slug}.json`),
+        `missing current page file for slug "${slug}"`,
+      );
+    }
+
+    // Manifest reflects only the current pages.
+    const manifestRaw = await readFile(join(dir, "manifest.json"), "utf-8");
+    const manifest = ManifestSchema.parse(JSON.parse(manifestRaw));
+    assert.equal(manifest.count, currentSlugs.length);
+    assert.deepEqual(
+      manifest.pages.map((entry) => entry.slug).sort(),
+      [...currentSlugs].sort(),
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
