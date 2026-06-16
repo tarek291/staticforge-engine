@@ -74,12 +74,22 @@ export function LuxuryLandingView({
         <h2 className="text-2xl font-semibold tracking-tight">
           {content.cta.heading}
         </h2>
-        <a
-          href={content.cta.href}
-          className="rounded-full bg-neutral-900 px-8 py-3 text-sm font-semibold text-white hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
-        >
-          {content.cta.buttonLabel}
-        </a>
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          <a
+            href={content.cta.href}
+            className="rounded-full bg-neutral-900 px-8 py-3 text-sm font-semibold text-white hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
+          >
+            {content.cta.buttonLabel}
+          </a>
+          {content.cta.secondary && (
+            <a
+              href={content.cta.secondary.href}
+              className="rounded-full border border-neutral-300 px-8 py-3 text-sm font-semibold hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+            >
+              {content.cta.secondary.buttonLabel}
+            </a>
+          )}
+        </div>
       </section>
     </main>
   );

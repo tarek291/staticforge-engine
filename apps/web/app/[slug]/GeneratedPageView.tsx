@@ -80,12 +80,22 @@ export function GeneratedPageView({
 
       <section className="flex flex-col items-start gap-4 rounded-lg border border-neutral-200 p-6 dark:border-neutral-800">
         <h2 className="text-lg font-medium">{content.cta.heading}</h2>
-        <a
-          href={content.cta.href}
-          className="rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-neutral-900"
-        >
-          {content.cta.buttonLabel}
-        </a>
+        <div className="flex flex-wrap gap-3">
+          <a
+            href={content.cta.href}
+            className="rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-neutral-900"
+          >
+            {content.cta.buttonLabel}
+          </a>
+          {content.cta.secondary && (
+            <a
+              href={content.cta.secondary.href}
+              className="rounded-md border border-neutral-300 px-4 py-2 text-sm font-medium dark:border-neutral-700"
+            >
+              {content.cta.secondary.buttonLabel}
+            </a>
+          )}
+        </div>
       </section>
     </main>
   );
