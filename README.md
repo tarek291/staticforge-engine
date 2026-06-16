@@ -491,8 +491,8 @@ last validation gap (generated pages were already validated per file).
 
 - **Shared schema:** `ManifestSchema` lives in `packages/schemas`.
   `ManifestEntrySchema` is derived from `GeneratedPageSchema` (picking `slug`,
-  `locale`, `title`, `metaDescription`) so entry shapes — including `locale` —
-  stay aligned with generated pages.
+  `locale`, `title`, `metaDescription`, `templateId`) so entry shapes — including
+  `locale` and `templateId` — stay aligned with generated pages.
 - **Constraints:** `count` is a non-negative integer, `pages` is an array of
   entries, and `count` must equal `pages.length`.
 - **Web validation:** `apps/web/lib/staticforge-output.ts` runs
@@ -513,6 +513,12 @@ last validation gap (generated pages were already validated per file).
 > **Step 18B added shared manifest validation; Step 18C proved it via a reversible
 > negative test.** No manifest-structure, generator-output, route, sample-data, or
 > template/rendering changes; German content remains demo data only.
+
+> **Step 50B** later added `templateId` to each manifest entry, so the manifest is
+> a complete index of which template every page uses. The change is additive and
+> backward compatible — older manifests without `templateId` parse to `"default"`.
+> (This supersedes the earlier "expose `templateId` in `manifest.json`" deferred
+> items.)
 
 ---
 
