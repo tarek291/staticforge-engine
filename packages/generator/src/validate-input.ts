@@ -31,6 +31,8 @@ const StaticContentTemplateSchema = z.object({
   }),
   cta: z.object({
     primary: z.string(),
+    // Reserved for a future secondary CTA: accepted in input but not yet
+    // rendered or written to generated output.
     secondary: z.string(),
   }),
   faqs: z

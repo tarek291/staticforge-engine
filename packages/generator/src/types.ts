@@ -27,6 +27,8 @@ export interface InputPaths {
  */
 export interface StaticContentTemplate {
   hero: { titleTemplate: string; subtitleTemplate: string };
+  // `cta.secondary` is reserved for a future secondary CTA: accepted in input
+  // but not yet rendered or written to generated output.
   cta: { primary: string; secondary: string };
   faqs: Array<{ q: string; a: string }>;
   templateId?: string;
