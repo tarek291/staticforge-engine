@@ -11,6 +11,7 @@ import {
   combineSlug,
   truncateTitle,
   truncateMetaDescription,
+  toTelHref,
 } from "@staticforge/core";
 import { ValidationError, type ValidationIssue } from "./errors.js";
 import type { BuildPagesOptions, ValidatedInputData } from "./types.js";
@@ -142,6 +143,14 @@ function assemblePage(
   const slug = combineSlug([generateSlug(service.slug), location.city]);
   const templateId = service.templateId ?? content.templateId ?? "default";
 
+  // Optional secondary CTA: a tel: link, only when the phone normalizes to a
+  // valid tel href and a secondary label is provided. Not rendered yet.
+  const telHref = toTelHref(business.contactPhone);
+  const secondaryCta =
+    telHref !== null && content.cta.secondary.trim().length > 0
+      ? { buttonLabel: content.cta.secondary, href: telHref }
+      : undefined;
+
   return {
     slug,
     locale,
@@ -167,6 +176,7 @@ function assemblePage(
         heading: titleText,
         buttonLabel: content.cta.primary,
         href: `mailto:${business.contactEmail}`,
+        ...(secondaryCta ? { secondary: secondaryCta } : {}),
       },
     },
     schemaOrg: {

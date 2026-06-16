@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { Business, Service, Location } from "@staticforge/schemas";
+import { toTelHref } from "@staticforge/core";
 import { buildPages } from "./build-pages.js";
 import { ValidationError } from "./errors.js";
 import type { StaticContentTemplate, ValidatedInputData } from "./types.js";
@@ -343,5 +344,45 @@ test("cta: generated cta.href is a mailto link to the business contact email", (
     assert.notEqual(href, "#contact");
     assert.ok(href.startsWith("mailto:"), "href starts with mailto:");
     assert.ok(href.length > 0, "href is non-empty");
+  }
+});
+
+// --- Optional secondary (tel) CTA in generated output (not rendered yet) ---
+
+test("cta: secondary tel CTA is emitted for a valid phone + non-empty label", () => {
+  const pages = buildPages(eligibilityInput({}), { locale: "en" });
+  assert.ok(pages.length >= 1);
+
+  for (const page of pages) {
+    // Primary mailto CTA is unchanged.
+    assert.equal(page.content.cta.href, `mailto:${business.contactEmail}`);
+
+    const secondary = page.content.cta.secondary;
+    assert.ok(secondary, "secondary CTA should be present");
+    assert.equal(secondary.buttonLabel, content.cta.secondary);
+    assert.ok(secondary.href.startsWith("tel:"), "secondary href starts with tel:");
+    assert.equal(secondary.href, toTelHref(business.contactPhone));
+  }
+});
+
+test("cta: secondary CTA is omitted when the phone is invalid", () => {
+  const pages = buildPages(eligibilityInput({ contactPhone: "12345" }), {
+    locale: "en",
+  });
+  for (const page of pages) {
+    assert.equal(page.content.cta.secondary, undefined);
+    // Primary CTA still intact.
+    assert.equal(page.content.cta.href, `mailto:${business.contactEmail}`);
+  }
+});
+
+test("cta: secondary CTA is omitted when the secondary label is empty", () => {
+  const emptySecondary: StaticContentTemplate = {
+    ...content,
+    cta: { ...content.cta, secondary: "   " },
+  };
+  const pages = buildPages(contentInput(emptySecondary), { locale: "en" });
+  for (const page of pages) {
+    assert.equal(page.content.cta.secondary, undefined);
   }
 });

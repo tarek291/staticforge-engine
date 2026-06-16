@@ -31,6 +31,14 @@ export const CtaSchema = z.object({
   heading: z.string().min(1),
   buttonLabel: z.string().min(1),
   href: z.string().min(1),
+  // Optional secondary action (e.g. a tel: link). Backward compatible: absent
+  // when not applicable. Not rendered by the views yet.
+  secondary: z
+    .object({
+      buttonLabel: z.string().min(1),
+      href: z.string().min(1),
+    })
+    .optional(),
 });
 export type Cta = z.infer<typeof CtaSchema>;
 
