@@ -1,4 +1,4 @@
-import { generatePageContent } from "@staticforge/ai";
+import type { GeneratedPageContent, PagePromptDetails } from "@staticforge/ai";
 import { sleep } from "@staticforge/core";
 import { GeneratedPageSchema, type GeneratedPage } from "@staticforge/schemas";
 
@@ -26,11 +26,33 @@ export function isAiGenerationEnabled(): boolean {
   return process.env[AI_ENV_VAR] === "true";
 }
 
+/**
+ * Authors the content for one page.
+ *
+ * Structurally identical to `generatePageContent` from `@staticforge/ai`; it is
+ * injected rather than imported directly so the merge can be tested against a
+ * stub without any network call or API key.
+ */
+export type GenerateContentFn = (
+  details: PagePromptDetails,
+) => Promise<GeneratedPageContent>;
+
 /** Reported after each page is authored, for CLI progress output. */
 export interface AiProgress {
   done: number;
   total: number;
   slug: string;
+}
+
+/** Optional knobs for {@link applyAiContent}. */
+export interface ApplyAiContentOptions {
+  /** Per-page progress callback. */
+  onProgress?: (progress: AiProgress) => void;
+  /**
+   * Delay between calls, in milliseconds. Defaults to {@link AI_CALL_DELAY_MS};
+   * tests pass `0` so the suite does not spend real seconds waiting.
+   */
+  delayMs?: number;
 }
 
 /** Index a list of identified entities by id. */
@@ -58,9 +80,12 @@ function indexById<T extends { id: string }>(items: T[]): Map<string, T> {
  * Fails fast rather than collecting issues across all pages — every iteration
  * costs a paid API call, so continuing past a failure would waste tokens.
  *
+ * Does not mutate `pages`; a new array of new objects is returned.
+ *
  * @param pages - Deterministic pages produced by `buildPages`.
  * @param input - The validated input the pages were built from.
- * @param onProgress - Optional per-page progress callback.
+ * @param generateContentFn - Authors the content for a single page.
+ * @param options - Progress reporting and call pacing.
  * @returns A new array of pages with AI-authored content applied.
  * @throws {ValidationError} If a page references an unknown entity id, or if a
  * merged page fails schema validation.
@@ -68,8 +93,11 @@ function indexById<T extends { id: string }>(items: T[]): Map<string, T> {
 export async function applyAiContent(
   pages: GeneratedPage[],
   input: ValidatedInputData,
-  onProgress?: (progress: AiProgress) => void,
+  generateContentFn: GenerateContentFn,
+  options: ApplyAiContentOptions = {},
 ): Promise<GeneratedPage[]> {
+  const { onProgress, delayMs = AI_CALL_DELAY_MS } = options;
+
   const businesses = indexById(input.businesses);
   const services = indexById(input.services);
   const locations = indexById(input.locations);
@@ -94,7 +122,7 @@ export async function applyAiContent(
       throw new ValidationError("ai-content", missing);
     }
 
-    const content = await generatePageContent({
+    const content = await generateContentFn({
       businessName: business.name,
       serviceName: service.name,
       cityName: location.city,
@@ -125,7 +153,7 @@ export async function applyAiContent(
     // Pace the calls — skipped after the final page, where the delay would
     // only add dead time before the run ends.
     if (index < pages.length - 1) {
-      await sleep(AI_CALL_DELAY_MS);
+      await sleep(delayMs);
     }
   }
 

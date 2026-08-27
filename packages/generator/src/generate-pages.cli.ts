@@ -1,6 +1,7 @@
 import { parseArgs } from "node:util";
 import { resolve, join } from "node:path";
 import { LocaleSchema, type Locale } from "@staticforge/schemas";
+import { generatePageContent } from "@staticforge/ai";
 import { loadInputData, defaultInputPaths } from "./load-data.js";
 import { validateInputData } from "./validate-input.js";
 import { buildPages } from "./build-pages.js";
@@ -58,8 +59,10 @@ async function main(): Promise<void> {
   // above are saved unchanged, exactly as before.
   if (isAiGenerationEnabled()) {
     console.log(`… authoring content with AI (${pages.length} pages)`);
-    pages = await applyAiContent(pages, validated, ({ done, total, slug }) => {
-      console.log(`  · ${done}/${total} ${slug}`);
+    pages = await applyAiContent(pages, validated, generatePageContent, {
+      onProgress: ({ done, total, slug }) => {
+        console.log(`  · ${done}/${total} ${slug}`);
+      },
     });
     console.log("✓ AI content applied");
   }
