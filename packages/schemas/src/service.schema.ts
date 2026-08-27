@@ -24,5 +24,10 @@ export const ServiceSchema = z.object({
   // Optional per-service template override. Absent → the generator falls back
   // to the content-level default. Empty string is rejected.
   templateId: z.string().min(1).optional(),
+  // Optional per-service content-profile override, resolved by the same
+  // precedence. Deliberately separate from templateId: one decides how a page
+  // looks, the other what counts as good enough to publish. A tenant may want
+  // a premium visual template on modest content, or the reverse.
+  contentProfileId: z.string().min(1).optional(),
 });
 export type Service = z.infer<typeof ServiceSchema>;

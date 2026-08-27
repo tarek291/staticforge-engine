@@ -33,6 +33,8 @@ export interface StaticContentTemplate {
   cta: { primary: string; secondary: string };
   faqs: Array<{ q: string; a: string }>;
   templateId?: string;
+  /** Project-wide content profile. A service may override it. */
+  contentProfileId?: string;
   /** Absolute origin the site is published at, e.g. "https://www.example.de".
    * Required to emit canonical URLs, OpenGraph tags and a sitemap. */
   siteUrl?: string;

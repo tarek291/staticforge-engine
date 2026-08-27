@@ -41,6 +41,8 @@ const StaticContentTemplateSchema = z.object({
   // Optional override selecting which template renders the generated pages.
   // Absent → the generator falls back to "default". Empty string is rejected.
   templateId: z.string().min(1).optional(),
+  // Project-wide content profile. Absent → "default". A service overrides it.
+  contentProfileId: z.string().min(1).optional(),
   // Absolute origin, no path. Publishing artifacts are skipped when absent.
   siteUrl: z
     .string()

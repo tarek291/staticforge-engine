@@ -97,6 +97,7 @@ const ENGINE_OWNED_PLACEHOLDERS: Omit<
   locale: "de",
   schemaOrg: { "@type": "Service" },
   templateId: "default",
+  contentProfileId: "default",
   businessId: "00000000-0000-4000-8000-000000000000",
   serviceId: "content-probe-service",
   locationId: "content-probe-location",
@@ -189,6 +190,14 @@ export interface GenerationRequest extends PagePromptDetails {
   facts?: GroundingFacts;
   /** Identity for caching. Omit to bypass the cache. */
   cacheIdentity?: CacheIdentity;
+  /**
+   * Which content profile this page is held to.
+   *
+   * The service itself is built around one profile — its prompt is rendered
+   * from it once — so this field is how a *router* knows which service to hand
+   * the request to, not something a single service switches on.
+   */
+  contentProfileId?: string;
 }
 
 /** What produced a piece of content, recorded on the page it becomes. */

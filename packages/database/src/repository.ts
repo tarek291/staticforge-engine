@@ -38,6 +38,7 @@ export interface ContentTemplatePayload {
   cta: { primary: string; secondary: string };
   faqs: Array<{ q: string; a: string }>;
   templateId?: string;
+  contentProfileId?: string;
 }
 
 /**
@@ -192,6 +193,9 @@ export async function getProjectPayload(
         ...(service.templateId !== null
           ? { templateId: service.templateId }
           : {}),
+        ...(service.contentProfileId !== null
+          ? { contentProfileId: service.contentProfileId }
+          : {}),
       };
     }),
 
@@ -226,8 +230,9 @@ export async function getProjectPayload(
       // The generator's validateInputData is what actually checks it — and
       // rejects the payload if this is not `[{ q, a }, …]` with 3+ entries.
       faqs: content.faqs as ContentTemplatePayload["faqs"],
-      // Project-level default. A service-level templateId still wins over it.
+      // Project-level defaults. Service-level values still win over them.
       templateId: project.templateId,
+      contentProfileId: project.contentProfileId,
     },
   };
 }
@@ -305,6 +310,7 @@ export async function saveGeneratedPages(
       content: page.content as unknown as Prisma.InputJsonObject,
       schemaOrg: page.schemaOrg as Prisma.InputJsonObject,
       templateId: page.templateId,
+      contentProfileId: page.contentProfileId,
       source,
       // Provenance travels with the page or it is lost: cloud mode would
       // otherwise silently drop the prompt, model and source fingerprint that

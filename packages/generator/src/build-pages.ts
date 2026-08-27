@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  CONTENT_PROFILES,
   GeneratedPageSchema,
   type Business,
   type Service,
@@ -141,7 +142,14 @@ function assemblePage(
   const titleText = interpolate(content.hero.titleTemplate, values);
   const subtitleText = interpolate(content.hero.subtitleTemplate, values);
   const slug = combineSlug([generateSlug(service.slug), location.city]);
+
+  // Two independent axes, resolved by the same precedence but never consulting
+  // each other. A page may be rendered by any registered template while being
+  // held to any content profile; coupling them would make most of the grid
+  // unreachable for no reason.
   const templateId = service.templateId ?? content.templateId ?? "default";
+  const contentProfileId =
+    service.contentProfileId ?? content.contentProfileId ?? "default";
 
   // Optional secondary CTA: a tel: link, only when the phone normalizes to a
   // valid tel href and a secondary label is provided. Rendered by the views
@@ -198,6 +206,7 @@ function assemblePage(
       },
     },
     templateId,
+    contentProfileId,
     businessId: business.id,
     serviceId: service.id,
     locationId: location.id,
@@ -296,6 +305,19 @@ export function buildPages(
           input.content,
           options.locale,
         );
+
+        // An unknown content profile is fatal here, unlike an unknown
+        // templateId — which the web registry catches, because only the
+        // renderer knows which views exist. A content profile is consumed by
+        // the engine itself: it drives the authoring prompt and the quality
+        // verdict, so generating against one that does not exist would mean
+        // silently applying no rules at all.
+        if (CONTENT_PROFILES[page.contentProfileId] === undefined) {
+          issues.push({
+            path: `pages[${page.slug}].contentProfileId`,
+            message: `Unknown contentProfileId "${page.contentProfileId}". Registered profiles: ${Object.keys(CONTENT_PROFILES).join(", ")}.`,
+          });
+        }
 
         // Guard against two combinations producing the same slug, which would
         // otherwise silently overwrite output files and duplicate manifest rows.

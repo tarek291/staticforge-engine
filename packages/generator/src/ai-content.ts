@@ -186,6 +186,9 @@ export async function applyAiContent(
         services: input.services,
         locations: input.locations,
       }),
+      // Routed on, not switched on: the page states which profile it is held
+      // to, and the caller decides which service that means.
+      contentProfileId: page.contentProfileId,
       cacheIdentity: {
         businessId: page.businessId,
         serviceId: page.serviceId,

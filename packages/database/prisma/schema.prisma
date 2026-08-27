@@ -46,8 +46,13 @@ model Project {
   locale String @default("de")
 
   /// Project-level template default. The service-level value wins over it, and
-  /// "default" applies when neither is set.
+  /// "default" applies when neither is set. Purely a rendering choice.
   templateId String @default("default")
+
+  /// Project-level content-profile default, resolved by the same precedence.
+  /// Independent of templateId: how a page looks and what it must contain are
+  /// separate decisions, and a tenant may pair them however it likes.
+  contentProfileId String @default("default")
 
   workspaceId String
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
@@ -155,6 +160,9 @@ model Service {
   /// Optional per-service template override. Highest precedence.
   templateId String?
 
+  /// Optional per-service content-profile override. Highest precedence.
+  contentProfileId String?
+
   projectId String
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
@@ -226,8 +234,11 @@ model GeneratedPage {
   /// JSON-LD structured data, shape depending on the `@type` used.
   schemaOrg Json
 
-  templateId String     @default("default")
-  source     PageSource @default(TEMPLATE)
+  templateId       String     @default("default")
+  /// The profile this page was judged against, recorded alongside the template
+  /// it renders through so a dashboard can show both independently.
+  contentProfileId String     @default("default")
+  source           PageSource @default(TEMPLATE)
 
   /// Provenance of authored content: prompt version, model, content profile and
   /// the source fingerprint. Null on deterministic template pages — there is no

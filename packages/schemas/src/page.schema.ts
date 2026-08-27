@@ -215,7 +215,18 @@ export const GeneratedPageSchema = z.object({
   schemaOrg: SchemaOrgSchema,
   // Identifies which template renders this page. Defaults to "default" so
   // existing payloads without the field remain valid (backward compatible).
+  //
+  // Purely a *rendering* choice. It selects a view and nothing else — it does
+  // not decide what the page must contain, how long its copy may be, or which
+  // claims it may make.
   templateId: z.string().min(1).default("default"),
+  // Identifies which content profile judged this page.
+  //
+  // Purely a *quality* choice, and deliberately independent of templateId: a
+  // tenant may want a premium visual template over modest content, or a plain
+  // template over content held to the strictest bar. Coupling the two would
+  // make one of those combinations unreachable for no reason.
+  contentProfileId: z.string().min(1).default("default"),
   businessId: z.string(),
   serviceId: z.string(),
   locationId: z.string(),
