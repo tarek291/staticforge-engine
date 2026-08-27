@@ -1,4 +1,4 @@
-import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -33,6 +33,56 @@ function mapPageIssues(error: z.ZodError, slug: string): ValidationIssue[] {
   }));
 }
 
+/** Prefix for a directory being built. Dot-led, so it reads as internal. */
+const STAGING_PREFIX = ".staging-";
+
+/** Prefix for the previous `pages/`, kept only until the swap completes. */
+const RETIRED_PREFIX = ".retired-";
+
+/** Whether a filesystem error means "it was not there". */
+function isMissing(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
+}
+
+/** Remove a directory, ignoring the case where it is already gone. */
+async function discard(path: string): Promise<void> {
+  await rm(path, { recursive: true, force: true }).catch(() => {
+    // Best effort. A leftover directory costs disk, not correctness, and
+    // failing a completed run over cleanup would trade the cheap problem for
+    // the expensive one.
+  });
+}
+
+/**
+ * Sweep staging and retired directories left by a run that did not finish.
+ *
+ * They are inert — the web app and the validate stage read `pages/` and
+ * `manifest.json` and nothing else — so this is housekeeping, not recovery. It
+ * runs before writing, so a repeatedly crashing run cannot accumulate copies of
+ * a site on disk indefinitely.
+ */
+async function sweepLeftovers(outputDir: string): Promise<void> {
+  const entries = await readdir(outputDir).catch((error: unknown) => {
+    if (isMissing(error)) {
+      return [] as string[];
+    }
+    throw error;
+  });
+
+  await Promise.all(
+    entries
+      .filter(
+        (name) =>
+          name.startsWith(STAGING_PREFIX) || name.startsWith(RETIRED_PREFIX),
+      )
+      .map((name) => discard(join(outputDir, name))),
+  );
+}
+
 /**
  * Write generated pages to disk as individual JSON files plus a manifest.
  *
@@ -42,8 +92,34 @@ function mapPageIssues(error: z.ZodError, slug: string): ValidationIssue[] {
  *
  * Every page is validated against {@link GeneratedPageSchema} *before* anything
  * is written; if any page is invalid a single {@link ValidationError} is thrown
- * and no files are touched. The output directory is never deleted — only stale
- * `.json` files inside `outputDir/pages/` are removed before writing.
+ * and no files are touched.
+ *
+ * ## Why the write is staged
+ *
+ * The published site *is* this directory. The straightforward implementation —
+ * delete every stale page, then write the new ones — leaves the site destroyed
+ * for the whole duration of the write, and that span is the one long enough to
+ * actually be interrupted: a crash, a killed job, a machine losing power. What
+ * survives is an empty or half-populated directory, and the last good copy is
+ * already gone.
+ *
+ * So the new site is built beside the old one and swapped in at the end:
+ *
+ * 1. Write every page and the manifest into a staging directory.
+ * 2. Move the live `pages/` aside.
+ * 3. Move staging's `pages/` into place.
+ * 4. Move the manifest over the old one — a file rename replaces atomically.
+ * 5. Discard what was moved aside.
+ *
+ * The exposure shrinks from "the length of the whole write" to the gap between
+ * steps 2 and 3, which is two directory-entry renames. A failure before step 2
+ * leaves the old site untouched; a failure between 2 and 3 is rolled back
+ * explicitly; a failure after 3 leaves the new site live with stale
+ * housekeeping, which the next run sweeps.
+ *
+ * This is not a true atomic directory swap. POSIX offers none portably, and
+ * Windows refuses a rename onto an existing directory. It is the closest thing
+ * that works on both, and it closes the window that actually gets hit.
  *
  * The only side effect is writing inside the requested `outputDir`.
  *
@@ -70,42 +146,91 @@ export async function savePages(
     throw new ValidationError("pages", issues);
   }
 
+  await mkdir(outputDir, { recursive: true });
+  await sweepLeftovers(outputDir);
+
+  // Unique per run, so two processes writing the same directory stage into
+  // different places rather than into each other.
+  const token = `${process.pid}-${Date.now().toString(36)}`;
+  const stagingDir = join(outputDir, `${STAGING_PREFIX}${token}`);
+  const stagingPages = join(stagingDir, "pages");
+  const stagingManifest = join(stagingDir, "manifest.json");
+  const retiredPages = join(outputDir, `${RETIRED_PREFIX}${token}`);
+
   const pagesDir = join(outputDir, "pages");
-  await mkdir(pagesDir, { recursive: true });
+  const manifestPath = join(outputDir, "manifest.json");
 
-  // Remove only stale page JSON files; never delete the directory itself.
-  const existing = await readdir(pagesDir);
-  await Promise.all(
-    existing
-      .filter((name) => name.endsWith(".json"))
-      .map((name) => unlink(join(pagesDir, name))),
-  );
+  try {
+    await mkdir(stagingPages, { recursive: true });
 
-  // Write one pretty-printed JSON file per page.
-  await Promise.all(
-    validated.map((page) =>
-      writeFile(
-        join(pagesDir, `${page.slug}.json`),
-        `${JSON.stringify(page, null, 2)}\n`,
-        "utf-8",
+    // One pretty-printed JSON file per page.
+    await Promise.all(
+      validated.map((page) =>
+        writeFile(
+          join(stagingPages, `${page.slug}.json`),
+          `${JSON.stringify(page, null, 2)}\n`,
+          "utf-8",
+        ),
       ),
-    ),
-  );
+    );
 
-  // Write the manifest summarizing every page.
-  const manifest: Manifest = {
-    count: validated.length,
-    pages: validated.map((page) => ({
-      slug: page.slug,
-      locale: page.locale,
-      title: page.title,
-      metaDescription: page.metaDescription,
-      templateId: page.templateId,
-    })),
-  };
-  await writeFile(
-    join(outputDir, "manifest.json"),
-    `${JSON.stringify(manifest, null, 2)}\n`,
-    "utf-8",
-  );
+    const manifest: Manifest = {
+      count: validated.length,
+      pages: validated.map((page) => ({
+        slug: page.slug,
+        locale: page.locale,
+        title: page.title,
+        metaDescription: page.metaDescription,
+        templateId: page.templateId,
+      })),
+    };
+
+    await writeFile(
+      stagingManifest,
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      "utf-8",
+    );
+  } catch (error: unknown) {
+    // Nothing has been swapped, so the live site is still the previous one.
+    await discard(stagingDir);
+    throw error;
+  }
+
+  // --- The swap. Everything above is preparation; only this is destructive. ---
+
+  let moved = false;
+
+  try {
+    try {
+      await rename(pagesDir, retiredPages);
+      moved = true;
+    } catch (error: unknown) {
+      // No previous run wrote here, so there is nothing to move aside.
+      if (!isMissing(error)) {
+        throw error;
+      }
+    }
+
+    await rename(stagingPages, pagesDir);
+  } catch (error: unknown) {
+    // Put the old site back rather than leave no site at all.
+    if (moved) {
+      await rename(retiredPages, pagesDir).catch(() => {
+        // The rollback itself failed. The retired copy is still on disk under a
+        // known name, which is the most this layer can preserve.
+      });
+    }
+    await discard(stagingDir);
+    throw error;
+  }
+
+  // A file rename replaces the destination atomically on both platforms, so the
+  // manifest is never absent and never half-written: it is the old one or the
+  // new one. It moves last because the validate stage cross-checks it against
+  // the pages directory, and a manifest ahead of its pages would read as
+  // corruption rather than as progress.
+  await rename(stagingManifest, manifestPath);
+
+  await discard(retiredPages);
+  await discard(stagingDir);
 }

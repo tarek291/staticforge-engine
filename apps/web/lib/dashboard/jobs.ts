@@ -56,6 +56,8 @@ export function startJob(
   kind: JobKind,
   locale: string,
   userId: string,
+  /** Pages this run is expected to produce, for the timeout budget. */
+  pageCount: number,
   target?: { slug: string; feedback: string },
 ): void {
   if (inFlight.has(jobId)) {
@@ -64,9 +66,11 @@ export function startJob(
 
   inFlight.add(jobId);
 
-  void run(jobId, projectId, kind, locale, userId, target).finally(() => {
-    inFlight.delete(jobId);
-  });
+  void run(jobId, projectId, kind, locale, userId, pageCount, target).finally(
+    () => {
+      inFlight.delete(jobId);
+    },
+  );
 }
 
 async function run(
@@ -75,12 +79,13 @@ async function run(
   kind: JobKind,
   locale: string,
   userId: string,
+  pageCount: number,
   target?: { slug: string; feedback: string },
 ): Promise<void> {
   const lease: JobLease = { instanceId: instanceId() };
 
   try {
-    await markJobRunning(jobId, prisma, lease);
+    await markJobRunning(jobId, userId, prisma, lease);
 
     // Flush partial output on a timer, so a poller sees the run progressing
     // rather than a blank screen followed by a verdict.
@@ -88,7 +93,7 @@ async function run(
     const flush = setInterval(() => {
       // The flush is also the heartbeat: it renews the claim on this job, so a
       // run that is genuinely progressing is never mistaken for an orphan.
-      void updateJobLogs(jobId, latest, prisma, lease).catch(() => {
+      void updateJobLogs(jobId, latest, userId, prisma, lease).catch(() => {
         // A failed log write must not abort the run it is only reporting on.
       });
     }, LOG_FLUSH_MS);
@@ -101,14 +106,15 @@ async function run(
       kind === "REFRESH"
         ? await runRefresh(projectId, target, locale, userId, onOutput)
         : kind === "BUILD"
-          ? await runPipeline(projectId, locale, userId, onOutput)
-          : await runGenerate(projectId, locale, userId, onOutput);
+          ? await runPipeline(projectId, locale, userId, pageCount, onOutput)
+          : await runGenerate(projectId, locale, userId, pageCount, onOutput);
 
     clearInterval(flush);
 
     await finishJob(
       jobId,
       { ok: result.ok, exitCode: result.exitCode, logs: result.output },
+      userId,
       prisma,
     );
   } catch (error: unknown) {
@@ -124,6 +130,7 @@ async function run(
             ? `${error.name}: ${error.message}`
             : String(error),
       },
+      userId,
       prisma,
     ).catch(() => {
       // Nothing left to do: the row will be closed out as orphaned at startup.

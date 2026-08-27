@@ -12,6 +12,8 @@ import {
   isDatabaseReachable,
   listProjectsForUser,
   markJobRunning,
+  countExpectedPages,
+  saveRefreshedPage,
   updateJobLogs,
 } from "./tenant.js";
 
@@ -277,29 +279,46 @@ describe("getJobForUser", () => {
 });
 
 describe("job lifecycle writes", () => {
+  /** Arm the scoped write and report how many rows it claims to have hit. */
+  function armWrite(count = 1): void {
+    prisma.generationJob.updateMany.mockResolvedValue({ count } as never);
+  }
+
+  /** The `where` the write was built with. */
+  function writeWhere(): Record<string, unknown> {
+    return prisma.generationJob.updateMany.mock.calls[0]?.[0]?.where as Record<
+      string,
+      unknown
+    >;
+  }
+
+  /** The `data` the write was built with. */
+  function writeData(): Record<string, unknown> {
+    return prisma.generationJob.updateMany.mock.calls[0]?.[0]?.data as Record<
+      string,
+      unknown
+    >;
+  }
+
   test("markJobRunning records when it started", async () => {
-    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
+    armWrite();
 
-    await markJobRunning("job_1", prisma);
+    await markJobRunning("job_1", "local-operator", prisma);
 
-    const data = prisma.generationJob.update.mock.calls[0]?.[0]?.data as {
-      status?: string;
-      startedAt?: Date;
-    };
-    expect(data.status).toBe("RUNNING");
-    expect(data.startedAt).toBeInstanceOf(Date);
+    expect(writeData().status).toBe("RUNNING");
+    expect(writeData().startedAt).toBeInstanceOf(Date);
   });
 
   test("markJobRunning claims the job for the instance running it", async () => {
-    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
+    armWrite();
 
     const before = Date.now();
-    await markJobRunning("job_1", prisma, { instanceId: "web-1", leaseMs: 60_000 });
+    await markJobRunning("job_1", "local-operator", prisma, {
+      instanceId: "web-1",
+      leaseMs: 60_000,
+    });
 
-    const data = prisma.generationJob.update.mock.calls[0]?.[0]?.data as {
-      lockedBy?: string;
-      leaseExpiresAt?: Date;
-    };
+    const data = writeData() as { lockedBy?: string; leaseExpiresAt?: Date };
 
     // Without a claim, "RUNNING" says only that some process once said so,
     // which is indistinguishable from a process that has since died.
@@ -309,15 +328,24 @@ describe("job lifecycle writes", () => {
     );
   });
 
+  test("updateJobLogs replaces rather than appends", async () => {
+    armWrite();
+
+    await updateJobLogs("job_1", "partial output", "local-operator", prisma);
+
+    // The caller owns and trims the buffer; a database-side append would grow
+    // without bound on a job that prints megabytes.
+    expect(writeData()).toEqual({ logs: "partial output" });
+  });
+
   test("updateJobLogs renews the claim on the same write", async () => {
-    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
+    armWrite();
 
-    await updateJobLogs("job_1", "partial", prisma, { instanceId: "web-1" });
+    await updateJobLogs("job_1", "partial", "local-operator", prisma, {
+      instanceId: "web-1",
+    });
 
-    const data = prisma.generationJob.update.mock.calls[0]?.[0]?.data as {
-      logs?: string;
-      leaseExpiresAt?: Date;
-    };
+    const data = writeData() as { logs?: string; leaseExpiresAt?: Date };
 
     // The flush is the heartbeat. A second periodic write would double the cost
     // of the noisiest query in the system to say what this one already proves.
@@ -325,35 +353,17 @@ describe("job lifecycle writes", () => {
     expect(data.leaseExpiresAt).toBeInstanceOf(Date);
   });
 
-  test("finishJob releases the claim", async () => {
-    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
-
-    await finishJob("job_1", { ok: true, exitCode: 0, logs: "done" }, prisma);
-
-    expect(prisma.generationJob.update.mock.calls[0]?.[0]?.data).toMatchObject({
-      lockedBy: null,
-      leaseExpiresAt: null,
-    });
-  });
-
-  test("updateJobLogs replaces rather than appends", async () => {
-    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
-
-    await updateJobLogs("job_1", "partial output", prisma);
-
-    // The caller owns and trims the buffer; a database-side append would grow
-    // without bound on a job that prints megabytes.
-    expect(prisma.generationJob.update.mock.calls[0]?.[0]?.data).toEqual({
-      logs: "partial output",
-    });
-  });
-
   test("finishJob completes on success", async () => {
-    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
+    armWrite();
 
-    await finishJob("job_1", { ok: true, exitCode: 0, logs: "done" }, prisma);
+    await finishJob(
+      "job_1",
+      { ok: true, exitCode: 0, logs: "done" },
+      "local-operator",
+      prisma,
+    );
 
-    expect(prisma.generationJob.update.mock.calls[0]?.[0]?.data).toMatchObject({
+    expect(writeData()).toMatchObject({
       status: "COMPLETED",
       exitCode: 0,
       logs: "done",
@@ -361,16 +371,81 @@ describe("job lifecycle writes", () => {
   });
 
   test("finishJob fails on a non-zero exit", async () => {
-    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
+    armWrite();
 
-    await finishJob("job_1", { ok: false, exitCode: 1, logs: "boom" }, prisma);
+    await finishJob(
+      "job_1",
+      { ok: false, exitCode: 1, logs: "boom" },
+      "local-operator",
+      prisma,
+    );
 
-    expect(prisma.generationJob.update.mock.calls[0]?.[0]?.data).toMatchObject({
-      status: "FAILED",
-      exitCode: 1,
-    });
+    expect(writeData()).toMatchObject({ status: "FAILED", exitCode: 1 });
+  });
+
+  test("finishJob releases the claim", async () => {
+    armWrite();
+
+    await finishJob(
+      "job_1",
+      { ok: true, exitCode: 0, logs: "done" },
+      "local-operator",
+      prisma,
+    );
+
+    expect(writeData()).toMatchObject({ lockedBy: null, leaseExpiresAt: null });
+  });
+
+  test("every lifecycle write is scoped to the job's owner", async () => {
+    // An id is not a capability: it appears in a URL, a log line and a poller's
+    // request. Knowing it must not mean being able to overwrite the logs or
+    // mark the job failed.
+    const writes: Array<[string, () => Promise<unknown>]> = [
+      ["markJobRunning", () => markJobRunning("job_1", "user_a", prisma)],
+      ["updateJobLogs", () => updateJobLogs("job_1", "x", "user_a", prisma)],
+      [
+        "finishJob",
+        () =>
+          finishJob("job_1", { ok: true, exitCode: 0, logs: "" }, "user_a", prisma),
+      ],
+    ];
+
+    for (const [name, write] of writes) {
+      prisma.generationJob.updateMany.mockClear();
+      armWrite();
+
+      await write();
+
+      expect(writeWhere(), `${name} is not scoped`).toEqual({
+        id: "job_1",
+        userId: "user_a",
+      });
+    }
+  });
+
+  test("a write that matches nothing reports it rather than claiming success", async () => {
+    // "Not yours" and "already gone" both land here, and a caller that cannot
+    // tell them from success would carry on against a job it does not hold.
+    armWrite(0);
+
+    await expect(markJobRunning("job_1", "user_other", prisma)).resolves.toBe(
+      false,
+    );
+  });
+
+  test("uses updateMany so the owner can be part of the condition", async () => {
+    armWrite();
+
+    await markJobRunning("job_1", "local-operator", prisma);
+
+    // `update` wants a unique `where`, and an id is unique — which is the
+    // problem: the scope would have to become a check on the result, which is
+    // the pattern this module exists to avoid.
+    expect(prisma.generationJob.update).not.toHaveBeenCalled();
+    expect(prisma.generationJob.updateMany).toHaveBeenCalledTimes(1);
   });
 });
+
 
 describe("failOrphanedJobs", () => {
   const now = new Date("2026-08-27T12:00:00.000Z");
@@ -485,5 +560,81 @@ describe("LOCAL_OPERATOR_ID", () => {
     // The Prisma default was chosen to equal this constant; a mismatch would
     // make every seeded project invisible to the dashboard.
     expect(LOCAL_OPERATOR_ID).toBe("local-operator");
+  });
+});
+
+describe("saveRefreshedPage", () => {
+  const page = {
+    slug: "bueroreinigung-duisburg",
+    title: "T",
+    metaDescription: "M",
+    h1: "H",
+    content: { hero: { heading: "x" } },
+  };
+
+  test("is scoped through the project relation", async () => {
+    prisma.generatedPage.updateMany.mockResolvedValue({ count: 1 } as never);
+
+    await saveRefreshedPage("prj_1", page, "local-operator", prisma);
+
+    // The page is unreachable unless its project is — the same guarantee
+    // getPageForUser gives on the read side, applied to the write that follows
+    // it rather than assumed from it.
+    expect(prisma.generatedPage.updateMany.mock.calls[0]?.[0]?.where).toEqual({
+      projectId: "prj_1",
+      slug: "bueroreinigung-duisburg",
+      project: { userId: "local-operator" },
+    });
+  });
+
+  test("reports a miss instead of silently succeeding", async () => {
+    prisma.generatedPage.updateMany.mockResolvedValue({ count: 0 } as never);
+
+    // A refresh that writes nothing must not let the caller go on to write the
+    // static file, or the output would claim a revision the database refused.
+    await expect(
+      saveRefreshedPage("prj_1", page, "user_other", prisma),
+    ).resolves.toBe(false);
+  });
+
+  test("still writes only the fields a refresh may change", async () => {
+    prisma.generatedPage.updateMany.mockResolvedValue({ count: 1 } as never);
+
+    await saveRefreshedPage("prj_1", page, "local-operator", prisma);
+
+    const data = prisma.generatedPage.updateMany.mock.calls[0]?.[0]
+      ?.data as Record<string, unknown>;
+
+    // A mistake upstream must not be able to move a slug or clear a link graph
+    // through this path.
+    expect(Object.keys(data).sort()).toEqual(
+      ["content", "generation", "h1", "metaDescription", "source", "title"].sort(),
+    );
+    expect(data.source).toBe("MANUAL");
+  });
+});
+
+describe("countExpectedPages", () => {
+  test("multiplies the service x location grid the generator walks", async () => {
+    prisma.project.findFirst.mockResolvedValue({
+      _count: { services: 5, locations: 40 },
+    } as never);
+
+    await expect(
+      countExpectedPages("prj_1", "local-operator", prisma),
+    ).resolves.toBe(200);
+  });
+
+  test("is scoped, and a foreign project counts as nothing rather than zero", async () => {
+    prisma.project.findFirst.mockResolvedValue(null as never);
+
+    await expect(
+      countExpectedPages("prj_1", "user_other", prisma),
+    ).resolves.toBeNull();
+
+    expect(prisma.project.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "prj_1",
+      userId: "user_other",
+    });
   });
 });

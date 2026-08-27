@@ -10,6 +10,8 @@ import type {
   Service,
 } from "@staticforge/schemas";
 
+import { withDbRetry } from "./retry.js";
+
 /**
  * The data-access bridge between the database and the generation engine.
  *
@@ -127,16 +129,22 @@ export async function getProjectPayload(
   // `findFirst`, not `findUnique`: the scope is part of the lookup rather than
   // a check applied to its result, so "not yours" cannot be reached by an early
   // return that forgot to run.
-  const project = await prisma.project.findFirst({
-    where: { id: projectId, userId },
-    include: {
-      workspace: true,
-      business: true,
-      content: true,
-      services: { orderBy: { createdAt: "asc" } },
-      locations: { orderBy: { createdAt: "asc" } },
-    },
-  });
+  //
+  // Retried on a dropped connection: this is the first query of a run that may
+  // then spend an hour authoring pages, and losing it to a recycled pooler
+  // connection would waste the whole invocation. A read repeats cleanly.
+  const project = await withDbRetry(() =>
+    prisma.project.findFirst({
+      where: { id: projectId, userId },
+      include: {
+        workspace: true,
+        business: true,
+        content: true,
+        services: { orderBy: { createdAt: "asc" } },
+        locations: { orderBy: { createdAt: "asc" } },
+      },
+    }),
+  );
 
   if (project === null) {
     throw new ProjectPayloadError(projectId, "not found.");
@@ -331,55 +339,62 @@ export async function saveGeneratedPages(
   const source: PageSource = options.source ?? "TEMPLATE";
   const slugs = pages.map((page) => page.slug);
 
-  return prisma.$transaction(async (tx) => {
-    const owned = await tx.project.findFirst({
-      where: { id: projectId, userId },
-      select: { id: true },
-    });
-
-    if (owned === null) {
-      throw new ProjectPayloadError(projectId, "not found.");
-    }
-
-    // Scoped through the relation as well as by id. The ownership check above
-    // already settles it; expressing it again here means a future refactor that
-    // drops the check still cannot delete another tenant's rows.
-    const { count: removed } = await tx.generatedPage.deleteMany({
-      where: { projectId, project: { userId }, slug: { notIn: slugs } },
-    });
-
-    for (const page of pages) {
-      const fields = {
-        locale: page.locale,
-        title: page.title,
-        metaDescription: page.metaDescription,
-        h1: page.h1,
-        content: page.content as unknown as Prisma.InputJsonObject,
-        schemaOrg: page.schemaOrg as Prisma.InputJsonObject,
-        templateId: page.templateId,
-        contentProfileId: page.contentProfileId,
-        source,
-        // Provenance travels with the page or it is lost: cloud mode would
-        // otherwise silently drop the prompt, model and source fingerprint that
-        // the file output records.
-        generation:
-          page.generation === undefined
-            ? Prisma.DbNull
-            : (page.generation as unknown as Prisma.InputJsonObject),
-        // Links travel with the page for the same reason provenance does: cloud
-        // mode would otherwise hold a page whose internal graph had vanished.
-        links: page.links as unknown as Prisma.InputJsonArray,
-        serviceId: page.serviceId,
-        locationId: page.locationId,
-      };
-
-      await tx.generatedPage.upsert({
-        where: { projectId_slug: { projectId, slug: page.slug } },
-        create: { projectId, slug: page.slug, ...fields },
-        update: fields,
+  // Retried whole. A transaction is the one write shape that is always safe to
+  // repeat: a connection lost part-way rolls it back completely, so the second
+  // attempt starts against exactly the state the first one found. This is also
+  // the write worth protecting most — it lands at the end of a long run, and
+  // losing it there discards everything the run produced.
+  return withDbRetry(() =>
+    prisma.$transaction(async (tx) => {
+      const owned = await tx.project.findFirst({
+        where: { id: projectId, userId },
+        select: { id: true },
       });
-    }
 
-    return { saved: pages.length, removed };
-  });
+      if (owned === null) {
+        throw new ProjectPayloadError(projectId, "not found.");
+      }
+
+      // Scoped through the relation as well as by id. The ownership check above
+      // already settles it; expressing it again here means a future refactor that
+      // drops the check still cannot delete another tenant's rows.
+      const { count: removed } = await tx.generatedPage.deleteMany({
+        where: { projectId, project: { userId }, slug: { notIn: slugs } },
+      });
+
+      for (const page of pages) {
+        const fields = {
+          locale: page.locale,
+          title: page.title,
+          metaDescription: page.metaDescription,
+          h1: page.h1,
+          content: page.content as unknown as Prisma.InputJsonObject,
+          schemaOrg: page.schemaOrg as Prisma.InputJsonObject,
+          templateId: page.templateId,
+          contentProfileId: page.contentProfileId,
+          source,
+          // Provenance travels with the page or it is lost: cloud mode would
+          // otherwise silently drop the prompt, model and source fingerprint that
+          // the file output records.
+          generation:
+            page.generation === undefined
+              ? Prisma.DbNull
+              : (page.generation as unknown as Prisma.InputJsonObject),
+          // Links travel with the page for the same reason provenance does: cloud
+          // mode would otherwise hold a page whose internal graph had vanished.
+          links: page.links as unknown as Prisma.InputJsonArray,
+          serviceId: page.serviceId,
+          locationId: page.locationId,
+        };
+
+        await tx.generatedPage.upsert({
+          where: { projectId_slug: { projectId, slug: page.slug } },
+          create: { projectId, slug: page.slug, ...fields },
+          update: fields,
+        });
+      }
+
+      return { saved: pages.length, removed };
+    }),
+  );
 }

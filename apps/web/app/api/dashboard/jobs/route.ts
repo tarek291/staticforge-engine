@@ -1,5 +1,10 @@
 import { ProjectIdSchema } from "@staticforge/core";
-import { LOCAL_OPERATOR_ID, enqueueJob, prisma } from "@staticforge/database";
+import {
+  LOCAL_OPERATOR_ID,
+  countExpectedPages,
+  enqueueJob,
+  prisma,
+} from "@staticforge/database";
 import { LocaleSchema } from "@staticforge/schemas";
 
 import {
@@ -99,12 +104,24 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Project not found." }, { status: 404 });
   }
 
+  // Budget the run from the grid it will walk. A flat timeout either kills a
+  // large project part-way — which is what the ten-minute limit did to every
+  // real authoring run — or leaves a small one an hour in which to hang.
+  // Falls back to zero, which buys only the base allowance, if the count is
+  // unavailable for any reason.
+  const pageCount = (await countExpectedPages(
+    parsedProjectId.data,
+    LOCAL_OPERATOR_ID,
+    prisma,
+  )) ?? 0;
+
   startJob(
     job.id,
     parsedProjectId.data,
     kind,
     parsedLocale.data,
     LOCAL_OPERATOR_ID,
+    pageCount,
     target,
   );
 

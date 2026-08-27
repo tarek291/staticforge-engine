@@ -146,7 +146,19 @@ async function main(): Promise<void> {
       : `· unchanged (${result.contentHash}) — the model judged the feedback already satisfied`,
   );
 
-  await saveRefreshedPage(projectId, result.page, prisma);
+  const written = await saveRefreshedPage(projectId, result.page, userId, prisma);
+
+  if (!written) {
+    // The scoped read above found the page, so reaching this means it moved or
+    // changed hands mid-run. Writing the file anyway would leave the static
+    // output claiming a revision the database never accepted.
+    console.error(
+      `Page "${slug}" in project "${projectId}" could not be written. ` +
+        `It no longer exists, or is no longer yours.`,
+    );
+    process.exit(1);
+  }
+
   console.log("✓ database updated");
 
   // The static file has to move with the row, or the next build would publish

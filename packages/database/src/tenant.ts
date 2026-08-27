@@ -1,6 +1,8 @@
 import { Prisma } from "@prisma/client";
 import type { JobKind, JobStatus, PrismaClient } from "@prisma/client";
 
+import { withDbRetry } from "./retry.js";
+
 /**
  * Tenant-scoped reads and job bookkeeping.
  *
@@ -318,28 +320,59 @@ function leaseDeadline(lease: JobLease, now: Date): Date {
  * The claim is what makes the job's liveness observable from another process.
  * Without it, "RUNNING" means only that some process once said so, which is
  * indistinguishable from a process that has since died.
+ *
+ * ## Why these writes take an owner, and why they use `updateMany`
+ *
+ * Every write below addresses a job by id alone unless the owner is part of the
+ * `where`. An id is not a capability: it appears in a URL, a log line and a
+ * poller's request, so "knows the id" cannot be allowed to mean "may overwrite
+ * the logs" or "may mark it failed".
+ *
+ * `updateMany` rather than `update` because `update` wants a unique `where`,
+ * and an id *is* unique — which is exactly the problem: the scope would have to
+ * be a separate check on the result, which is the pattern this module exists to
+ * avoid. `updateMany` takes the whole condition, so a job belonging to someone
+ * else matches nothing.
+ *
+ * Each returns whether it actually hit a row, so a caller can tell "done" from
+ * "not yours" instead of assuming the first.
+ *
+ * @returns Whether the job was found and updated.
  */
 export async function markJobRunning(
   jobId: string,
+  userId: string,
   prisma: PrismaClient,
   lease?: JobLease,
-): Promise<void> {
+): Promise<boolean> {
   const now = new Date();
 
-  await prisma.generationJob.update({
-    where: { id: jobId },
-    data: {
-      status: "RUNNING",
-      startedAt: now,
-      ...(lease === undefined
-        ? {}
-        : { lockedBy: lease.instanceId, leaseExpiresAt: leaseDeadline(lease, now) }),
-    },
-  });
+  // Retried: losing this to a dropped connection leaves a job that a worker
+  // believes it started and the database believes is still queued.
+  const { count } = await withDbRetry(() =>
+    prisma.generationJob.updateMany({
+      where: { id: jobId, userId },
+      data: {
+        status: "RUNNING",
+        startedAt: now,
+        ...(lease === undefined
+          ? {}
+          : {
+              lockedBy: lease.instanceId,
+              leaseExpiresAt: leaseDeadline(lease, now),
+            }),
+      },
+    }),
+  );
+
+  return count > 0;
 }
 
 /**
  * Append progress to a running job, and renew its claim.
+ *
+ * Scoped to the owner for the same reason the rest are: an unscoped log write
+ * lets anyone holding a job id overwrite what an operator is reading.
  *
  * Replaces rather than concatenates: the caller owns the buffer and has already
  * trimmed it, and a database-side append would grow without bound on a job that
@@ -349,15 +382,23 @@ export async function markJobRunning(
  * flush already runs on a timer for exactly as long as the job does, so it is
  * the heartbeat — and a second periodic write would double the cost of the
  * noisiest query in the system to say something this one already proves.
+ *
+ * Deliberately *not* wrapped in {@link withDbRetry}, unlike every other write
+ * here. The flush already repeats every couple of seconds with the same buffer,
+ * so the next tick is the retry — a backoff loop inside one tick would only
+ * risk overlapping with it, on the highest-frequency query in the system, to
+ * re-send a log line that is about to be sent again anyway. The lease is what
+ * makes that safe: it outlives several missed flushes.
  */
 export async function updateJobLogs(
   jobId: string,
   logs: string,
+  userId: string,
   prisma: PrismaClient,
   lease?: JobLease,
-): Promise<void> {
-  await prisma.generationJob.update({
-    where: { id: jobId },
+): Promise<boolean> {
+  const { count } = await prisma.generationJob.updateMany({
+    where: { id: jobId, userId },
     data: {
       logs,
       ...(lease === undefined
@@ -365,6 +406,8 @@ export async function updateJobLogs(
         : { leaseExpiresAt: leaseDeadline(lease, new Date()) }),
     },
   });
+
+  return count > 0;
 }
 
 /**
@@ -377,19 +420,55 @@ export async function updateJobLogs(
 export async function finishJob(
   jobId: string,
   outcome: { ok: boolean; exitCode: number; logs: string },
+  userId: string,
   prisma: PrismaClient,
-): Promise<void> {
-  await prisma.generationJob.update({
-    where: { id: jobId },
-    data: {
-      status: outcome.ok ? "COMPLETED" : "FAILED",
-      exitCode: outcome.exitCode,
-      logs: outcome.logs,
-      completedAt: new Date(),
-      lockedBy: null,
-      leaseExpiresAt: null,
-    },
-  });
+): Promise<boolean> {
+  // The worst write in the system to lose: a run that finished but could not
+  // say so leaves a job reading RUNNING until its lease lapses, and an operator
+  // watching a completed build that never completes.
+  const { count } = await withDbRetry(() =>
+    prisma.generationJob.updateMany({
+      where: { id: jobId, userId },
+      data: {
+        status: outcome.ok ? "COMPLETED" : "FAILED",
+        exitCode: outcome.exitCode,
+        logs: outcome.logs,
+        completedAt: new Date(),
+        lockedBy: null,
+        leaseExpiresAt: null,
+      },
+    }),
+  );
+
+  return count > 0;
+}
+
+/**
+ * How many pages a run for this project is expected to produce.
+ *
+ * The service x location grid, which is what `buildPages` walks. Used to budget
+ * a run's timeout: a flat limit either kills a large project or gives a small
+ * one an hour to hang in, and only the caller's own project may be measured, so
+ * this is scoped like every other read here.
+ *
+ * @returns The expected page count, or `null` when the project is not the
+ * caller's — the same answer as a project that does not exist.
+ */
+export async function countExpectedPages(
+  projectId: string,
+  userId: string,
+  prisma: PrismaClient,
+): Promise<number | null> {
+  const project = await withDbRetry(() =>
+    prisma.project.findFirst({
+      where: { id: projectId, userId },
+      select: { _count: { select: { services: true, locations: true } } },
+    }),
+  );
+
+  return project === null
+    ? null
+    : project._count.services * project._count.locations;
 }
 
 /** Read one job a user owns, or `null`. */
@@ -467,19 +546,23 @@ export async function failOrphanedJobs(
     abandoned.unshift({ lockedBy: options.instanceId });
   }
 
-  const result = await prisma.generationJob.updateMany({
-    where: {
-      status: { in: ["PENDING", "RUNNING"] },
-      OR: abandoned,
-    },
-    data: {
-      status: "FAILED",
-      exitCode: -1,
-      completedAt: now,
-      lockedBy: null,
-      leaseExpiresAt: null,
-    },
-  });
+  // Retried: this runs once at boot, and a connection that was not ready yet is
+  // the single most likely moment for it to fail.
+  const result = await withDbRetry(() =>
+    prisma.generationJob.updateMany({
+      where: {
+        status: { in: ["PENDING", "RUNNING"] },
+        OR: abandoned,
+      },
+      data: {
+        status: "FAILED",
+        exitCode: -1,
+        completedAt: now,
+        lockedBy: null,
+        leaseExpiresAt: null,
+      },
+    }),
+  );
 
   return result.count;
 }
@@ -555,6 +638,12 @@ export async function getPageForUser(
  * Deliberately narrow: it writes only the fields a refresh may change, so a
  * mistake upstream cannot move a slug or clear a link graph through this path.
  * `slug` appears only in the `where`.
+ *
+ * Scoped through the project relation, so the page is unreachable unless its
+ * project is — the same guarantee `getPageForUser` gives on the read side,
+ * applied to the write that follows it rather than assumed from it.
+ *
+ * @returns Whether the page was found and rewritten.
  */
 export async function saveRefreshedPage(
   projectId: string,
@@ -566,20 +655,27 @@ export async function saveRefreshedPage(
     content: unknown;
     generation?: unknown;
   },
+  userId: string,
   prisma: PrismaClient,
-): Promise<void> {
-  await prisma.generatedPage.update({
-    where: { projectId_slug: { projectId, slug: page.slug } },
-    data: {
-      title: page.title,
-      metaDescription: page.metaDescription,
-      h1: page.h1,
-      content: page.content as Prisma.InputJsonObject,
-      generation:
-        page.generation === undefined
-          ? Prisma.DbNull
-          : (page.generation as Prisma.InputJsonObject),
-      source: "MANUAL",
-    },
-  });
+): Promise<boolean> {
+  // Retried: this lands immediately after a paid authoring call, so losing it
+  // to a connection blip means paying again for the same revision.
+  const { count } = await withDbRetry(() =>
+    prisma.generatedPage.updateMany({
+      where: { projectId, slug: page.slug, project: { userId } },
+      data: {
+        title: page.title,
+        metaDescription: page.metaDescription,
+        h1: page.h1,
+        content: page.content as Prisma.InputJsonObject,
+        generation:
+          page.generation === undefined
+            ? Prisma.DbNull
+            : (page.generation as Prisma.InputJsonObject),
+        source: "MANUAL",
+      },
+    }),
+  );
+
+  return count > 0;
 }

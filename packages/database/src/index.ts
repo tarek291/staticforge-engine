@@ -38,6 +38,7 @@ if (process.env.NODE_ENV !== "production") {
   globalForPrisma.prisma = prisma;
 }
 
+export * from "./retry.js";
 export * from "./repository.js";
 export * from "./tenant.js";
 

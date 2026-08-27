@@ -5,7 +5,11 @@ import {
 } from "node:child_process";
 import { resolve } from "node:path";
 
-import { assertSafeProjectId } from "@staticforge/core";
+import {
+  assertSafeProjectId,
+  computeCommandTimeoutMs,
+  describeBudget,
+} from "@staticforge/core";
 import { LocaleSchema } from "@staticforge/schemas";
 
 /**
@@ -51,8 +55,15 @@ export function repoRoot(): string {
   return process.env.STATICFORGE_REPO_ROOT ?? resolve(process.cwd(), "../..");
 }
 
-/** Longest a command may run before it is killed, in milliseconds. */
-const TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * Longest a command may run before it is killed, when nothing is known about
+ * the size of the work.
+ *
+ * A floor, not a policy: callers that know the page count pass a budget derived
+ * from it. See `computeCommandTimeoutMs` for why a flat limit cannot serve this
+ * workload.
+ */
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** How long a signalled tree has to exit before it is killed outright. */
 const KILL_GRACE_MS = 5_000;
@@ -138,6 +149,8 @@ export function runCommand(
   env: Record<string, string> = {},
   /** Called as output arrives, so a long run can report progress. */
   onOutput?: (output: string) => void,
+  /** Budget for this run. Defaults to {@link DEFAULT_TIMEOUT_MS}. */
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<CommandResult> {
   const started = Date.now();
   const root = repoRoot();
@@ -188,10 +201,10 @@ export function runCommand(
     const timer = setTimeout(() => {
       const killed = killTree(child);
       output +=
-        `\n\nTimed out after ${TIMEOUT_MS / 1000}s and was killed` +
+        `\n\nTimed out after ${describeBudget(timeoutMs)} and was killed` +
         `${killed ? "" : " (the process tree could not be signalled)"}.`;
       finish(124);
-    }, TIMEOUT_MS);
+    }, timeoutMs);
 
     const capture = (chunk: Buffer): void => {
       output += chunk.toString();
@@ -256,6 +269,26 @@ function checkArgs(
 }
 
 /**
+ * Whether the run this budget is for will author content with the model.
+ *
+ * Read from the same variable the spawned process will read, because it is the
+ * one that decides whether a page costs milliseconds or half a minute. The
+ * child inherits this environment, so the budget and the work it is budgeting
+ * cannot disagree.
+ */
+function aiAuthoringEnabled(): boolean {
+  return process.env.USE_AI_GENERATION === "true";
+}
+
+/** Budget one run from the number of pages it is expected to produce. */
+function budgetFor(pageCount: number): number {
+  return computeCommandTimeoutMs({
+    pageCount,
+    aiEnabled: aiAuthoringEnabled(),
+  });
+}
+
+/**
  * The owner the spawned command acts as.
  *
  * Through the environment for the same reason the refresh feedback is: `argv`
@@ -276,6 +309,8 @@ export function runGenerate(
   projectId: string | undefined,
   locale: string,
   userId: string,
+  /** Pages this run is expected to produce, for the timeout budget. */
+  pageCount: number,
   onOutput?: (output: string) => void,
 ): Promise<CommandResult> {
   const checked = checkArgs(projectId, locale);
@@ -295,7 +330,13 @@ export function runGenerate(
     args.push("--project-id", checked.projectId);
   }
 
-  return runCommand("npx", args, operatorEnv(userId), onOutput);
+  return runCommand(
+    "npx",
+    args,
+    operatorEnv(userId),
+    onOutput,
+    budgetFor(pageCount),
+  );
 }
 
 /** Run the full deploy pipeline: generate, validate, build. */
@@ -303,6 +344,8 @@ export function runPipeline(
   projectId: string | undefined,
   locale: string,
   userId: string,
+  /** Pages this run is expected to produce, for the timeout budget. */
+  pageCount: number,
   onOutput?: (output: string) => void,
 ): Promise<CommandResult> {
   const checked = checkArgs(projectId, locale);
@@ -323,7 +366,13 @@ export function runPipeline(
     args.push("--project-id", checked.projectId);
   }
 
-  return runCommand("npx", args, operatorEnv(userId), onOutput);
+  return runCommand(
+    "npx",
+    args,
+    operatorEnv(userId),
+    onOutput,
+    budgetFor(pageCount),
+  );
 }
 
 /**
@@ -376,5 +425,7 @@ export function runRefresh(
     ],
     { ...operatorEnv(userId), STATICFORGE_FEEDBACK: target.feedback },
     onOutput,
+    // A refresh rewrites exactly one page.
+    budgetFor(1),
   );
 }
