@@ -85,7 +85,14 @@ function check(label: string, condition: boolean, detail = ""): boolean {
 }
 
 function resolveRepoRoot(): string {
-  return process.env.INIT_CWD ?? resolve(process.cwd(), "../..");
+  // STATICFORGE_REPO_ROOT is the explicit contract, checked first: npx and npm
+  // rewrite INIT_CWD to their own working directory, so a parent process cannot
+  // hand the root down through it.
+  return (
+    process.env.STATICFORGE_REPO_ROOT ??
+    process.env.INIT_CWD ??
+    resolve(process.cwd(), "../..")
+  );
 }
 
 async function main(): Promise<void> {
