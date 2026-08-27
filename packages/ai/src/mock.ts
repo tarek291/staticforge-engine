@@ -10,6 +10,7 @@ import type {
   AuthoredContent,
   GeneratedPageContent,
   GenerationRequest,
+  RefreshRequest,
 } from "./service.js";
 
 /**
@@ -133,6 +134,8 @@ export function buildMockContent(
 /** The subset of the service the generator actually calls. */
 export interface AuthoringService {
   authorPage(request: GenerationRequest): Promise<AuthoredContent>;
+  /** Revise an existing page. The mock ignores the feedback by design. */
+  refreshPage(request: RefreshRequest): Promise<AuthoredContent>;
 }
 
 /**
@@ -154,24 +157,30 @@ export function createMockService(
     modelVersion = "mock",
   } = options;
 
-  return {
-    async authorPage(request: GenerationRequest): Promise<AuthoredContent> {
+  const author = async (request: GenerationRequest): Promise<AuthoredContent> => {
       // Jittered latency, so pacing and progress behave as they would against a
       // real provider instead of resolving in the same tick.
       const spread = latencyMs * jitter;
       await sleepFn(Math.max(0, latencyMs - spread + random() * spread * 2));
 
-      return {
-        content: buildMockContent(request, profile),
-        provenance: {
-          promptVersion: PROMPT_VERSION,
-          modelVersion,
-          profileId: profile.id,
-          sourceHash: request.cacheIdentity?.sourceHash,
-          cacheHit: false,
-        },
-      };
-    },
+    return {
+      content: buildMockContent(request, profile),
+      provenance: {
+        promptVersion: PROMPT_VERSION,
+        modelVersion,
+        profileId: profile.id,
+        sourceHash: request.cacheIdentity?.sourceHash,
+        cacheHit: false,
+      },
+    };
+  };
+
+  return {
+    authorPage: author,
+    // A mock cannot act on feedback, and pretending otherwise would make a
+    // refresh test pass for the wrong reason. It regenerates instead, which is
+    // enough to exercise every gate and every merge rule around it.
+    refreshPage: (request: RefreshRequest) => author(request),
   };
 }
 

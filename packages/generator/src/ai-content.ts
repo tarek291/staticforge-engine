@@ -210,6 +210,14 @@ export async function applyAiContent(
         modelVersion: provenance.modelVersion,
         profileId: provenance.profileId,
         sourceHash,
+        // Fingerprinted here too, so a later refresh can tell whether it
+        // actually changed anything rather than guessing.
+        contentHash: stableHash({
+          title: content.title,
+          metaDescription: content.metaDescription,
+          h1: content.h1,
+          content: content.content,
+        }),
         generatedAt: new Date().toISOString(),
       },
     };

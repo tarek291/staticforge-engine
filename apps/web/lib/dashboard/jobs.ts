@@ -6,7 +6,7 @@ import {
   type JobKind,
 } from "@staticforge/database";
 
-import { runGenerate, runPipeline } from "./run-command";
+import { runGenerate, runPipeline, runRefresh } from "./run-command";
 
 /**
  * Runs a queued job in the background.
@@ -39,14 +39,20 @@ const inFlight = new Set<string>();
  * rather than thrown, because by the time one happens there is no request left
  * to answer.
  */
-export function startJob(jobId: string, projectId: string, kind: JobKind, locale: string): void {
+export function startJob(
+  jobId: string,
+  projectId: string,
+  kind: JobKind,
+  locale: string,
+  target?: { slug: string; feedback: string },
+): void {
   if (inFlight.has(jobId)) {
     return;
   }
 
   inFlight.add(jobId);
 
-  void run(jobId, projectId, kind, locale).finally(() => {
+  void run(jobId, projectId, kind, locale, target).finally(() => {
     inFlight.delete(jobId);
   });
 }
@@ -56,6 +62,7 @@ async function run(
   projectId: string,
   kind: JobKind,
   locale: string,
+  target?: { slug: string; feedback: string },
 ): Promise<void> {
   try {
     await markJobRunning(jobId, prisma);
@@ -76,9 +83,11 @@ async function run(
     };
 
     const result =
-      kind === "BUILD"
-        ? await runPipeline(projectId, locale, onOutput)
-        : await runGenerate(projectId, locale, onOutput);
+      kind === "REFRESH"
+        ? await runRefresh(projectId, target, locale, onOutput)
+        : kind === "BUILD"
+          ? await runPipeline(projectId, locale, onOutput)
+          : await runGenerate(projectId, locale, onOutput);
 
     clearInterval(flush);
 

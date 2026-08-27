@@ -27,7 +27,12 @@ import {
   type CacheKeyParts,
   type ContentCache,
 } from "./cache.js";
-import { PROMPT_VERSION, buildSystemPrompt, buildUserPrompt } from "./prompts.js";
+import {
+  PROMPT_VERSION,
+  buildRefreshPrompt,
+  buildSystemPrompt,
+  buildUserPrompt,
+} from "./prompts.js";
 import type { PagePromptDetails } from "./prompts.js";
 import { RetryExhaustedError, withRetry, type RetryOptions } from "./retry.js";
 
@@ -129,6 +134,49 @@ export const TOOL_INPUT_SCHEMA = ((): Anthropic.Tool["input_schema"] => {
   return schema as Anthropic.Tool["input_schema"];
 })();
 
+/**
+ * Render the current page as readable text for a revision prompt.
+ *
+ * Plain labelled sections rather than JSON: the model is being asked to revise
+ * prose, and prose is what it should see. Handing it the payload shape would
+ * invite it to answer in that shape outside the tool call.
+ */
+function renderCurrentContent(content: GeneratedPageContent): string {
+  const lines = [
+    `title: ${content.title}`,
+    `metaDescription: ${content.metaDescription}`,
+    `h1: ${content.h1}`,
+    `hero heading: ${content.content.hero.heading}`,
+  ];
+
+  if (content.content.hero.subheading !== undefined) {
+    lines.push(`hero subheading: ${content.content.hero.subheading}`);
+  }
+
+  content.content.sections.forEach((section, index) => {
+    lines.push(
+      ``,
+      `section ${index + 1}${section.kind === undefined ? "" : ` (${section.kind})`}: ${section.heading}`,
+      section.body,
+    );
+  });
+
+  content.content.faq.forEach((item, index) => {
+    lines.push(``, `faq ${index + 1}: ${item.question}`, item.answer);
+  });
+
+  lines.push(``, `cta: ${content.content.cta.heading} — ${content.content.cta.buttonLabel}`);
+
+  return lines.join("\n");
+}
+
+/** Append the verified record to a user turn, when there is one. */
+function withFacts(text: string, request: GenerationRequest): string {
+  return request.facts === undefined
+    ? text
+    : `${text}\n\n${renderGroundingFacts(request.facts)}`;
+}
+
 /** Reported when a transport failure is about to be retried. */
 export interface GenerationRetryNotice {
   attempt: number;
@@ -208,6 +256,14 @@ export interface ContentProvenance {
   sourceHash: string | undefined;
   /** Whether this came from the cache rather than the provider. */
   cacheHit: boolean;
+}
+
+/** A page that already exists, and what the operator wants changed about it. */
+export interface RefreshRequest extends GenerationRequest {
+  /** What the page says now. */
+  current: GeneratedPageContent;
+  /** The operator instruction driving this revision. */
+  feedback: string;
 }
 
 /** Authored content together with its provenance. */
@@ -307,6 +363,63 @@ export class AIGenerationService {
     }
 
     return { content, provenance: this.provenance(request, false) };
+  }
+
+  /**
+   * Revise an existing page against operator feedback.
+   *
+   * The same four gates apply, unchanged: a revision that violates the contract,
+   * the profile or the verified record is rejected, and the page that is already
+   * published stays published. A rewrite is the *most* dangerous moment to relax
+   * grounding — the model has prose in front of it and an instruction to change
+   * it, which is exactly when a plausible invention slips in.
+   *
+   * The cache is deliberately bypassed. A refresh is a person asking for
+   * something to change; answering it from a store would be surprising at best,
+   * and the base key does not encode the feedback anyway.
+   */
+  async refreshPage(request: RefreshRequest): Promise<AuthoredContent> {
+    if (this.requireFacts && request.facts === undefined) {
+      throw new AIRequestError(
+        "requireFacts is enabled but no verified record was supplied; " +
+          "a revision would be unverifiable.",
+        undefined,
+        undefined,
+      );
+    }
+
+    if (request.feedback.trim().length === 0) {
+      throw new AIRequestError(
+        "Refresh requires feedback: without it there is nothing to change, " +
+          "and the call would cost a page rewrite for no reason.",
+        undefined,
+        undefined,
+      );
+    }
+
+    const response = await this.callProvider(request, () =>
+      buildRefreshPrompt({
+        businessName: request.businessName,
+        serviceName: request.serviceName,
+        cityName: request.cityName,
+        currentContent: renderCurrentContent(request.current),
+        feedback: request.feedback,
+      }),
+    );
+
+    const toolUse = response.content.find(
+      (block): block is Anthropic.ToolUseBlock =>
+        block.type === "tool_use" && block.name === TOOL_NAME,
+    );
+
+    if (toolUse === undefined) {
+      throw new AIToolCallMissingError(TOOL_NAME, response.stop_reason);
+    }
+
+    return {
+      content: this.acceptOrReject(toolUse.input, request.facts),
+      provenance: this.provenance(request, false),
+    };
   }
 
   /** The full cache key parts, or undefined when the caller supplied no identity. */
@@ -452,6 +565,7 @@ export class AIGenerationService {
   /** Gate 1, with the transport retry policy wrapped around it. */
   private async callProvider(
     request: GenerationRequest,
+    buildText: () => string = () => this.buildRequestText(request),
   ): Promise<Anthropic.Message> {
     try {
       return await withRetry(
@@ -474,9 +588,7 @@ export class AIGenerationService {
               name: TOOL_NAME,
               disable_parallel_tool_use: true,
             },
-            messages: [
-              { role: "user", content: this.buildRequestText(request) },
-            ],
+            messages: [{ role: "user", content: withFacts(buildText(), request) }],
           }) as Promise<Anthropic.Message>,
         {
           ...this.retryOptions,

@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import type { JobKind, JobStatus, PrismaClient } from "@prisma/client";
 
 /**
@@ -231,6 +232,7 @@ export async function enqueueJob(
   userId: string,
   kind: JobKind,
   prisma: PrismaClient,
+  target?: { slug: string; feedback: string },
 ): Promise<JobSummary | null> {
   const project = await prisma.project.findFirst({
     where: { id: projectId, userId },
@@ -242,7 +244,15 @@ export async function enqueueJob(
   }
 
   const job = await prisma.generationJob.create({
-    data: { projectId, userId, kind, status: "PENDING" },
+    data: {
+      projectId,
+      userId,
+      kind,
+      status: "PENDING",
+      ...(target !== undefined
+        ? { targetSlug: target.slug, feedback: target.feedback }
+        : {}),
+    },
   });
 
   return toJobSummary(job);
@@ -322,4 +332,104 @@ export async function failOrphanedJobs(prisma: PrismaClient): Promise<number> {
   });
 
   return result.count;
+}
+
+// ---------------------------------------------------------------------------
+// Single-page reads and writes, for the refresh loop
+// ---------------------------------------------------------------------------
+
+/** One stored page, in the engine's shape. */
+export interface StoredPage {
+  slug: string;
+  locale: string;
+  title: string;
+  metaDescription: string;
+  h1: string;
+  content: unknown;
+  schemaOrg: unknown;
+  templateId: string;
+  contentProfileId: string;
+  businessId: string;
+  serviceId: string;
+  locationId: string;
+  links: unknown;
+  generation?: unknown;
+}
+
+/**
+ * Read one page a user owns.
+ *
+ * Scoped through the project, so a page is unreachable unless its project is —
+ * the same guarantee, applied one level down rather than restated.
+ */
+export async function getPageForUser(
+  projectId: string,
+  slug: string,
+  userId: string,
+  prisma: PrismaClient,
+): Promise<StoredPage | null> {
+  const page = await prisma.generatedPage.findFirst({
+    where: { projectId, slug, project: { userId } },
+  });
+
+  if (page === null) {
+    return null;
+  }
+
+  return {
+    slug: page.slug,
+    locale: page.locale,
+    title: page.title,
+    metaDescription: page.metaDescription,
+    h1: page.h1,
+    content: page.content,
+    schemaOrg: page.schemaOrg,
+    templateId: page.templateId,
+    contentProfileId: page.contentProfileId,
+    // The page row does not store businessId — a project has exactly one
+    // business — so the caller supplies it from the project payload.
+    businessId: "",
+    serviceId: page.serviceId,
+    locationId: page.locationId,
+    links: page.links,
+    // A template page has no provenance, and the column holds NULL. Zod's
+    // `.optional()` means absent, not null, so the two are reconciled here —
+    // at the boundary, once, rather than at every call site.
+    generation: page.generation === null ? undefined : page.generation,
+  };
+}
+
+/**
+ * Replace one page's authored content after a revision.
+ *
+ * Deliberately narrow: it writes only the fields a refresh may change, so a
+ * mistake upstream cannot move a slug or clear a link graph through this path.
+ * `slug` appears only in the `where`.
+ */
+export async function saveRefreshedPage(
+  projectId: string,
+  page: {
+    slug: string;
+    title: string;
+    metaDescription: string;
+    h1: string;
+    content: unknown;
+    generation?: unknown;
+  },
+  prisma: PrismaClient,
+): Promise<void> {
+  await prisma.generatedPage.update({
+    where: { projectId_slug: { projectId, slug: page.slug } },
+    data: {
+      title: page.title,
+      metaDescription: page.metaDescription,
+      h1: page.h1,
+      content: page.content as Prisma.InputJsonObject,
+      generation:
+        page.generation === undefined
+          ? Prisma.DbNull
+          : (page.generation as Prisma.InputJsonObject),
+      source: "MANUAL",
+    },
+  });
 }

@@ -106,6 +106,7 @@ function router() {
         seen.push(request);
         return mock.authorPage(request);
       },
+      refreshPage: (request) => mock.refreshPage(request),
     };
   });
 

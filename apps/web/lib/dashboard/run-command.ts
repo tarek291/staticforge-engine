@@ -161,3 +161,54 @@ export function runPipeline(
 
   return runCommand("npx", args, {}, onOutput);
 }
+
+/**
+ * Revise one page against operator feedback.
+ *
+ * The feedback travels in the environment, never in `argv`. It is free text an
+ * operator typed, this spawn goes through a shell on Windows, and anything in
+ * `argv` is shell-parsed — a note containing `&` or a quote would break the
+ * command at best. Environment values are handed to the process directly.
+ *
+ * The ids that do travel in `argv` are validated first, for the same reason.
+ */
+export function runRefresh(
+  projectId: string,
+  target: { slug: string; feedback: string } | undefined,
+  locale: string,
+  onOutput?: (output: string) => void,
+): Promise<CommandResult> {
+  if (target === undefined) {
+    return Promise.resolve({
+      ok: false,
+      exitCode: 1,
+      output: "A refresh job needs a target page and feedback.",
+      durationMs: 0,
+    });
+  }
+
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(target.slug)) {
+    return Promise.resolve({
+      ok: false,
+      exitCode: 1,
+      output: `Refusing to run: "${target.slug}" is not a valid page slug.`,
+      durationMs: 0,
+    });
+  }
+
+  return runCommand(
+    "npx",
+    [
+      "tsx",
+      "packages/generator/src/refresh-page.cli.ts",
+      "--project-id",
+      projectId,
+      "--slug",
+      target.slug,
+      "--locale",
+      locale,
+    ],
+    { STATICFORGE_FEEDBACK: target.feedback },
+    onOutput,
+  );
+}

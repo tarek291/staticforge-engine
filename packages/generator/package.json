@@ -14,7 +14,8 @@
     "validate:input": "tsx src/validate-input.cli.ts",
     "preview:pages": "tsx src/preview-pages.cli.ts",
     "generate": "tsx src/generate-pages.cli.ts --locale de",
-    "bench": "tsx src/scale-benchmark.cli.ts"
+    "bench": "tsx src/scale-benchmark.cli.ts",
+    "refresh": "tsx src/refresh-page.cli.ts"
   },
   "dependencies": {
     "@staticforge/ai": "workspace:*",

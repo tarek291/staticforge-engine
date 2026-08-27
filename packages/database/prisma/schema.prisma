@@ -93,6 +93,8 @@ enum JobKind {
   GENERATE
   /// Generate, validate, then build the site.
   BUILD
+  /// Revise one existing page against operator feedback.
+  REFRESH
 }
 
 /// Where a job is in its life.
@@ -125,6 +127,10 @@ model GenerationJob {
   /// Denormalised from the project so a job can be scoped without a join —
   /// which matters because every read of this table is scoped.
   userId String
+
+  /// For a REFRESH job: which page, and what the operator asked to change.
+  targetSlug String?
+  feedback   String?
 
   createdAt   DateTime  @default(now())
   startedAt   DateTime?

@@ -196,6 +196,17 @@ export const PageGenerationSchema = z.object({
   profileId: z.string().min(1),
   /** Fingerprint of the business, service, location and content template. */
   sourceHash: z.string().min(1),
+  /**
+   * Fingerprint of the authored content itself.
+   *
+   * Distinct from sourceHash, which fingerprints the *inputs*. This one answers
+   * a different question: did a rewrite actually change anything? A refresh
+   * that returns identical prose is a wasted call, and without this the two
+   * cases are indistinguishable.
+   */
+  contentHash: z.string().min(1).optional(),
+  /** The feedback that produced this revision, when it came from a refresh. */
+  refreshedFrom: z.string().min(1).optional(),
   /** ISO timestamp of the authoring run. */
   generatedAt: z.string().min(1).optional(),
 });

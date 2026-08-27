@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import type { ReactElement } from "react";
 
 import { ControlPanel } from "../../_components/ControlPanel";
+import { RefreshButton } from "../../_components/RefreshButton";
 import { isDashboardEnabled } from "@/lib/dashboard/guard";
 import {
   LOCAL_OPERATOR_ID,
@@ -145,7 +146,7 @@ export default async function ProjectPage({ params }: Props): Promise<ReactEleme
                   <th className="py-2 pr-4 font-medium">Profile</th>
                   <th className="py-2 pr-4 font-medium">Source</th>
                   <th className="py-2 pr-4 text-right font-medium">Links</th>
-                  <th className="py-2 font-medium">Preview</th>
+                  <th className="py-2 font-medium">Preview / revise</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-neutral-100 dark:divide-neutral-900">
@@ -188,6 +189,13 @@ export default async function ProjectPage({ params }: Props): Promise<ReactEleme
                         >
                           luxury
                         </Link>
+                        {isDashboardEnabled() && (
+                          <RefreshButton
+                            projectId={project.id}
+                            slug={page.slug}
+                            locale={project.locale}
+                          />
+                        )}
                       </span>
                     </td>
                   </tr>
