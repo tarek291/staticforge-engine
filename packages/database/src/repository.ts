@@ -1,6 +1,7 @@
-import type { PrismaClient } from "@prisma/client";
+import type { PageSource, Prisma, PrismaClient } from "@prisma/client";
 import type {
   Business,
+  GeneratedPage as EnginePage,
   Location,
   Service,
 } from "@staticforge/schemas";
@@ -225,4 +226,96 @@ export async function getProjectPayload(
       templateId: project.templateId,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Write path
+// ---------------------------------------------------------------------------
+
+/** Outcome of one persistence pass. */
+export interface SaveGeneratedPagesResult {
+  /** Pages written (created or updated). */
+  saved: number;
+  /** Stale pages deleted because this run no longer produces their slug. */
+  removed: number;
+}
+
+/** Options for {@link saveGeneratedPages}. */
+export interface SaveGeneratedPagesOptions {
+  /**
+   * How the content was produced. Defaults to `TEMPLATE`; the generator passes
+   * `AI` when the authoring pass ran, so a dashboard can tell a templated page
+   * from an authored one.
+   */
+  source?: PageSource;
+}
+
+/**
+ * Persist a run's pages for one project, atomically.
+ *
+ * Everything happens inside a single `$transaction`, so a failure part-way
+ * leaves the project's pages exactly as they were rather than half-updated.
+ *
+ * The transaction runs in two stages, and the order matters:
+ *
+ * 1. **Delete stale pages** — rows whose slug this run no longer produces. This
+ *    mirrors what `savePages` already does for files, and it is not optional:
+ *    the table also carries a unique `(projectId, serviceId, locationId)`
+ *    constraint, so a renamed service would otherwise leave an old row that the
+ *    slug-keyed upsert cannot see and whose presence makes the insert fail.
+ * 2. **Upsert each page**, keyed on `(projectId, slug)`.
+ *
+ * An empty `pages` array therefore clears the project's pages, matching the
+ * file pipeline, where a run that produces nothing leaves nothing behind.
+ *
+ * `content` and `schemaOrg` are stored as JSON columns; they are rendered whole
+ * and never queried field by field. `businessId` is not stored: a project has
+ * exactly one business, so the page's identity follows from the project.
+ *
+ * @param projectId - The project these pages belong to.
+ * @param pages - Validated pages from the generator.
+ * @param prisma - The client to write with. Injected so the write path can be
+ * tested against a mock with no database.
+ * @param options - Provenance of the content.
+ * @returns How many pages were written and how many stale rows were removed.
+ */
+export async function saveGeneratedPages(
+  projectId: string,
+  pages: EnginePage[],
+  prisma: PrismaClient,
+  options: SaveGeneratedPagesOptions = {},
+): Promise<SaveGeneratedPagesResult> {
+  const source: PageSource = options.source ?? "TEMPLATE";
+  const slugs = pages.map((page) => page.slug);
+
+  const removeStale = prisma.generatedPage.deleteMany({
+    where: { projectId, slug: { notIn: slugs } },
+  });
+
+  const writes = pages.map((page) => {
+    const fields = {
+      locale: page.locale,
+      title: page.title,
+      metaDescription: page.metaDescription,
+      h1: page.h1,
+      content: page.content as unknown as Prisma.InputJsonObject,
+      schemaOrg: page.schemaOrg as Prisma.InputJsonObject,
+      templateId: page.templateId,
+      source,
+      serviceId: page.serviceId,
+      locationId: page.locationId,
+    };
+
+    return prisma.generatedPage.upsert({
+      where: { projectId_slug: { projectId, slug: page.slug } },
+      create: { projectId, slug: page.slug, ...fields },
+      update: fields,
+    });
+  });
+
+  const results = await prisma.$transaction([removeStale, ...writes]);
+
+  const deleted = results[0] as { count: number } | undefined;
+
+  return { saved: pages.length, removed: deleted?.count ?? 0 };
 }

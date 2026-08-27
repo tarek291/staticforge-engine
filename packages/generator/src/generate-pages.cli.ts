@@ -1,6 +1,10 @@
 import { parseArgs } from "node:util";
 import { resolve, join } from "node:path";
-import { LocaleSchema, type Locale } from "@staticforge/schemas";
+import {
+  LocaleSchema,
+  type GeneratedPage,
+  type Locale,
+} from "@staticforge/schemas";
 import { generatePageContent } from "@staticforge/ai";
 import { loadInputData, defaultInputPaths } from "./load-data.js";
 import { validateInputData } from "./validate-input.js";
@@ -86,6 +90,25 @@ async function loadFromDatabase(
   };
 }
 
+/**
+ * Persist a run's pages for one project.
+ *
+ * Runs only in database mode, after validation and the optional AI pass have
+ * both succeeded, so a failed run never writes half-authored pages. Prisma is
+ * imported dynamically here for the same reason as on the read side.
+ */
+async function persistToDatabase(
+  projectId: string,
+  pages: GeneratedPage[],
+): Promise<{ saved: number; removed: number }> {
+  const { saveGeneratedPages, prisma } = await import("@staticforge/database");
+
+  return saveGeneratedPages(projectId, pages, prisma, {
+    // Provenance, so a dashboard can tell an authored page from a templated one.
+    source: isAiGenerationEnabled() ? "AI" : "TEMPLATE",
+  });
+}
+
 async function main(): Promise<void> {
   const { locale, projectId } = parseOptions();
   const repoRoot = resolveRepoRoot();
@@ -123,8 +146,18 @@ async function main(): Promise<void> {
     console.log("✓ AI content applied");
   }
 
+  // Dual-write: the static files are always produced, because Next builds from
+  // them in both modes. In database mode the pages are additionally persisted.
   await savePages(pages, outputDir);
   console.log("✓ output saved");
+
+  if (projectId !== undefined) {
+    const { saved, removed } = await persistToDatabase(projectId, pages);
+    console.log(
+      `✓ database updated (${saved} saved` +
+        (removed > 0 ? `, ${removed} stale removed)` : ")"),
+    );
+  }
 
   console.log(`\nGenerated ${pages.length} pages (locale: ${locale})`);
   console.log(`Output directory: ${outputDir}`);

@@ -2,7 +2,11 @@ import type { PrismaClient } from "@prisma/client";
 import { beforeEach, describe, expect, test } from "vitest";
 import { mockDeep, type DeepMockProxy } from "vitest-mock-extended";
 
-import { ProjectPayloadError, getProjectPayload } from "./repository.js";
+import {
+  ProjectPayloadError,
+  getProjectPayload,
+  saveGeneratedPages,
+} from "./repository.js";
 
 /**
  * Every test runs against a deep mock of PrismaClient. Nothing here opens a
@@ -391,5 +395,212 @@ describe("empty collections", () => {
 
     expect(payload.services).toEqual([]);
     expect(payload.locations).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Write path
+// ---------------------------------------------------------------------------
+
+/** A validated engine page, as `buildPages` hands it over. */
+function enginePage(overrides: Record<string, unknown> = {}) {
+  return {
+    slug: "bueroreinigung-duisburg",
+    locale: "de",
+    title: "Büroreinigung in Duisburg",
+    metaDescription: "Professionelle Büroreinigung in Duisburg.",
+    h1: "Büroreinigung in Duisburg",
+    content: {
+      hero: { heading: "Büroreinigung in Duisburg", subheading: "Zuverlässig." },
+      sections: [{ heading: "Ablauf", body: "Wir reinigen gründlich." }],
+      faq: [{ question: "Wie schnell?", answer: "Wenige Tage." }],
+      cta: {
+        heading: "Jetzt anfragen",
+        buttonLabel: "Angebot",
+        href: "mailto:kontakt@glanzfix.de",
+      },
+    },
+    schemaOrg: { "@context": "https://schema.org", "@type": "Service" },
+    templateId: "default",
+    businessId: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    serviceId: "svc-bueroreinigung",
+    locationId: "loc-duisburg",
+    ...overrides,
+  };
+}
+
+/** Call the write path with loosely typed fixtures. */
+function save(
+  pages: ReturnType<typeof enginePage>[],
+  options?: Parameters<typeof saveGeneratedPages>[3],
+) {
+  return saveGeneratedPages(
+    "prj_1",
+    pages as unknown as Parameters<typeof saveGeneratedPages>[1],
+    prisma,
+    options,
+  );
+}
+
+/** Arm `$transaction` to resolve, mimicking deleteMany-then-upserts. */
+function armTransaction(removed = 0): void {
+  prisma.$transaction.mockImplementation(((operations: unknown[]) =>
+    Promise.resolve([
+      { count: removed },
+      ...operations.slice(1),
+    ])) as unknown as typeof prisma.$transaction);
+}
+
+/** The `create` payload of the nth upsert call. */
+function createArg(index = 0): Record<string, unknown> {
+  return prisma.generatedPage.upsert.mock.calls[index]?.[0]
+    ?.create as unknown as Record<string, unknown>;
+}
+
+describe("saveGeneratedPages", () => {
+  beforeEach(() => {
+    armTransaction();
+  });
+
+  test("runs every write inside a single transaction", async () => {
+    await save([enginePage()]);
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+
+    // `$transaction` is overloaded (array form and interactive callback form),
+    // so the recorded argument needs widening before it reads as the batch.
+    const batch = prisma.$transaction.mock.calls[0]?.[0] as unknown as unknown[];
+    // One deleteMany for stale rows, then one upsert per page.
+    expect(batch).toHaveLength(2);
+  });
+
+  test("deletes stale pages before writing, not after", async () => {
+    await save([enginePage(), enginePage({ slug: "grundreinigung-essen" })]);
+
+    // The unique (projectId, serviceId, locationId) constraint means a renamed
+    // service's old row must be gone before the new one is inserted.
+    const deleteOrder =
+      prisma.generatedPage.deleteMany.mock.invocationCallOrder[0] ?? 0;
+    const firstUpsertOrder =
+      prisma.generatedPage.upsert.mock.invocationCallOrder[0] ?? 0;
+
+    expect(deleteOrder).toBeLessThan(firstUpsertOrder);
+  });
+
+  test("scopes stale deletion to the project and the slugs it did not produce", async () => {
+    await save([enginePage(), enginePage({ slug: "grundreinigung-essen" })]);
+
+    expect(prisma.generatedPage.deleteMany).toHaveBeenCalledWith({
+      where: {
+        projectId: "prj_1",
+        slug: { notIn: ["bueroreinigung-duisburg", "grundreinigung-essen"] },
+      },
+    });
+  });
+
+  test("keys the upsert on (projectId, slug)", async () => {
+    await save([enginePage()]);
+
+    expect(prisma.generatedPage.upsert.mock.calls[0]?.[0]?.where).toEqual({
+      projectId_slug: { projectId: "prj_1", slug: "bueroreinigung-duisburg" },
+    });
+  });
+
+  test("stores content and schemaOrg as the JSON objects they are", async () => {
+    await save([enginePage()]);
+
+    // Passed through structurally — not stringified, not flattened.
+    expect(createArg().content).toEqual(enginePage().content);
+    expect(createArg().schemaOrg).toEqual({
+      "@context": "https://schema.org",
+      "@type": "Service",
+    });
+    expect(typeof createArg().content).toBe("object");
+    expect(typeof createArg().schemaOrg).toBe("object");
+  });
+
+  test("writes the same fields on create and update", async () => {
+    await save([enginePage()]);
+
+    const { projectId, slug, ...created } = createArg();
+
+    expect(projectId).toBe("prj_1");
+    expect(slug).toBe("bueroreinigung-duisburg");
+    // A re-run must refresh every field, not merely insert new rows.
+    expect(prisma.generatedPage.upsert.mock.calls[0]?.[0]?.update).toEqual(
+      created,
+    );
+  });
+
+  test("carries the service and location foreign keys", async () => {
+    await save([enginePage()]);
+
+    expect(createArg()).toMatchObject({
+      serviceId: "svc-bueroreinigung",
+      locationId: "loc-duisburg",
+    });
+  });
+
+  test("defaults the source to TEMPLATE", async () => {
+    await save([enginePage()]);
+
+    expect(createArg()).toMatchObject({ source: "TEMPLATE" });
+  });
+
+  test("records AI provenance when the authoring pass ran", async () => {
+    await save([enginePage()], { source: "AI" });
+
+    expect(createArg()).toMatchObject({ source: "AI" });
+  });
+
+  test("preserves the templateId the generator resolved", async () => {
+    await save([enginePage({ templateId: "luxuryLanding" })]);
+
+    expect(createArg()).toMatchObject({ templateId: "luxuryLanding" });
+  });
+
+  test("does not store businessId, which the project already implies", async () => {
+    await save([enginePage()]);
+
+    expect("businessId" in createArg()).toBe(false);
+  });
+
+  test("upserts one row per page", async () => {
+    await save([
+      enginePage(),
+      enginePage({ slug: "grundreinigung-essen" }),
+      enginePage({ slug: "treppenhausreinigung-essen" }),
+    ]);
+
+    expect(prisma.generatedPage.upsert).toHaveBeenCalledTimes(3);
+  });
+
+  test("reports how many pages were saved and stale rows removed", async () => {
+    armTransaction(4);
+
+    const result = await save([
+      enginePage(),
+      enginePage({ slug: "grundreinigung-essen" }),
+    ]);
+
+    expect(result).toEqual({ saved: 2, removed: 4 });
+  });
+
+  test("an empty run clears the project's pages, as file mode does", async () => {
+    armTransaction(9);
+
+    const result = await save([]);
+
+    expect(prisma.generatedPage.deleteMany).toHaveBeenCalledWith({
+      where: { projectId: "prj_1", slug: { notIn: [] } },
+    });
+    expect(prisma.generatedPage.upsert).not.toHaveBeenCalled();
+    expect(result).toEqual({ saved: 0, removed: 9 });
+  });
+
+  test("never opens a connection", async () => {
+    await save([enginePage()]);
+
+    expect(prisma.$connect).not.toHaveBeenCalled();
   });
 });
