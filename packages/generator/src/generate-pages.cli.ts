@@ -5,7 +5,12 @@ import {
   type GeneratedPage,
   type Locale,
 } from "@staticforge/schemas";
-import { FileContentCache, createAnthropicService } from "@staticforge/ai";
+import {
+  FileContentCache,
+  createAnthropicService,
+  createMockService,
+  isMockAiEnabled,
+} from "@staticforge/ai";
 import { validateInternalLinks, withInternalLinks } from "@staticforge/core";
 import { publishSeoArtifacts, resolveSite } from "./publish-seo.js";
 import { loadInputData, defaultInputPaths } from "./load-data.js";
@@ -148,11 +153,22 @@ async function main(): Promise<void> {
   if (isAiGenerationEnabled()) {
     console.log(`… authoring content with AI (${pages.length} pages)`);
 
-    // Cached content survives between runs, so an unrelated rebuild does not
-    // re-buy pages whose source has not moved.
-    const service = createAnthropicService({
-      cache: new FileContentCache(join(repoRoot, "data", "cache", "content")),
-    });
+    // AI_MOCK swaps in a no-cost authoring service. Every downstream gate still
+    // runs — the mock builds its content from the real content profile — so a
+    // load test exercises the architecture without buying prose.
+    const mocked = isMockAiEnabled();
+
+    const service = mocked
+      ? createMockService()
+      : // Cached content survives between runs, so an unrelated rebuild does not
+        // re-buy pages whose source has not moved.
+        createAnthropicService({
+          cache: new FileContentCache(join(repoRoot, "data", "cache", "content")),
+        });
+
+    if (mocked) {
+      console.log("  ! AI_MOCK=true — content is generated, not authored");
+    }
 
     let hits = 0;
 
@@ -161,9 +177,17 @@ async function main(): Promise<void> {
       validated,
       (request) => service.authorPage(request),
       {
+        // Rate-limit pacing is meaningless against a mock, and at scale it
+        // would dominate the run: 500 pages three seconds apart is 25 minutes
+        // of sleeping.
+        ...(mocked ? { delayMs: 0 } : {}),
         onProgress: ({ done, total, slug, cacheHit }) => {
           if (cacheHit) hits += 1;
-          console.log(`  · ${done}/${total} ${slug}${cacheHit ? " (cached)" : ""}`);
+          // One line per page buries the result at scale, so report in batches
+          // once a run is large.
+          if (total <= 20 || done % 50 === 0 || done === total) {
+            console.log(`  · ${done}/${total} ${slug}${cacheHit ? " (cached)" : ""}`);
+          }
         },
       },
     );

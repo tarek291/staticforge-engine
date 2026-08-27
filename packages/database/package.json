@@ -15,7 +15,8 @@
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:studio": "prisma studio",
-    "db:seed": "prisma db seed"
+    "db:seed": "prisma db seed",
+    "db:seed:scale": "tsx prisma/seed-scale.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

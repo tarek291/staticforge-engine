@@ -35,9 +35,23 @@ export function GeneratedPageView({
       <nav>
         <Link
           href="/"
-          className="text-sm text-neutral-500 underline-offset-2 hover:underline dark:text-neutral-400"
+          className="inline-flex text-neutral-500 transition-colors hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100"
         >
-          ← Back
+          {/* An arrow, not the word "Back". Every visible string on a generated
+              page comes from tenant data, and this link has no data behind it —
+              so it says nothing in any language. */}
+          <svg
+            viewBox="0 0 20 20"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="h-5 w-5"
+            aria-hidden="true"
+          >
+            <path d="M12.5 4.5 7 10l5.5 5.5" />
+          </svg>
         </Link>
       </nav>
 

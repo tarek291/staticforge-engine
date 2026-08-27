@@ -5,4 +5,5 @@ export * from "./prompts.js";
 export * from "./grounding.js";
 export * from "./cache.js";
 export * from "./service.js";
+export * from "./mock.js";
 export * from "./generate.js";
