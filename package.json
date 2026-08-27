@@ -23,7 +23,8 @@
     "typecheck:web": "corepack pnpm --filter @staticforge/web typecheck",
     "typecheck:ai": "corepack pnpm --filter @staticforge/ai typecheck",
     "verify": "corepack pnpm generate && corepack pnpm -r typecheck && corepack pnpm -r test && corepack pnpm --filter @staticforge/web build",
-    "staticforge": "corepack pnpm --filter @staticforge/cli start"
+    "staticforge": "corepack pnpm --filter @staticforge/cli start",
+    "dev:dashboard": "cross-env STATICFORGE_DASHBOARD=local corepack pnpm dev:web"
   },
   "devDependencies": {
     "cross-env": "^10.1.0"

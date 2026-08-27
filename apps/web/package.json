@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@staticforge/core": "workspace:*",
+    "@staticforge/database": "workspace:*",
     "@staticforge/schemas": "workspace:*",
     "next": "^15.1.0",
     "react": "^19.0.0",

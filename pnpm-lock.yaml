@@ -17,6 +17,9 @@ importers:
       '@staticforge/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@staticforge/database':
+        specifier: workspace:*
+        version: link:../../packages/database
       '@staticforge/schemas':
         specifier: workspace:*
         version: link:../../packages/schemas
