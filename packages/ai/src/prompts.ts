@@ -1,20 +1,25 @@
+import {
+  STRICT_SEO_PROFILE,
+  type ContentProfile,
+} from "@staticforge/schemas";
+
 /**
  * Prompt text for AI-assisted page content generation.
  *
- * Language-agnostic by design: no human language is hardcoded here. The model
- * is instructed to mirror the language of the input details it receives, which
- * keeps this package aligned with the engine-wide rule that only input data
- * decides the output language.
+ * The hard constraints are **rendered from a `ContentProfile`**, not written
+ * out by hand. The same profile object then judges the result, so the rules the
+ * model is given and the rules it is measured against cannot drift apart — a
+ * prompt that promises "3 to 5 sections" while the validator demands four would
+ * fail every run for a reason no one could see.
+ *
+ * Language-agnostic by design: no human language is hardcoded. The model is
+ * told to mirror the language of the input details, which keeps this package
+ * aligned with the engine-wide rule that only input data decides the output
+ * language.
  */
 
-/**
- * System prompt establishing the authoring standard.
- *
- * The character limits mirror `GeneratedPageSchema` (`title.max(70)`,
- * `metaDescription.max(160)`) so the model targets them directly instead of
- * failing the final Zod validation.
- */
-export const SYSTEM_PROMPT = `You are a senior SEO engineer and content strategist specializing in programmatic SEO at scale.
+/** The authoring standard, independent of any particular profile. */
+const CRAFT_GUIDANCE = `You are a senior SEO engineer and content strategist specializing in programmatic SEO at scale.
 
 You write landing page content for local service businesses. Thousands of pages are generated from the same pipeline, so your single hardest requirement is this: the page must not read like one row of a spreadsheet. It must read like a page a knowledgeable human wrote about this specific service in this specific city.
 
@@ -33,22 +38,144 @@ Every page must carry real information gain — substance a reader cannot get fr
 - Empty intensifiers ("cutting-edge", "state-of-the-art", "unparalleled", "top-notch", "premier", "world-class").
 - Restating the service name and city over and over. Mention them naturally, where a human would.
 - Padding a section to look thorough. A short, dense section beats a long, hollow one.
-- Facts you cannot support: invented prices, invented years in business, invented certifications, invented review counts, invented staff numbers, fake awards, fake guarantees. Write about how the work is done, not about credentials you were not given.
+- Facts you cannot support: invented prices, invented years in business, invented certifications, invented review counts, invented staff numbers, fake awards, fake guarantees. Write about how the work is done, not about credentials you were not given.`;
 
-## Hard constraints
+/** What each section kind is for, so the model picks a fitting one. */
+const SECTION_KIND_GUIDE: Record<string, string> = {
+  overview: "what the service covers and who it is for",
+  process: "how the work is actually carried out, step by step",
+  benefits: "what the customer gains, in concrete terms",
+  pricing: "what drives the price and how quoting works",
+  coverage: "the area served and what that means locally",
+  trust: "how quality is assured and verified",
+  custom: "anything else that genuinely helps the reader",
+};
 
-- title: at most 70 characters.
-- metaDescription: at most 160 characters, and it must be a reason to click, not a summary of the title.
-- h1: distinct from the title, written for the reader rather than the SERP.
-- sections: 3 to 5 entries, each with a substantive heading and a body of several sentences.
-- faq: 4 to 6 entries, answering genuine pre-purchase questions with direct, useful answers. No question whose answer is "it depends" and nothing more.
-- cta: one clear action. href must be a plain relative anchor such as "#contact".
+/** Render one range as a human-readable bound. */
+function range(label: string, min: number, max: number, unit: string): string {
+  return `- ${label}: between ${min} and ${max} ${unit}.`;
+}
 
-## Language
+/**
+ * Render a profile's rules as prompt text.
+ *
+ * Exported so a test can assert that a changed profile changes the prompt —
+ * the guarantee that keeps the two in step.
+ */
+export function renderProfileConstraints(profile: ContentProfile): string {
+  const lines: string[] = [
+    `## Hard constraints (content profile "${profile.id}")`,
+    "",
+    range("title", profile.title.min, profile.title.max, "characters"),
+    range(
+      "metaDescription",
+      profile.metaDescription.min,
+      profile.metaDescription.max,
+      "characters",
+    ),
+    range("h1", profile.h1.min, profile.h1.max, "characters"),
+  ];
+
+  if (profile.requireDistinctH1) {
+    lines.push(
+      "- The h1 must differ from the title. The title is written for a search result; the h1 for the reader who arrived.",
+    );
+  }
+
+  lines.push(
+    range(
+      "sections",
+      profile.sections.count.min,
+      profile.sections.count.max,
+      "entries",
+    ),
+    range(
+      "  section heading",
+      profile.sections.heading.min,
+      profile.sections.heading.max,
+      "characters",
+    ),
+    range(
+      "  section body",
+      profile.sections.body.min,
+      profile.sections.body.max,
+      "characters",
+    ),
+  );
+
+  if (profile.sections.uniqueHeadings) {
+    lines.push("- No two sections may share a heading.");
+  }
+
+  const kinds =
+    profile.sections.allowedKinds.length > 0
+      ? profile.sections.allowedKinds
+      : Object.keys(SECTION_KIND_GUIDE);
+
+  if (profile.sections.requireKind) {
+    lines.push(
+      "- Every section must declare a `kind`, chosen from:",
+      ...kinds.map(
+        (kind) => `    - ${kind}: ${SECTION_KIND_GUIDE[kind] ?? "purpose-specific"}`,
+      ),
+      "- Do not repeat a kind unless the two sections genuinely cover different ground.",
+    );
+  }
+
+  lines.push(
+    range("faq", profile.faq.count.min, profile.faq.count.max, "entries"),
+    range(
+      "  question",
+      profile.faq.question.min,
+      profile.faq.question.max,
+      "characters",
+    ),
+    range(
+      "  answer",
+      profile.faq.answer.min,
+      profile.faq.answer.max,
+      "characters",
+    ),
+  );
+
+  if (profile.faq.uniqueQuestions) {
+    lines.push("- No two FAQ entries may ask the same question.");
+  }
+
+  if (profile.requiredBlocks.includes("heroSubheading")) {
+    lines.push("- The hero must carry a subheading, not only a heading.");
+  }
+
+  lines.push(
+    "- cta: one clear action. `href` must be a plain relative anchor such as \"#contact\".",
+    "",
+    "These are limits, not targets. Content that violates any of them is rejected outright and the page is not published.",
+  );
+
+  return lines.join("\n");
+}
+
+/** Compose the full system prompt for a profile. */
+export function buildSystemPrompt(profile: ContentProfile): string {
+  return [
+    CRAFT_GUIDANCE,
+    "",
+    renderProfileConstraints(profile),
+    "",
+    `## Language
 
 Write every field in the same language as the business, service, and city details you are given. Do not translate them, and do not switch to English if they are not English.
 
-Return your answer only by calling the provided tool. Do not write any prose outside the tool call.`;
+Return your answer only by calling the provided tool. Do not write any prose outside the tool call.`,
+  ].join("\n");
+}
+
+/**
+ * System prompt for the default authoring profile.
+ *
+ * Kept as a constant for callers that do not select a profile explicitly.
+ */
+export const SYSTEM_PROMPT = buildSystemPrompt(STRICT_SEO_PROFILE);
 
 /** Details describing the single page to author. */
 export interface PagePromptDetails {

@@ -54,6 +54,9 @@ importers:
       '@anthropic-ai/sdk':
         specifier: ^0.120.0
         version: 0.120.0(zod@3.25.76)
+      '@staticforge/core':
+        specifier: workspace:*
+        version: link:../core
       '@staticforge/schemas':
         specifier: workspace:*
         version: link:../schemas
@@ -70,6 +73,9 @@ importers:
       typescript:
         specifier: ^5.5.0
         version: 5.9.3
+      vitest:
+        specifier: ^4.1.11
+        version: 4.1.11(@types/node@20.19.43)(vite@8.2.2(@types/node@20.19.43)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.12))
 
   packages/core:
     dependencies:

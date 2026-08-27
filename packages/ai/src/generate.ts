@@ -1,105 +1,58 @@
-import type Anthropic from "@anthropic-ai/sdk";
-import { GeneratedPageSchema } from "@staticforge/schemas";
-import type { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { DEFAULT_CONTENT_PROFILE, type ContentProfile } from "@staticforge/schemas";
 
 import { getAnthropicClient } from "./client.js";
-import { SYSTEM_PROMPT, buildUserPrompt } from "./prompts.js";
 import type { PagePromptDetails } from "./prompts.js";
+import {
+  AIGenerationService,
+  type GeneratedPageContent,
+} from "./service.js";
 
 /**
- * The authored slice of a generated page.
+ * Module-level convenience wrapper over {@link AIGenerationService}.
  *
- * Derived from `GeneratedPageSchema` with `.pick()` — the same derivation
- * pattern `ManifestEntrySchema` uses — so the two stay aligned automatically:
- * a change to `title`, `metaDescription`, `h1`, or `content` upstream applies
- * here without edits.
- *
- * The omitted fields are deliberately not the model's to decide:
- * `slug` is derived from service + city by the generator (and guarded against
- * collisions), `businessId` / `serviceId` / `locationId` are input-data
- * identifiers the model never sees, `locale` comes from the input, and
- * `templateId` is resolved by the service → content → "default" precedence.
- * Asking the model for them would only invite plausible-looking fabrications.
+ * Callers that want to choose a profile, inject a client, or tune the retry
+ * policy should construct the service directly. This function exists for the
+ * common case — one process, one profile, the ambient credential — and for the
+ * generator, which has used this signature since before the service existed.
  */
-export const GeneratedPageContentSchema = GeneratedPageSchema.pick({
-  title: true,
-  metaDescription: true,
-  h1: true,
-  content: true,
-});
-export type GeneratedPageContent = z.infer<typeof GeneratedPageContentSchema>;
 
-/** Model used for content generation. */
-const MODEL = "claude-opus-5";
-
-/** Name of the tool the model must call to return its answer. */
-const TOOL_NAME = "emit_page_content";
+let cachedService: AIGenerationService | undefined;
+let cachedProfileId: string | undefined;
 
 /**
- * The Zod contract, expressed as JSON Schema for the Anthropic tool.
+ * The process-wide service, created on first use.
  *
- * `$refStrategy: "none"` inlines every sub-schema, because the API expects one
- * self-contained schema object rather than a `$ref` / `definitions` graph.
- * The generated `$schema` key is dropped for the same reason.
- *
- * Note that `strict: true` is intentionally not set on the tool: strict mode
- * requires every property to appear in `required`, which the optional fields
- * in `content` (`hero.subheading`, `hero.image`, `cta.secondary`) cannot
- * satisfy. The JSON Schema steers the model; `GeneratedPageContentSchema.parse`
- * below is what actually guarantees the shape.
+ * Lazy for the same reason the client is: importing this module must not
+ * require an API key, so a run that never authors content pays nothing.
  */
-const TOOL_INPUT_SCHEMA = ((): Anthropic.Tool["input_schema"] => {
-  const { $schema, ...schema } = zodToJsonSchema(GeneratedPageContentSchema, {
-    $refStrategy: "none",
-  }) as Record<string, unknown> & { $schema?: string };
+function getService(profile: ContentProfile): AIGenerationService {
+  if (cachedService !== undefined && cachedProfileId === profile.id) {
+    return cachedService;
+  }
 
-  void $schema;
+  cachedService = new AIGenerationService({
+    client: getAnthropicClient(),
+    profile,
+  });
+  cachedProfileId = profile.id;
 
-  return schema as Anthropic.Tool["input_schema"];
-})();
+  return cachedService;
+}
 
 /**
- * Generates validated page content for one service-in-city combination.
+ * Generate validated page content for one service-in-city combination.
  *
- * Fails loudly — consistent with the rest of the engine — when the model
- * returns no tool call, or when its arguments do not satisfy the schema.
- *
- * @throws when `ANTHROPIC_API_KEY` is unset, when the model returns no tool
- * call, or when the returned arguments fail Zod validation.
+ * @param details - Business, service and city names.
+ * @param profile - Quality policy. Defaults to the baseline profile.
+ * @throws When `ANTHROPIC_API_KEY` is unset, when the provider stays
+ * unreachable, when the model returns no tool call, or when the content
+ * violates the contract.
  */
 export async function generatePageContent(
   details: PagePromptDetails,
+  profile: ContentProfile = DEFAULT_CONTENT_PROFILE,
 ): Promise<GeneratedPageContent> {
-  const client = getAnthropicClient();
-
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 16000,
-    thinking: { type: "adaptive" },
-    system: SYSTEM_PROMPT,
-    tools: [
-      {
-        name: TOOL_NAME,
-        description:
-          "Return the authored landing page content. This is the only way to deliver an answer.",
-        input_schema: TOOL_INPUT_SCHEMA,
-      },
-    ],
-    tool_choice: { type: "tool", name: TOOL_NAME, disable_parallel_tool_use: true },
-    messages: [{ role: "user", content: buildUserPrompt(details) }],
-  });
-
-  const toolUse = response.content.find(
-    (block): block is Anthropic.ToolUseBlock =>
-      block.type === "tool_use" && block.name === TOOL_NAME,
-  );
-
-  if (toolUse === undefined) {
-    throw new Error(
-      `Model did not call "${TOOL_NAME}" (stop_reason: ${String(response.stop_reason)}).`,
-    );
-  }
-
-  return GeneratedPageContentSchema.parse(toolUse.input);
+  return getService(profile).generatePageContent(details);
 }
+
+export type { GeneratedPageContent };
