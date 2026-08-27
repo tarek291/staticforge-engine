@@ -1,4 +1,4 @@
-import test from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
 import type { GeneratedPageContent, PagePromptDetails } from "@staticforge/ai";
 import type {

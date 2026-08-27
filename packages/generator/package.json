@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/build-pages.test.ts src/apply-ai.test.ts src/save-output.test.ts src/manifest-schema.test.ts src/phone.test.ts",
+    "test": "vitest run",
     "validate:input": "tsx src/validate-input.cli.ts",
     "preview:pages": "tsx src/preview-pages.cli.ts",
     "generate": "tsx src/generate-pages.cli.ts --locale de"
@@ -24,6 +24,7 @@
   "devDependencies": {
     "@types/node": "^20.14.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.11"
   }
 }

@@ -1,0 +1,177 @@
+// StaticForge — multi-tenant data model.
+//
+// Tenancy: Workspace is the tenant root. Every other row reaches a Workspace
+// through Project, so a tenant's data is a single subtree and can be scoped,
+// exported, or deleted as one unit.
+//
+// This schema mirrors the file-based contracts the engine already validates
+// (`@staticforge/schemas`), so the generator's semantics survive the move to a
+// database — notably: a service slug is unique per project, a generated page
+// slug is unique per project (the duplicate-slug guarantee), and templateId
+// carries the service → project → "default" precedence.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// A tenant: an agency or a customer account. The root of every ownership path.
+model Workspace {
+  id   String @id @default(cuid())
+  name String
+
+  /// URL-safe tenant handle. Globally unique — it identifies the tenant.
+  slug String @unique
+
+  projects Project[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// One generated site. Owns the input entities and the generated output.
+model Project {
+  id          String  @id @default(cuid())
+  name        String
+  /// URL-safe handle, unique within the workspace rather than globally, so two
+  /// tenants may both have a "main" project.
+  slug        String
+  description String?
+
+  /// Content locale for generated pages. Mirrors `LocaleSchema` ("de" | "en").
+  locale String @default("de")
+
+  /// Project-level template default. The service-level value wins over it, and
+  /// "default" applies when neither is set.
+  templateId String @default("default")
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  services       Service[]
+  locations      Location[]
+  generatedPages GeneratedPage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([workspaceId, slug])
+  @@index([workspaceId])
+}
+
+/// A service offered within a project. Mirrors `ServiceSchema`.
+model Service {
+  id          String @id @default(cuid())
+  name        String
+  /// Curated, not derived: slug derivation strips diacritics rather than
+  /// transliterating them, and a page's URL depends on this value.
+  slug        String
+  description String
+
+  /// Stored as a list rather than a join table: benefits are opaque strings
+  /// that are never queried or shared across services.
+  benefits String[]
+
+  priceFrom     Decimal? @db.Decimal(10, 2)
+  priceTo       Decimal? @db.Decimal(10, 2)
+  priceCurrency String?
+
+  /// Optional per-service template override. Highest precedence.
+  templateId String?
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  generatedPages GeneratedPage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Two services sharing a slug in one project would produce colliding page
+  /// slugs — the collision the generator already refuses to write.
+  @@unique([projectId, slug])
+  @@index([projectId])
+}
+
+/// A place a project serves. Mirrors `LocationSchema`.
+model Location {
+  id   String @id @default(cuid())
+  /// Display name of the place. Kept alongside `city` because a location may be
+  /// labelled differently from its city ("Ruhrgebiet" covering "Essen").
+  name String
+  slug String
+
+  city       String
+  state      String
+  country    String  @default("DE")
+  postalCode String?
+
+  latitude  Float?
+  longitude Float?
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  generatedPages GeneratedPage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, slug])
+  @@index([projectId])
+}
+
+/// How a page's content was produced.
+enum PageSource {
+  /// Assembled from the content template — deterministic, no model involved.
+  TEMPLATE
+  /// Authored by the AI pass.
+  AI
+  /// Edited by a human after generation.
+  MANUAL
+}
+
+/// A fully resolved page, ready to render. Mirrors `GeneratedPageSchema`.
+model GeneratedPage {
+  id String @id @default(cuid())
+
+  /// Route slug, unique per project — the database-level counterpart of the
+  /// generator's duplicate-slug guard.
+  slug            String
+  locale          String
+  title           String
+  metaDescription String
+  h1              String
+
+  /// The `PageContentSchema` payload (hero, sections, faq, cta). Stored as JSON
+  /// because it is rendered whole and never queried field by field.
+  content Json
+
+  /// JSON-LD structured data, shape depending on the `@type` used.
+  schemaOrg Json
+
+  templateId String     @default("default")
+  source     PageSource @default(TEMPLATE)
+
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  serviceId  String
+  service    Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, slug])
+  /// One page per service-in-city combination, matching the generator's
+  /// cartesian product.
+  @@unique([projectId, serviceId, locationId])
+  @@index([projectId])
+  @@index([serviceId])
+  @@index([locationId])
+}
