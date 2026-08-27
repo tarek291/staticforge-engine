@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",
+    "@staticforge/core": "workspace:*",
     "@staticforge/schemas": "workspace:*"
   },
   "devDependencies": {

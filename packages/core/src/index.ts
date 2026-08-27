@@ -7,3 +7,6 @@ export * from "./seo-publishing.js";
 export * from "./sleep.js";
 export * from "./tenant-paths.js";
 export * from "./job-budget.js";
+export * from "./sync/adapter.js";
+export * from "./sync/adapters.js";
+export * from "./sync/webhook-auth.js";

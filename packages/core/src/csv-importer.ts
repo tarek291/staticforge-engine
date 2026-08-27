@@ -57,10 +57,11 @@ export class CsvImportError extends Error {
   override readonly name = "CsvImportError";
 
   constructor(
-    readonly filePath: string,
+    /** Where the sheet came from: a file path, a URL, or a description. */
+    readonly source: string,
     readonly issues: CsvIssue[],
   ) {
-    super(`${filePath}: ${issues.length} invalid row(s)`);
+    super(`${source}: ${issues.length} invalid row(s)`);
   }
 }
 
@@ -161,8 +162,22 @@ function toLocationCandidate(row: CsvRow, name: string): unknown {
  * unknown `type`, or fails its schema.
  */
 export function importFromCsv(filePath: string): CsvImportResult {
-  const raw = readFileSync(filePath, "utf8");
+  return parseCsvSheet(readFileSync(filePath, "utf8"), filePath);
+}
 
+/**
+ * Parse a sheet that is already in memory.
+ *
+ * Split out from {@link importFromCsv} because a sheet no longer only comes
+ * from disk: the sync layer fetches one over HTTP, and a remote sheet has to go
+ * through exactly the same validation as a local one or the two paths would
+ * drift into accepting different things.
+ *
+ * @param raw - The sheet's text.
+ * @param source - What to name in an error. A path, a URL, or a description.
+ * @throws {CsvImportError} If any row is invalid, reporting every issue at once.
+ */
+export function parseCsvSheet(raw: string, source: string): CsvImportResult {
   const rows = parse(raw, {
     columns: (header: string[]) => header.map((name) => name.trim()),
     skip_empty_lines: true,
@@ -228,7 +243,7 @@ export function importFromCsv(filePath: string): CsvImportResult {
   collectDuplicateIds(locations, "location", issues);
 
   if (issues.length > 0) {
-    throw new CsvImportError(filePath, issues);
+    throw new CsvImportError(source, issues);
   }
 
   return { services, locations };

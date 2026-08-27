@@ -107,7 +107,7 @@ try {
   main();
 } catch (error: unknown) {
   if (error instanceof CsvImportError) {
-    console.error(`\n${error.name}: ${error.issues.length} issue(s) in ${error.filePath}\n`);
+    console.error(`\n${error.name}: ${error.issues.length} issue(s) in ${error.source}\n`);
     for (const issue of error.issues) {
       console.error(`  - row ${issue.row}, ${issue.column}: ${issue.message}`);
     }

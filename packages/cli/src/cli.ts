@@ -26,6 +26,7 @@ const USAGE = `staticforge <command> [options]
 Commands:
   build                 Generate, validate and build once, in this process.
   worker                Run the queue worker until stopped.
+  sync                  Pull services and locations from a published sheet.
 
 build options:
   --locale <de|en>      Content locale. Default: de
@@ -36,6 +37,11 @@ build options:
 worker options:
   --idle-ms <ms>        How long to wait when the queue is empty. Default: 3000
   --lease-ms <ms>       How long a claim holds without renewal. Default: 120000
+
+sync options:
+  --project-id <id>     Project to sync into. Required.
+  --url <url>           Published CSV to pull from. Required.
+  --dry-run             Report what would change, and write nothing.
 
 Exits non-zero if any stage fails, and never reaches the build when an
 earlier stage did.`;
@@ -109,6 +115,101 @@ async function runWorker(values: Record<string, unknown>): Promise<void> {
   console.log("worker stopped.");
 }
 
+/**
+ * Pull services and locations from a published sheet into a project.
+ *
+ * The pull half of the sync layer. It fetches, parses through the CSV adapter,
+ * compares against what the project already holds, and queues a run only if the
+ * comparison says the pages would come out different.
+ *
+ * That last part is the whole point. These sources re-send: a nightly cron
+ * uploads the same sheet, an operator clicks twice. A sync that queued a run
+ * every time would be a standing order to re-buy a few hundred pages of prose
+ * identical to the prose already stored.
+ */
+async function runSync(values: Record<string, unknown>): Promise<void> {
+  const projectId = values["project-id"] as string | undefined;
+  const url = values.url as string | undefined;
+  const dryRun = values["dry-run"] === true;
+
+  if (projectId === undefined || url === undefined) {
+    console.error("Both --project-id and --url are required.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const { csvSyncAdapter } = await import("@staticforge/core");
+  const { fetchSheet } = await import("./sync/fetch-sheet.js");
+
+  console.log(`▸ fetching ${url}`);
+
+  const fetched = await fetchSheet(url);
+
+  if (!fetched.ok) {
+    console.error(`✗ ${fetched.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const parsed = csvSyncAdapter.parse(fetched.body);
+
+  if (!parsed.ok) {
+    console.error(`\n✗ The sheet has ${parsed.issues.length} problem(s):\n`);
+    for (const issue of parsed.issues.slice(0, 20)) {
+      console.error(`  - ${issue.path}: ${issue.message}`);
+    }
+    if (parsed.issues.length > 20) {
+      console.error(`  … and ${parsed.issues.length - 20} more`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(
+    `✓ parsed ${parsed.payload.services?.length ?? 0} service(s), ` +
+      `${parsed.payload.locations?.length ?? 0} location(s)`,
+  );
+
+  const { describeSyncDiff, enqueueJob, prisma, resolveOperatorId, syncProject } =
+    await import("@staticforge/database");
+
+  const userId = resolveOperatorId();
+
+  const result = await syncProject(projectId, userId, parsed.payload, prisma, {
+    enqueue: !dryRun,
+    enqueueJob: async (project, owner) => {
+      const job = await enqueueJob(project, owner, "GENERATE", prisma);
+      return job?.id ?? null;
+    },
+  });
+
+  if (result === null) {
+    // The same answer a project that does not exist would give: a sync must not
+    // become a way to discover which ids are real.
+    console.error(`✗ Project "${projectId}" not found.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!result.changed) {
+    console.log(`· ${result.note ?? "nothing changed"} — no run queued.`);
+    return;
+  }
+
+  console.log(`✓ applied (${describeSyncDiff(result.diff)})`);
+
+  if (result.jobId === null) {
+    console.log(
+      dryRun
+        ? "· dry run — nothing was written and no run was queued."
+        : "· no run queued.",
+    );
+    return;
+  }
+
+  console.log(`✓ queued job ${result.jobId} — a worker will pick it up.`);
+}
+
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
     options: {
@@ -118,6 +219,8 @@ async function main(): Promise<void> {
       "skip-build": { type: "boolean", default: false },
       "idle-ms": { type: "string" },
       "lease-ms": { type: "string" },
+      url: { type: "string" },
+      "dry-run": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: true,
@@ -132,6 +235,11 @@ async function main(): Promise<void> {
 
   if (command === "worker") {
     await runWorker(values);
+    return;
+  }
+
+  if (command === "sync") {
+    await runSync(values);
     return;
   }
 
