@@ -52,6 +52,8 @@ model Project {
   workspaceId String
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
+  business       Business?
+  content        ContentTemplate?
   services       Service[]
   locations      Location[]
   generatedPages GeneratedPage[]
@@ -61,6 +63,76 @@ model Project {
 
   @@unique([workspaceId, slug])
   @@index([workspaceId])
+}
+
+/// Business verticals. Values match `NicheSchema` exactly, so the mapping into
+/// the engine is a pass-through rather than a translation table.
+enum Niche {
+  cleaning
+  moving
+  handyman
+  coaching
+  security
+}
+
+/// The trading identity behind a project — the "who" on every generated page.
+///
+/// One per project, kept separate from Workspace: a Workspace is the tenant
+/// (an agency may own many sites), while a Business is the company a single
+/// site speaks for.
+model Business {
+  /// A UUID rather than the cuid used elsewhere, because `BusinessSchema.id`
+  /// is validated with `.uuid()`.
+  id String @id @default(uuid()) @db.Uuid
+
+  name String
+  slug String
+  /// 50–500 characters, per `BusinessSchema`.
+  description String
+  niche       Niche
+  foundedYear Int?
+
+  contactEmail String
+  contactPhone String
+
+  /// Address, flattened. `AddressSchema` is a value object with no identity of
+  /// its own, so a separate table would buy nothing.
+  addressStreet     String
+  addressCity       String
+  addressState      String
+  addressPostalCode String
+  addressCountry    String @default("DE")
+
+  projectId String  @unique
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// The language-agnostic content template a project renders through.
+/// Mirrors `StaticContentTemplate`.
+model ContentTemplate {
+  id String @id @default(cuid())
+
+  /// `{{service}}`, `{{city}}` and `{{business}}` placeholders are resolved by
+  /// the generator, which rejects any other placeholder name.
+  heroTitleTemplate    String
+  heroSubtitleTemplate String
+
+  ctaPrimary String
+  /// Label for the optional secondary CTA. Empty string means "no secondary".
+  ctaSecondary String @default("")
+
+  /// `[{ q, a }]`, at least three entries. Stored as JSON because the template
+  /// is read whole and never queried per entry.
+  faqs Json
+
+  projectId String  @unique
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 /// A service offered within a project. Mirrors `ServiceSchema`.

@@ -8,6 +8,7 @@ import { buildPages } from "./build-pages.js";
 import { applyAiContent, isAiGenerationEnabled } from "./ai-content.js";
 import { savePages } from "./save-output.js";
 import { ValidationError } from "./errors.js";
+import type { RawInputData } from "./types.js";
 
 /**
  * Resolve the monorepo root.
@@ -21,10 +22,20 @@ function resolveRepoRoot(): string {
   return process.env.INIT_CWD ?? resolve(process.cwd(), "../..");
 }
 
-/** Parse and validate the required `--locale` argument. */
-function parseLocale(): Locale {
+/** Command-line options. `projectId` selects the data source. */
+interface CliOptions {
+  locale: Locale;
+  /** When set, input comes from the database instead of `data/input/`. */
+  projectId: string | undefined;
+}
+
+/** Parse `--locale` (required) and `--project-id` (optional). */
+function parseOptions(): CliOptions {
   const { values } = parseArgs({
-    options: { locale: { type: "string" } },
+    options: {
+      locale: { type: "string" },
+      "project-id": { type: "string" },
+    },
     allowPositionals: false,
   });
 
@@ -37,17 +48,62 @@ function parseLocale(): Locale {
     );
     process.exit(1);
   }
-  return parsed.data;
+
+  return { locale: parsed.data, projectId: values["project-id"] };
+}
+
+/**
+ * Load one project's input from the database.
+ *
+ * `@staticforge/database` is imported dynamically so a local-file run never
+ * loads Prisma at all — no client construction, no engine binary, no reason for
+ * a machine without a database to carry the cost.
+ */
+async function loadFromDatabase(
+  projectId: string,
+  locale: Locale,
+): Promise<RawInputData> {
+  const { getProjectPayload, prisma } = await import("@staticforge/database");
+
+  const payload = await getProjectPayload(projectId, prisma);
+
+  console.log(
+    `  workspace: ${payload.workspace.name} (${payload.workspace.slug})`,
+  );
+
+  if (payload.locale !== locale) {
+    console.warn(
+      `  ! project locale is "${payload.locale}" but --locale is "${locale}"; ` +
+        `the flag wins.`,
+    );
+  }
+
+  return {
+    businesses: payload.businesses,
+    services: payload.services,
+    locations: payload.locations,
+    content: payload.content,
+  };
 }
 
 async function main(): Promise<void> {
-  const locale = parseLocale();
+  const { locale, projectId } = parseOptions();
   const repoRoot = resolveRepoRoot();
   const inputDir = join(repoRoot, "data", "input");
   const outputDir = join(repoRoot, "data", "output");
 
-  const raw = await loadInputData(defaultInputPaths(inputDir));
-  console.log("✓ input loaded");
+  // Dual mode: --project-id switches the source of input. Everything after this
+  // point — validation, page building, AI, saving — is identical either way.
+  const raw =
+    projectId !== undefined
+      ? await loadFromDatabase(projectId, locale)
+      : await loadInputData(defaultInputPaths(inputDir));
+
+  console.log(
+    projectId !== undefined
+      ? `✓ input loaded from database (project ${projectId})`
+      : "✓ input loaded from data/input",
+  );
 
   const validated = validateInputData(raw);
   console.log("✓ input validated");

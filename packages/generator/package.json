@@ -18,6 +18,7 @@
   "dependencies": {
     "@staticforge/ai": "workspace:*",
     "@staticforge/core": "workspace:*",
+    "@staticforge/database": "workspace:*",
     "@staticforge/schemas": "workspace:*",
     "zod": "^3.23.0"
   },

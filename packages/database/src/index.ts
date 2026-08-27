@@ -38,6 +38,8 @@ if (process.env.NODE_ENV !== "production") {
   globalForPrisma.prisma = prisma;
 }
 
+export * from "./repository.js";
+
 export { PrismaClient } from "@prisma/client";
 export type {
   Workspace,
