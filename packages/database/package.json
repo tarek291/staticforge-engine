@@ -14,7 +14,11 @@
     "postinstall": "prisma generate",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "db:seed": "prisma db seed"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",
@@ -23,6 +27,7 @@
   "devDependencies": {
     "@types/node": "^20.14.0",
     "prisma": "^6.19.0",
+    "tsx": "^4.23.12",
     "typescript": "^5.5.0",
     "vitest": "^4.1.11",
     "vitest-mock-extended": "^5.1.1"

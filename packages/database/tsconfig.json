@@ -1,9 +1,13 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "rootDir": "./src",
+    // rootDir is the package root, not ./src, so `prisma/seed.ts` is inside the
+    // program and actually gets typechecked. The package never emits (main
+    // points at src/index.ts and typecheck runs --noEmit), so this only widens
+    // what tsc reads.
+    "rootDir": ".",
     "outDir": "./dist"
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "prisma/**/*.ts"],
   "exclude": ["dist", "node_modules"]
 }
