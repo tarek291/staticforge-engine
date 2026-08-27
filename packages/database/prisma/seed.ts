@@ -271,8 +271,10 @@ async function seed(): Promise<void> {
   console.log(
     `\nThis project yields ${SERVICES.length * LOCATIONS.length} pages. Generate them with:`,
   );
+  // No `--` separator: pnpm forwards it to the script as a literal argument,
+  // where parseArgs rejects it as an unexpected positional.
   console.log(
-    `  corepack pnpm --filter @staticforge/generator generate -- --project-id ${project.id}`,
+    `  corepack pnpm --filter @staticforge/generator generate --project-id ${project.id}`,
   );
 }
 

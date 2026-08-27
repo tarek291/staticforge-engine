@@ -103,6 +103,40 @@ data/output/
 
 ---
 
+## Cloud database mode
+
+The generator reads from PostgreSQL when given a project id, and writes the
+generated pages back to it. Without the flag it reads `data/input/` exactly as
+before.
+
+```bash
+corepack pnpm --filter @staticforge/database db:push    # schema → database
+corepack pnpm --filter @staticforge/database db:seed    # sample tenant (idempotent)
+corepack pnpm --filter @staticforge/generator generate --project-id <id>
+```
+
+> Pass `--project-id` **without** a `--` separator. pnpm forwards the separator
+> to the script as a literal argument, where it is rejected as an unexpected
+> positional.
+
+`DATABASE_URL` lives in a git-ignored `.env` inside `packages/database/`
+(see `.env.example`). Percent-encode any reserved character in the password —
+an unencoded `?` terminates the URI authority and leaves the URL with no host.
+
+### What the two modes share
+
+Only the *load* step differs. Validation, page assembly, slug collision
+detection, AI authoring and static output are identical, and this is verified
+rather than assumed: the seeded project uses the same entity ids as the JSON
+fixtures, so generating from the database produces output byte-identical to a
+local-file run.
+
+Static files are written in **both** modes, because the Next.js build reads
+them. Database mode additionally persists each page, after validation and the
+optional AI pass have both succeeded.
+
+---
+
 ## CSV data ingestion
 
 Services and locations can be imported from one flat CSV sheet instead of being
