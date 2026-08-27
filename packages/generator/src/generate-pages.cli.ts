@@ -4,6 +4,7 @@ import { LocaleSchema, type Locale } from "@staticforge/schemas";
 import { loadInputData, defaultInputPaths } from "./load-data.js";
 import { validateInputData } from "./validate-input.js";
 import { buildPages } from "./build-pages.js";
+import { applyAiContent, isAiGenerationEnabled } from "./ai-content.js";
 import { savePages } from "./save-output.js";
 import { ValidationError } from "./errors.js";
 
@@ -50,8 +51,18 @@ async function main(): Promise<void> {
   const validated = validateInputData(raw);
   console.log("✓ input validated");
 
-  const pages = buildPages(validated, { locale });
+  let pages = buildPages(validated, { locale });
   console.log(`✓ pages built (${pages.length})`);
+
+  // Opt-in only. Without USE_AI_GENERATION=true the deterministic pages built
+  // above are saved unchanged, exactly as before.
+  if (isAiGenerationEnabled()) {
+    console.log(`… authoring content with AI (${pages.length} pages)`);
+    pages = await applyAiContent(pages, validated, ({ done, total, slug }) => {
+      console.log(`  · ${done}/${total} ${slug}`);
+    });
+    console.log("✓ AI content applied");
+  }
 
   await savePages(pages, outputDir);
   console.log("✓ output saved");

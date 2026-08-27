@@ -16,8 +16,9 @@
     "generate": "tsx src/generate-pages.cli.ts --locale de"
   },
   "dependencies": {
-    "@staticforge/schemas": "workspace:*",
+    "@staticforge/ai": "workspace:*",
     "@staticforge/core": "workspace:*",
+    "@staticforge/schemas": "workspace:*",
     "zod": "^3.23.0"
   },
   "devDependencies": {
