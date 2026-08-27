@@ -10,6 +10,7 @@ import {
   AIToolCallMissingError,
   AITransportError,
 } from "./errors.js";
+import { GroundingFactsSchema, type GroundingFacts } from "./grounding.js";
 import { renderProfileConstraints } from "./prompts.js";
 import {
   AIGenerationService,
@@ -93,6 +94,19 @@ function proseResponse() {
     usage: { input_tokens: 1, output_tokens: 1 },
   };
 }
+
+/** The verified record the grounding gate checks against. */
+const FACTS: GroundingFacts = GroundingFactsSchema.parse({
+  businessName: "GlanzFix Reinigungsservice",
+  foundedYear: 2014,
+  emails: ["kontakt@glanzfix.de"],
+  phones: ["+49 203 1234567"],
+  approvedServices: ["Büroreinigung", "Grundreinigung"],
+  approvedCities: ["Duisburg", "Essen"],
+  unapprovedServices: ["Treppenhausreinigung", "Fensterreinigung"],
+  unapprovedCities: ["Köln"],
+  prices: [{ from: 25, to: 45, currency: "EUR" }],
+});
 
 /** An error shaped like the SDK's, without importing the SDK's classes. */
 function apiError(status: number, headers?: Record<string, string>) {
@@ -453,6 +467,199 @@ describe("transport handling", () => {
       ).resolves.toBeDefined();
     } finally {
       if (before !== undefined) process.env.ANTHROPIC_API_KEY = before;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fact grounding — gate 4
+// ---------------------------------------------------------------------------
+
+describe("fact grounding", () => {
+  /** Plant text in the first section's body. */
+  function withClaim(claim: string): GeneratedPageContent {
+    const base = goodContent();
+    const [first, ...rest] = base.content.sections;
+
+    return {
+      ...base,
+      content: {
+        ...base.content,
+        sections: [{ ...first!, body: `${first!.body}${claim}` }, ...rest],
+      },
+    };
+  }
+
+  test("puts the verified record in front of the model", async () => {
+    const create = vi.fn().mockResolvedValue(toolResponse(goodContent()));
+
+    await serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS });
+
+    const userTurn = create.mock.calls[0]?.[0].messages[0].content as string;
+    expect(userTurn).toContain("Verified record");
+    expect(userTurn).toContain("kontakt@glanzfix.de");
+    expect(userTurn).toContain("25–45 EUR");
+    // Prevention as well as detection: it is told what it may not name.
+    expect(userTurn).toContain("Treppenhausreinigung");
+  });
+
+  test("omits the record when none is supplied", async () => {
+    const create = vi.fn().mockResolvedValue(toolResponse(goodContent()));
+
+    await serviceWith(create).generatePageContent(DETAILS);
+
+    expect(create.mock.calls[0]?.[0].messages[0].content).not.toContain(
+      "Verified record",
+    );
+  });
+
+  test("rejects an invented contact detail at the grounding gate", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValue(toolResponse(withClaim(" Schreiben Sie an fake@example.com.")));
+
+    try {
+      await serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS });
+      throw new Error("expected the service to reject the content");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AIContentRejectedError);
+      expect((error as AIContentRejectedError).stage).toBe("grounding");
+    }
+  });
+
+  test("rejects an invented founding year", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValue(toolResponse(withClaim(" Seit 1998 im Ruhrgebiet.")));
+
+    await expect(
+      serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS }),
+    ).rejects.toMatchObject({ stage: "grounding" });
+  });
+
+  test("rejects a service the business does not sell", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValue(toolResponse(withClaim(" Auch Fensterreinigung im Angebot.")));
+
+    await expect(
+      serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS }),
+    ).rejects.toMatchObject({ stage: "grounding" });
+  });
+
+  test("rejects a price nobody quoted", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValue(toolResponse(withClaim(" Pauschal ab 750 EUR.")));
+
+    await expect(
+      serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS }),
+    ).rejects.toMatchObject({ stage: "grounding" });
+  });
+
+  test("accepts content that stays inside the record", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValue(
+        toolResponse(withClaim(" Seit 2014 tätig, ab 30 EUR, kontakt@glanzfix.de.")),
+      );
+
+    await expect(
+      serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS }),
+    ).resolves.toBeDefined();
+  });
+
+  test("does not retry a fabrication — a lie does not become true on a second call", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValue(toolResponse(withClaim(" Seit 1998 im Ruhrgebiet.")));
+
+    await expect(
+      serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS }),
+    ).rejects.toBeInstanceOf(AIContentRejectedError);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  test("skips the gate when no record is supplied", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValue(toolResponse(withClaim(" Seit 1998, ab 900 EUR, fake@example.com.")));
+
+    // Nothing to check against: what is not known cannot be verified.
+    await expect(serviceWith(create).generatePageContent(DETAILS)).resolves.toBeDefined();
+  });
+
+  test("refuses to generate ungrounded when requireFacts is on", async () => {
+    const create = vi.fn().mockResolvedValue(toolResponse(goodContent()));
+
+    await expect(
+      serviceWith(create, { requireFacts: true }).generatePageContent(DETAILS),
+    ).rejects.toBeInstanceOf(AIRequestError);
+    // Refused before spending anything.
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  test("quality is judged before grounding, so a thin page fails as thin", async () => {
+    const base = goodContent();
+    const create = vi.fn().mockResolvedValue(
+      toolResponse({
+        ...base,
+        content: {
+          ...base.content,
+          sections: [
+            { ...base.content.sections[0]!, body: `${base.content.sections[0]!.body} Seit 1998.` },
+          ],
+        },
+      }),
+    );
+
+    // Both gates would fire; the earlier verdict is the useful one, because the
+    // page will be rewritten anyway.
+    await expect(
+      serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS }),
+    ).rejects.toMatchObject({ stage: "profile" });
+  });
+
+  test("honours the percentage switch", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValue(toolResponse(withClaim(" 98% Zufriedenheit.")));
+
+    await expect(
+      serviceWith(create).generatePageContent({ ...DETAILS, facts: FACTS }),
+    ).rejects.toMatchObject({ stage: "grounding" });
+
+    await expect(
+      serviceWith(create, {
+        grounding: { rejectPercentages: false },
+      }).generatePageContent({ ...DETAILS, facts: FACTS }),
+    ).resolves.toBeDefined();
+  });
+
+  test("acceptOrReject applies the grounding gate without a provider", () => {
+    const service = serviceWith(vi.fn());
+
+    expect(() =>
+      service.acceptOrReject(withClaim(" Seit 1998 im Ruhrgebiet."), FACTS),
+    ).toThrow(AIContentRejectedError);
+
+    // Same content, no record to check against: nothing to object to.
+    expect(
+      service.acceptOrReject(withClaim(" Seit 1998 im Ruhrgebiet.")).h1,
+    ).toBeDefined();
+  });
+
+  test("names the offending field and the fact that contradicts it", () => {
+    try {
+      serviceWith(vi.fn()).acceptOrReject(
+        withClaim(" Seit 1998 im Ruhrgebiet."),
+        FACTS,
+      );
+      throw new Error("expected a rejection");
+    } catch (error) {
+      const issues = (error as AIContentRejectedError).issues;
+      expect(issues[0]?.path).toMatch(/^content\.sections\[0\]\.body$/);
+      expect(issues[0]?.message).toContain("2014");
     }
   });
 });

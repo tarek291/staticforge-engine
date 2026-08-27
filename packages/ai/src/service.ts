@@ -16,6 +16,12 @@ import {
   AIToolCallMissingError,
   AITransportError,
 } from "./errors.js";
+import {
+  collectGroundingIssues,
+  renderGroundingFacts,
+  type GroundingFacts,
+  type GroundingOptions,
+} from "./grounding.js";
 import { buildSystemPrompt, buildUserPrompt } from "./prompts.js";
 import type { PagePromptDetails } from "./prompts.js";
 import { RetryExhaustedError, withRetry, type RetryOptions } from "./retry.js";
@@ -26,13 +32,16 @@ import { RetryExhaustedError, withRetry, type RetryOptions } from "./retry.js";
  * ## Separation of powers
  *
  * The model authors data. It has no authority to accept it. Every response
- * passes three gates before this service returns anything:
+ * passes four gates before this service returns anything:
  *
  * 1. **Tool call present** — the model must answer through the tool, not prose.
  * 2. **Structural contract** — the arguments are parsed with the Zod schema
  *    derived from `GeneratedPageSchema`. The model cannot widen the shape.
  * 3. **Quality profile** — the parsed content is measured against the same
  *    `ContentProfile` whose rules were rendered into the prompt.
+ * 4. **Fact grounding** — every checkable claim is matched against the verified
+ *    record that was put in front of the model. Runs only when facts are
+ *    supplied: what is not known cannot be verified.
  *
  * A failure at any gate is a rejection, not a retry. Retrying is reserved for
  * transport failures, where waiting can plausibly change the outcome; rejected
@@ -130,6 +139,22 @@ export interface AIGenerationServiceOptions {
   /** Transport retry policy. */
   retry?: RetryOptions;
   onRetry?: (notice: GenerationRetryNotice) => void;
+  /** Grounding guard configuration. */
+  grounding?: GroundingOptions;
+  /**
+   * Refuse to generate at all when no verified record is supplied.
+   *
+   * Off by default so existing callers keep working, but worth turning on for
+   * anything published: without facts the grounding gate cannot run, and an
+   * ungrounded page looks exactly like a grounded one.
+   */
+  requireFacts?: boolean;
+}
+
+/** A page to author, with the verified record it must stay inside. */
+export interface GenerationRequest extends PagePromptDetails {
+  /** The verified record. Omit to skip the grounding gate. */
+  facts?: GroundingFacts;
 }
 
 export class AIGenerationService {
@@ -139,6 +164,8 @@ export class AIGenerationService {
   private readonly maxTokens: number;
   private readonly retryOptions: RetryOptions;
   private readonly onRetry: ((notice: GenerationRetryNotice) => void) | undefined;
+  private readonly groundingOptions: GroundingOptions;
+  private readonly requireFacts: boolean;
   private readonly systemPrompt: string;
 
   constructor(options: AIGenerationServiceOptions) {
@@ -148,6 +175,8 @@ export class AIGenerationService {
     this.maxTokens = options.maxTokens ?? 16_000;
     this.retryOptions = options.retry ?? {};
     this.onRetry = options.onRetry;
+    this.groundingOptions = options.grounding ?? {};
+    this.requireFacts = options.requireFacts ?? false;
     // Rendered once: the prompt is derived from the profile, so it changes only
     // when the profile does.
     this.systemPrompt = buildSystemPrompt(this.profile);
@@ -174,9 +203,18 @@ export class AIGenerationService {
    * @throws {AIContentRejectedError} The content violated the contract.
    */
   async generatePageContent(
-    details: PagePromptDetails,
+    request: GenerationRequest,
   ): Promise<GeneratedPageContent> {
-    const response = await this.callProvider(details);
+    if (this.requireFacts && request.facts === undefined) {
+      throw new AIRequestError(
+        "requireFacts is enabled but no verified record was supplied; " +
+          "the grounding gate cannot run and the page would be unverifiable.",
+        undefined,
+        undefined,
+      );
+    }
+
+    const response = await this.callProvider(request);
 
     const toolUse = response.content.find(
       (block): block is Anthropic.ToolUseBlock =>
@@ -187,16 +225,21 @@ export class AIGenerationService {
       throw new AIToolCallMissingError(TOOL_NAME, response.stop_reason);
     }
 
-    return this.acceptOrReject(toolUse.input);
+    return this.acceptOrReject(toolUse.input, request.facts);
   }
 
   /**
-   * Gate 2 and gate 3: structure, then quality.
+   * Gates 2, 3 and 4: structure, then quality, then grounding.
+   *
+   * Ordered cheapest and most fundamental first — content that is not a page
+   * cannot be judged for quality, and content that fails the quality bar will
+   * be rewritten anyway, so there is no point scanning it for fabricated
+   * claims.
    *
    * Exposed so the same verdict can be applied to content that arrived by
    * another route, and so the rejection path is testable without a provider.
    */
-  acceptOrReject(input: unknown): GeneratedPageContent {
+  acceptOrReject(input: unknown, facts?: GroundingFacts): GeneratedPageContent {
     const parsed = GeneratedPageContentSchema.safeParse(input);
 
     if (!parsed.success) {
@@ -210,10 +253,26 @@ export class AIGenerationService {
       );
     }
 
-    const issues = this.collectProfileIssues(parsed.data);
+    const profileIssues = this.collectProfileIssues(parsed.data);
 
-    if (issues.length > 0) {
-      throw new AIContentRejectedError("profile", this.profile.id, issues);
+    if (profileIssues.length > 0) {
+      throw new AIContentRejectedError("profile", this.profile.id, profileIssues);
+    }
+
+    if (facts !== undefined) {
+      const groundingIssues = collectGroundingIssues(
+        parsed.data,
+        facts,
+        this.groundingOptions,
+      );
+
+      if (groundingIssues.length > 0) {
+        throw new AIContentRejectedError(
+          "grounding",
+          this.profile.id,
+          groundingIssues,
+        );
+      }
     }
 
     return parsed.data;
@@ -235,9 +294,25 @@ export class AIGenerationService {
     return collectContentIssues(probe, this.profile);
   }
 
+  /**
+   * The user turn, with the verified record appended when one exists.
+   *
+   * Grounding is two halves of one mechanism: the record is put in front of the
+   * model so it has no reason to invent, and the same record then judges the
+   * answer. Sending the facts without checking them would be a hope; checking
+   * without sending them would be a trap.
+   */
+  private buildRequestText(request: GenerationRequest): string {
+    const userPrompt = buildUserPrompt(request);
+
+    return request.facts === undefined
+      ? userPrompt
+      : `${userPrompt}\n\n${renderGroundingFacts(request.facts)}`;
+  }
+
   /** Gate 1, with the transport retry policy wrapped around it. */
   private async callProvider(
-    details: PagePromptDetails,
+    request: GenerationRequest,
   ): Promise<Anthropic.Message> {
     try {
       return await withRetry(
@@ -260,7 +335,9 @@ export class AIGenerationService {
               name: TOOL_NAME,
               disable_parallel_tool_use: true,
             },
-            messages: [{ role: "user", content: buildUserPrompt(details) }],
+            messages: [
+              { role: "user", content: this.buildRequestText(request) },
+            ],
           }) as Promise<Anthropic.Message>,
         {
           ...this.retryOptions,

@@ -78,13 +78,16 @@ export class AIContentRejectedError extends AIGenerationError {
   override readonly name = "AIContentRejectedError";
 
   constructor(
-    /** Which stage rejected it: the structural schema, or a quality profile. */
-    readonly stage: "schema" | "profile",
+    /**
+     * Which gate rejected it: the structural schema, the quality profile, or
+     * the verified record the content was checked against.
+     */
+    readonly stage: "schema" | "profile" | "grounding",
     readonly profileId: string,
     readonly issues: ContentIssue[],
   ) {
     super(
-      `AI content rejected by the ${stage} contract "${profileId}": ` +
+      `AI content rejected at the ${stage} gate ("${profileId}"): ` +
         `${issues.length} issue(s) — ${issues
           .slice(0, 3)
           .map((issue) => `${issue.path}: ${issue.message}`)
