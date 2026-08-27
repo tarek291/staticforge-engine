@@ -14,6 +14,7 @@
   "scripts": {
     "build": "echo \"No build configured yet\" && exit 0",
     "typecheck": "corepack pnpm -r typecheck",
+    "test": "corepack pnpm -r test",
     "generate": "corepack pnpm --filter @staticforge/generator generate",
     "generate:ai": "cross-env USE_AI_GENERATION=true corepack pnpm generate",
     "import:csv": "corepack pnpm --filter @staticforge/core import:csv",
@@ -21,7 +22,7 @@
     "build:web": "corepack pnpm --filter @staticforge/web build",
     "typecheck:web": "corepack pnpm --filter @staticforge/web typecheck",
     "typecheck:ai": "corepack pnpm --filter @staticforge/ai typecheck",
-    "verify": "corepack pnpm generate && corepack pnpm -r typecheck && corepack pnpm --filter @staticforge/generator test && corepack pnpm --filter @staticforge/web build"
+    "verify": "corepack pnpm generate && corepack pnpm -r typecheck && corepack pnpm -r test && corepack pnpm --filter @staticforge/web build"
   },
   "devDependencies": {
     "cross-env": "^10.1.0"

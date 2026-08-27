@@ -77,10 +77,13 @@ pnpm install
 
 ```bash
 corepack pnpm install     # install workspace dependencies
+corepack pnpm import:csv  # CSV sheet → data/input/{services,locations}.json
 corepack pnpm generate    # run the generator pipeline → data/output/
 corepack pnpm dev:web     # start the Next.js dev server
 corepack pnpm build:web   # build the static site
-corepack pnpm verify      # generate + generator typecheck + generator tests + web typecheck + build
+corepack pnpm typecheck   # typecheck every workspace package
+corepack pnpm test        # run every package's test suite
+corepack pnpm verify      # generate + typecheck (all) + test (all) + web build
 ```
 
 ### Generated output structure
@@ -97,6 +100,84 @@ data/output/
 - `/` — home (reads the manifest, lists sample slugs)
 - `/bueroreinigung-duisburg`
 - `/grundreinigung-essen`
+
+---
+
+## CSV data ingestion
+
+Services and locations can be imported from one flat CSV sheet instead of being
+hand-written as JSON — the path to generating hundreds of pages without editing
+JSON by hand.
+
+```bash
+corepack pnpm import:csv                # reads data/input/sample.csv
+corepack pnpm import:csv --dry-run      # parse and report, write nothing
+corepack pnpm import:csv --in my.csv    # a different sheet
+```
+
+> Pass flags **without** a `--` separator. The root script delegates through a
+> second pnpm invocation, which would otherwise forward the separator itself as
+> an argument.
+
+`import:csv` **overwrites** `data/input/services.json` and
+`data/input/locations.json`. Anything the sheet does not carry is gone, so
+`--dry-run` — which parses, validates and prints the row counts without writing
+a byte — is the safe first move on an unfamiliar sheet.
+
+### Columns
+
+The `type` column decides which schema a row must satisfy.
+
+| Column        | `service`            | `location`         |
+| ------------- | -------------------- | ------------------ |
+| `type`        | required             | required           |
+| `name`        | required             | required (city)    |
+| `description` | required, 100+ chars | ignored            |
+| `benefits`    | required, 3+ items   | ignored            |
+| `state`       | ignored              | required           |
+| `id`          | optional             | optional           |
+| `slug`        | optional             | ignored            |
+| `country`     | ignored              | optional (`DE`)    |
+| `postalCode`  | ignored              | optional           |
+| `pricing`     | optional             | ignored            |
+| `coordinates` | ignored              | optional           |
+
+`benefits` is a `|`-separated list, `pricing` is `from|to|currency`, and
+`coordinates` is `lat|lng`. Unknown columns are ignored.
+
+`description`, `benefits` and `state` are not conveniences that can be skipped —
+`ServiceSchema` and `LocationSchema` require them, so a three-column sheet
+cannot produce a page that validates.
+
+### Why `slug` is a column
+
+Slugs are derived from `name` only when the column is empty, and derivation
+**strips** diacritics rather than transliterating them: `Büroreinigung` becomes
+`buroreinigung`, not the curated `bueroreinigung`. Since a page's URL is built
+from the service slug, letting derivation win would silently rename published
+routes. Curated slugs belong in the sheet.
+
+### Safety
+
+- Every row is validated against the real schemas; issues are collected across
+  the whole sheet and reported together with row number and column, so a bad
+  sheet is fixed in one pass rather than one row per run.
+- Duplicate ids are rejected — the generator indexes by id, so a collision would
+  silently drop an entity.
+- Validation runs **before** any write, so a failed import cannot leave
+  `data/input/` half-overwritten.
+
+`data/input/sample.csv` reproduces the current sample data exactly: importing it
+leaves `services.json` and `locations.json` byte-identical.
+
+### Intentionally deferred
+
+- Importing businesses or the content template from CSV
+- Merging into existing JSON instead of overwriting it
+- Slug transliteration (`ü` → `ue`) as a derivation option
+- Reading sheets from a URL or a spreadsheet API
+
+---
 
 ### Scope & architecture reminders
 
