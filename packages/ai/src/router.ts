@@ -71,7 +71,14 @@ export function createAuthoringRouter(
 
     authorPage(request: GenerationRequest): Promise<AuthoredContent> {
       const profileId = request.contentProfileId ?? DEFAULT_CONTENT_PROFILE.id;
-      const profile = profiles[profileId];
+      // `Object.hasOwn`, not a bare index: the registry is an object literal, so
+      // it inherits `Object.prototype`. A page naming "constructor" or
+      // "toString" would read as a registered profile, skip the error below,
+      // and be handed to the factory as a function — turning the loud failure
+      // this check exists to produce into a prompt built from a constructor.
+      const profile = Object.hasOwn(profiles, profileId)
+        ? profiles[profileId]
+        : undefined;
 
       if (profile === undefined) {
         return Promise.reject(new UnknownContentProfileError(profileId));

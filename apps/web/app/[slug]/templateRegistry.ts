@@ -29,7 +29,15 @@ const TEMPLATE_REGISTRY: Record<string, TemplateView> = {
  * @throws {Error} If `templateId` is not registered.
  */
 export function getTemplateView(templateId: string): TemplateView {
-  const view = TEMPLATE_REGISTRY[templateId];
+  // Own property only. The registry is an object literal and therefore inherits
+  // `Object.prototype`, so "constructor" and "toString" resolve to functions
+  // rather than to undefined — which would slip past the throw below and reach
+  // React as a component, producing a cryptic render failure instead of the
+  // named error this function promises.
+  const view = Object.hasOwn(TEMPLATE_REGISTRY, templateId)
+    ? TEMPLATE_REGISTRY[templateId]
+    : undefined;
+
   if (view === undefined) {
     throw new Error(
       `Unknown templateId "${templateId}". Registered templates: ${Object.keys(TEMPLATE_REGISTRY).join(", ")}.`,

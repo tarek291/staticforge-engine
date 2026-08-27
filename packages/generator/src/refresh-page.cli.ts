@@ -121,7 +121,12 @@ async function main(): Promise<void> {
 
   console.log(`✓ loaded ${slug} (${page.contentProfileId} / ${page.templateId})`);
 
-  const profile = CONTENT_PROFILES[page.contentProfileId] ?? DEFAULT_CONTENT_PROFILE;
+  // `??` cannot save this on its own: a bare index for "constructor" returns a
+  // function rather than undefined, so the fallback never fires and the page is
+  // judged against something that is not a profile at all.
+  const profile = Object.hasOwn(CONTENT_PROFILES, page.contentProfileId)
+    ? (CONTENT_PROFILES[page.contentProfileId] ?? DEFAULT_CONTENT_PROFILE)
+    : DEFAULT_CONTENT_PROFILE;
   const mocked = isMockAiEnabled();
 
   const service = mocked

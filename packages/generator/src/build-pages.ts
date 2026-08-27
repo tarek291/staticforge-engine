@@ -312,7 +312,10 @@ export function buildPages(
         // the engine itself: it drives the authoring prompt and the quality
         // verdict, so generating against one that does not exist would mean
         // silently applying no rules at all.
-        if (CONTENT_PROFILES[page.contentProfileId] === undefined) {
+        // Own property only: the registry inherits `Object.prototype`, so a
+        // tenant-supplied "constructor" would satisfy a bare index lookup and
+        // pass the very check meant to reject it.
+        if (!Object.hasOwn(CONTENT_PROFILES, page.contentProfileId)) {
           issues.push({
             path: `pages[${page.slug}].contentProfileId`,
             message: `Unknown contentProfileId "${page.contentProfileId}". Registered profiles: ${Object.keys(CONTENT_PROFILES).join(", ")}.`,

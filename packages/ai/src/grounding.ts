@@ -95,9 +95,22 @@ const URL_PATTERN = /\bhttps?:\/\/[^\s<>"')\]]+/giu;
 const YEAR_PATTERN = /\b(?:1[89]\d{2}|20\d{2})\b/gu;
 const PERCENT_PATTERN = /\b\d{1,3}(?:[.,]\d+)?\s?%/gu;
 
-/** A currency symbol or ISO code, before or after the number. */
+/**
+ * A currency symbol or ISO code, before or after the number.
+ *
+ * The trailing boundary is a lookahead rather than `\b`, and that is the whole
+ * point of it. `\b` is defined between a word character and a non-word one, so
+ * a match ending in `€` only closed when a letter or digit followed — which in
+ * "ab 49 € pro Einsatz" it never does. The result was that the most natural way
+ * to write a price in German, and the way a model actually writes one, was
+ * invisible to the price guard: `€ 49` was caught, `49 €` and `49€` were not.
+ *
+ * `(?![\p{L}\p{N}])` says the same thing the `\b` was meant to say — the amount
+ * must not run into a word — without requiring a word character to exist. It
+ * still refuses "120 EURO", where the code is only the start of a longer word.
+ */
 const MONEY_PATTERN =
-  /(?:[€$£¥]\s?\d[\d.,]*|\b\d[\d.,]*\s?(?:€|\$|£|¥|EUR|USD|GBP|CHF)\b)/giu;
+  /(?:[€$£¥]\s?\d[\d.,]*|\b\d[\d.,]*\s?(?:€|\$|£|¥|EUR|USD|GBP|CHF)(?![\p{L}\p{N}]))/giu;
 
 /** International or trunk-prefixed phone numbers, loosely. */
 const PHONE_PATTERN = /(?:\+\d[\d\s().\-/]{6,}\d|\b0\d[\d\s().\-/]{7,}\d)/gu;

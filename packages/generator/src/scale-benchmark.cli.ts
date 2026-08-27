@@ -145,7 +145,10 @@ async function main(): Promise<void> {
 
   // The mock sizes its content from the profile, so the profile decides how
   // much body each page carries — and therefore how many links a page earns.
-  const profile = CONTENT_PROFILES[values.profile ?? "default"] ?? DEFAULT_CONTENT_PROFILE;
+  const requestedProfile = values.profile ?? "default";
+  const profile = Object.hasOwn(CONTENT_PROFILES, requestedProfile)
+    ? (CONTENT_PROFILES[requestedProfile] ?? DEFAULT_CONTENT_PROFILE)
+    : DEFAULT_CONTENT_PROFILE;
   const mockService = createMockService({ profile });
 
   const authored = await stage(stages, "author (mock)", () =>

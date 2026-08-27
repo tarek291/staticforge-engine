@@ -105,11 +105,49 @@ export interface ApplyAiContentOptions {
    * tests pass `0` so the suite does not spend real seconds waiting.
    */
   delayMs?: number;
+  /**
+   * Injected so a test can observe *whether* the run paced, not merely how
+   * long it took. The same seam `withRetry` and the mock service already use,
+   * for the same reason: a wall-clock assertion is a slow test and a flaky one.
+   */
+  sleepFn?: (ms: number) => Promise<void>;
 }
 
 /** Index a list of identified entities by id. */
 function indexById<T extends { id: string }>(items: T[]): Map<string, T> {
   return new Map(items.map((item) => [item.id, item]));
+}
+
+/**
+ * Realign a page's structured data with the content it now carries.
+ *
+ * `schemaOrg` is assembled during template building, from the template's hero
+ * title and subtitle. The authoring pass then replaces the title, the meta
+ * description and the h1 and left the structured data untouched — so every
+ * AI-authored page shipped JSON-LD describing a page that no longer existed,
+ * telling a crawler one thing while showing a reader another. For a
+ * programmatic SEO engine that is not a cosmetic inconsistency: mismatched
+ * structured data is a documented negative signal, and this product exists to
+ * rank.
+ *
+ * "Engine-owned" was always the right call for this field. It should have meant
+ * *derived from the finished page*, not *frozen at template time*.
+ *
+ * Only the two fields that describe the page move. `serviceType`, `provider`
+ * and `areaServed` come from the business record rather than from any prose,
+ * so the model has no say in them and no reason to be consulted about them.
+ * The roles are the ones the template established: `name` tracks the visible
+ * heading, `description` tracks the meta description.
+ */
+function realignSchemaOrg(
+  schemaOrg: GeneratedPage["schemaOrg"],
+  content: { h1: string; metaDescription: string },
+): GeneratedPage["schemaOrg"] {
+  return {
+    ...schemaOrg,
+    name: content.h1,
+    description: content.metaDescription,
+  };
 }
 
 /**
@@ -148,7 +186,7 @@ export async function applyAiContent(
   generateContentFn: GenerateContentFn,
   options: ApplyAiContentOptions = {},
 ): Promise<GeneratedPage[]> {
-  const { onProgress, delayMs = AI_CALL_DELAY_MS } = options;
+  const { onProgress, delayMs = AI_CALL_DELAY_MS, sleepFn = sleep } = options;
 
   const businesses = indexById(input.businesses);
   const services = indexById(input.services);
@@ -203,6 +241,10 @@ export async function applyAiContent(
       metaDescription: content.metaDescription,
       h1: content.h1,
       content: content.content,
+      // Derived from the finished page rather than carried over from the
+      // template, so the structured data cannot describe copy that was
+      // replaced.
+      schemaOrg: realignSchemaOrg(page.schemaOrg, content),
       // Provenance travels with the page, so a later run can tell what wrote it
       // without re-reading the text.
       generation: {
@@ -241,10 +283,13 @@ export async function applyAiContent(
       cacheHit: provenance.cacheHit,
     });
 
-    // Pace the calls — skipped after the final page, where the delay would
-    // only add dead time before the run ends.
-    if (index < pages.length - 1) {
-      await sleep(delayMs);
+    // Pace the calls. Skipped after the final page, where the delay would only
+    // add dead time before the run ends — and skipped entirely on a cache hit,
+    // which never touched the provider and so has no rate limit to respect.
+    // Pacing it anyway is pure waiting: a fully cached re-run of five hundred
+    // pages spent twenty-five minutes asleep to make zero requests.
+    if (index < pages.length - 1 && !provenance.cacheHit) {
+      await sleepFn(delayMs);
     }
   }
 

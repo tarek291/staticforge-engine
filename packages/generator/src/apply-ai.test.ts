@@ -152,7 +152,37 @@ test("applyAiContent leaves every deterministic field untouched", async () => {
     assert.equal(page.businessId, original.businessId);
     assert.equal(page.serviceId, original.serviceId);
     assert.equal(page.locationId, original.locationId);
-    assert.deepEqual(page.schemaOrg, original.schemaOrg);
+  }
+});
+
+test("applyAiContent realigns schemaOrg with the content it just wrote", async () => {
+  const before = baseline();
+  const after = await applyAiContent(before, input, stub().fn, noDelay);
+
+  for (const page of after) {
+    // Structured data that still described the template copy would tell a
+    // crawler one thing while the page showed a reader another — a documented
+    // negative signal, on a product whose whole purpose is to rank.
+    assert.equal(page.schemaOrg.name, page.h1);
+    assert.equal(page.schemaOrg.description, page.metaDescription);
+  }
+});
+
+test("applyAiContent moves only the schemaOrg fields that describe the page", async () => {
+  const before = baseline();
+  const after = await applyAiContent(before, input, stub().fn, noDelay);
+
+  for (const [index, page] of after.entries()) {
+    const original = before[index];
+    assert.ok(original !== undefined);
+
+    // These come from the business record rather than from any prose, so the
+    // model has no say in them and no reason to be consulted about them.
+    assert.equal(page.schemaOrg["@context"], original.schemaOrg["@context"]);
+    assert.equal(page.schemaOrg["@type"], original.schemaOrg["@type"]);
+    assert.deepEqual(page.schemaOrg.serviceType, original.schemaOrg.serviceType);
+    assert.deepEqual(page.schemaOrg.provider, original.schemaOrg.provider);
+    assert.deepEqual(page.schemaOrg.areaServed, original.schemaOrg.areaServed);
   }
 });
 
@@ -442,4 +472,88 @@ test("applyAiContent returns an empty result without calling the generator", asy
 
   assert.deepEqual(result, []);
   assert.equal(calls.length, 0);
+});
+
+/** A stub whose pages all come back from the cache. */
+function cachedStub(): GenerateContentFn {
+  return (request) => Promise.resolve(authored(fakeContent(request), true));
+}
+
+/** Records the pauses a run took instead of taking them. */
+function recordingSleep(): { fn: (ms: number) => Promise<void>; waits: number[] } {
+  const waits: number[] = [];
+  return {
+    fn: (ms: number) => {
+      waits.push(ms);
+      return Promise.resolve();
+    },
+    waits,
+  };
+}
+
+test("applyAiContent does not pace a page that came from the cache", async () => {
+  const before = baseline();
+  const sleeper = recordingSleep();
+
+  await applyAiContent(before, input, cachedStub(), {
+    delayMs: 3000,
+    sleepFn: sleeper.fn,
+  });
+
+  // The pacing exists to stay inside a provider's rate limit. A cache hit made
+  // no request, so there is nothing to pace: a fully cached re-run of five
+  // hundred pages used to spend twenty-five minutes asleep to make zero calls.
+  assert.deepEqual(sleeper.waits, []);
+});
+
+test("applyAiContent still paces pages it actually bought", async () => {
+  const before = baseline();
+  const sleeper = recordingSleep();
+
+  await applyAiContent(before, input, stub().fn, {
+    delayMs: 3000,
+    sleepFn: sleeper.fn,
+  });
+
+  // One pause between each pair of paid calls, and none after the last.
+  assert.equal(sleeper.waits.length, before.length - 1);
+  assert.ok(sleeper.waits.every((ms) => ms === 3000));
+});
+
+test("applyAiContent paces only the paid pages in a mixed run", async () => {
+  const before = baseline();
+  const sleeper = recordingSleep();
+
+  // Every other page is a hit, which is what a re-run after editing one
+  // service looks like.
+  let call = 0;
+  const mixed: GenerateContentFn = (request) => {
+    const hit = call % 2 === 0;
+    call += 1;
+    return Promise.resolve(authored(fakeContent(request), hit));
+  };
+
+  await applyAiContent(before, input, mixed, {
+    delayMs: 3000,
+    sleepFn: sleeper.fn,
+  });
+
+  const paidBeforeLast = before
+    .slice(0, -1)
+    .filter((_page, index) => index % 2 !== 0).length;
+
+  assert.equal(sleeper.waits.length, paidBeforeLast);
+});
+
+test("applyAiContent reports a cache hit through progress", async () => {
+  const before = baseline();
+  const seen: boolean[] = [];
+
+  await applyAiContent(before, input, cachedStub(), {
+    delayMs: 0,
+    onProgress: ({ cacheHit }) => seen.push(cacheHit),
+  });
+
+  assert.equal(seen.length, before.length);
+  assert.ok(seen.every((hit) => hit === true));
 });
