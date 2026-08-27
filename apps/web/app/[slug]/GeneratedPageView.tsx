@@ -97,6 +97,27 @@ export function GeneratedPageView({
           )}
         </div>
       </section>
+
+      {/* Related pages. Deliberately unlabelled: any heading would be text this
+          engine does not hold, and hardcoding one language here would break the
+          rule that only input data decides the output language. */}
+      {page.links.length > 0 && (
+        <nav className="flex flex-col gap-3 border-t border-neutral-200 pt-8 dark:border-neutral-800">
+          <ul className="flex flex-col gap-2">
+            {page.links.map((link) => (
+              <li key={link.slug}>
+                <a
+                  href={`/${link.slug}`}
+                  data-relation={link.relation}
+                  className="text-sm text-neutral-600 underline underline-offset-4 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100"
+                >
+                  {link.anchor}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </nav>
+      )}
     </main>
   );
 }

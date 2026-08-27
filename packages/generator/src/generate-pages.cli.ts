@@ -7,6 +7,7 @@ import {
 } from "@staticforge/schemas";
 import { FileContentCache, createAnthropicService } from "@staticforge/ai";
 import { validateInternalLinks, withInternalLinks } from "@staticforge/core";
+import { publishSeoArtifacts, resolveSite } from "./publish-seo.js";
 import { loadInputData, defaultInputPaths } from "./load-data.js";
 import { validateInputData } from "./validate-input.js";
 import { buildPages } from "./build-pages.js";
@@ -30,6 +31,8 @@ function resolveRepoRoot(): string {
 /** Command-line options. `projectId` selects the data source. */
 interface CliOptions {
   locale: Locale;
+  /** Absolute origin to publish at. Overrides SITE_URL and content.siteUrl. */
+  siteUrl: string | undefined;
   /** When set, input comes from the database instead of `data/input/`. */
   projectId: string | undefined;
 }
@@ -40,6 +43,7 @@ function parseOptions(): CliOptions {
     options: {
       locale: { type: "string" },
       "project-id": { type: "string" },
+      "site-url": { type: "string" },
     },
     allowPositionals: false,
   });
@@ -54,7 +58,11 @@ function parseOptions(): CliOptions {
     process.exit(1);
   }
 
-  return { locale: parsed.data, projectId: values["project-id"] };
+  return {
+    locale: parsed.data,
+    projectId: values["project-id"],
+    siteUrl: values["site-url"],
+  };
 }
 
 /**
@@ -111,7 +119,7 @@ async function persistToDatabase(
 }
 
 async function main(): Promise<void> {
-  const { locale, projectId } = parseOptions();
+  const { locale, projectId, siteUrl } = parseOptions();
   const repoRoot = resolveRepoRoot();
   const inputDir = join(repoRoot, "data", "input");
   const outputDir = join(repoRoot, "data", "output");
@@ -185,6 +193,25 @@ async function main(): Promise<void> {
   // them in both modes. In database mode the pages are additionally persisted.
   await savePages(pages, outputDir);
   console.log("✓ output saved");
+
+  const resolved = resolveSite({
+    flag: siteUrl,
+    env: process.env.SITE_URL,
+    contentSiteUrl: validated.content.siteUrl,
+  });
+
+  if (resolved === undefined) {
+    // A local build with no domain is ordinary, but silence would hide a
+    // missing sitemap on a real deploy, so say so plainly.
+    console.log(
+      "· no site URL (--site-url, SITE_URL or content.siteUrl) — skipping sitemap and robots.txt",
+    );
+  } else {
+    const artifacts = await publishSeoArtifacts(pages, resolved.site, outputDir);
+    console.log(
+      `✓ published ${artifacts.map((a) => a.fileName).join(", ")} for ${resolved.site.url} (from ${resolved.source})`,
+    );
+  }
 
   if (projectId !== undefined) {
     const { saved, removed } = await persistToDatabase(projectId, pages);

@@ -197,6 +197,38 @@ export function LuxuryLandingView({
             )}
           </div>
         </section>
+
+        {/* Related pages. Deliberately unlabelled — see GeneratedPageView. */}
+        {page.links.length > 0 && (
+          <nav
+            style={delay(0, 90, 240)}
+            className="mt-20 animate-fade-up motion-reduce:animate-none"
+          >
+            <span
+              aria-hidden="true"
+              className="block h-px w-full bg-gradient-to-r from-transparent via-white/10 to-transparent"
+            />
+            <ul className="mt-8 grid gap-x-8 gap-y-3 sm:grid-cols-2">
+              {page.links.map((link, index) => (
+                <li key={link.slug} className="flex items-baseline gap-4">
+                  <span
+                    aria-hidden="true"
+                    className="font-mono text-xs tracking-[0.3em] text-amber-200/40"
+                  >
+                    {ordinal(index)}
+                  </span>
+                  <a
+                    href={`/${link.slug}`}
+                    data-relation={link.relation}
+                    className="text-pretty text-sm leading-relaxed text-zinc-400 underline decoration-white/15 underline-offset-4 transition-colors hover:text-amber-100 hover:decoration-amber-200/40"
+                  >
+                    {link.anchor}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </nav>
+        )}
       </div>
     </main>
   );

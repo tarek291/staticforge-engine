@@ -6,6 +6,7 @@ import {
   type GeneratedPage,
   type Manifest,
 } from "@staticforge/schemas";
+import { SiteConfigSchema, type SiteConfig } from "@staticforge/core";
 
 /** Narrow an unknown error to a Node system error carrying a `code`. */
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
@@ -108,4 +109,71 @@ export async function getGeneratedPageBySlug(
     );
   }
   return parsed.data;
+}
+
+/**
+ * Read every generated page.
+ *
+ * Used where a decision needs the whole build rather than one page — locale
+ * alternates, for instance, exist only relative to their siblings.
+ */
+export async function getGeneratedPages(): Promise<GeneratedPage[]> {
+  const slugs = await getGeneratedPageSlugs();
+  const pages = await Promise.all(
+    slugs.map((slug) => getGeneratedPageBySlug(slug)),
+  );
+  return pages.filter((page): page is GeneratedPage => page !== null);
+}
+
+/**
+ * Read the site configuration the generator published with.
+ *
+ * Derived from `robots.txt`, which the generator writes only when a base URL
+ * was resolved — so its presence is exactly the signal "this build has a
+ * domain". Returns `null` otherwise, and callers then emit no canonical rather
+ * than inventing an origin.
+ */
+export async function getSiteConfig(): Promise<SiteConfig | null> {
+  try {
+    const robots = await readFile(
+      join(resolveOutputDir(), "robots.txt"),
+      "utf8",
+    );
+
+    const sitemap = /^Sitemap:\s*(\S+)$/m.exec(robots)?.[1];
+    if (sitemap === undefined) {
+      return null;
+    }
+
+    const parsed = SiteConfigSchema.safeParse({
+      url: new URL(sitemap).origin,
+    });
+
+    return parsed.success ? parsed.data : null;
+  } catch (error: unknown) {
+    if (isErrnoException(error) && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Read a published artifact verbatim.
+ *
+ * The generator is the single source of these files; the route handlers only
+ * hand them back, so the XML a crawler sees is byte-identical to the artifact
+ * on disk.
+ */
+export async function readPublishedArtifact(
+  fileName: string,
+): Promise<string | null> {
+  try {
+    return await readFile(join(resolveOutputDir(), fileName), "utf8");
+  } catch (error: unknown) {
+    if (isErrnoException(error) && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
 }

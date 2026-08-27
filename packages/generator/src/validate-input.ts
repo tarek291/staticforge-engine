@@ -41,6 +41,14 @@ const StaticContentTemplateSchema = z.object({
   // Optional override selecting which template renders the generated pages.
   // Absent → the generator falls back to "default". Empty string is rejected.
   templateId: z.string().min(1).optional(),
+  // Absolute origin, no path. Publishing artifacts are skipped when absent.
+  siteUrl: z
+    .string()
+    .regex(
+      /^https?:\/\/[^\s/]+$/,
+      "siteUrl must be an absolute origin with no path",
+    )
+    .optional(),
 });
 
 /** Build a readable, dotted/bracketed path like `businesses[0].contactEmail`. */

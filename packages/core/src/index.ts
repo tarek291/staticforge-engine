@@ -3,4 +3,5 @@ export * from "./seo.js";
 export * from "./phone.js";
 export * from "./hash.js";
 export * from "./link-graph.js";
+export * from "./seo-publishing.js";
 export * from "./sleep.js";

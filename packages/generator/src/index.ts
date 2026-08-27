@@ -6,3 +6,4 @@ export * from "./validate-input.js";
 export * from "./build-pages.js";
 export * from "./ai-content.js";
 export * from "./save-output.js";
+export * from "./publish-seo.js";

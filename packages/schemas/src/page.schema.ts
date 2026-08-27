@@ -127,6 +127,32 @@ export const SchemaOrgSchema = z.record(z.string(), z.unknown());
 export type SchemaOrg = z.infer<typeof SchemaOrgSchema>;
 
 /**
+ * Per-page search-engine policy.
+ *
+ * Only the parts a *person* decides live here. Canonical URLs, OpenGraph tags
+ * and alternates are all derivable from the page and the site's base URL, so
+ * storing them would be storing a computation — and a stale one the moment the
+ * domain changes.
+ *
+ * What is not derivable is intent: whether this particular page should be
+ * indexed at all. That is the operator's call, and it is what this block holds.
+ */
+export const PageSeoSchema = z.object({
+  /** May this page appear in results? */
+  index: z.boolean().default(true),
+  /** May its links be followed? */
+  follow: z.boolean().default(true),
+  /**
+   * Overrides the derived canonical URL.
+   *
+   * For a page that deliberately consolidates into another — a near-duplicate
+   * kept for a campaign, say. Absent means "the canonical is my own URL".
+   */
+  canonical: z.string().min(1).optional(),
+});
+export type PageSeo = z.infer<typeof PageSeoSchema>;
+
+/**
  * Why an internal link exists.
  *
  * A programmatic site is a grid of service × city. The two axes of that grid
@@ -200,5 +226,8 @@ export const GeneratedPageSchema = z.object({
   // optional, so consumers never have to distinguish "no links" from "not yet
   // computed" — a distinction that has no meaning once a page is written.
   links: z.array(InternalLinkSchema).default([]),
+  // Indexing policy. Optional and without a default, so every existing payload
+  // is unchanged; absent means the site-wide default applies.
+  seo: PageSeoSchema.optional(),
 });
 export type GeneratedPage = z.infer<typeof GeneratedPageSchema>;

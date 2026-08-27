@@ -16,7 +16,8 @@
   },
   "dependencies": {
     "@staticforge/schemas": "workspace:*",
-    "csv-parse": "^7.0.2"
+    "csv-parse": "^7.0.2",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
