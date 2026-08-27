@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { validateInternalLinks } from "@staticforge/core";
+import { verifyPagePolicy } from "@staticforge/generator";
 import {
   GeneratedPageSchema,
   LocaleSchema,
@@ -115,6 +116,20 @@ async function readPages(outputDir: string): Promise<GeneratedPage[]> {
  * It runs *before* the build for one reason: the build takes a minute and
  * produces a publishable site. Discovering a broken graph afterwards means
  * discovering it after publishing.
+ *
+ * ## Shape is not the same question as policy
+ *
+ * This stage used to check only that each file satisfied the page schema, which
+ * left a real gap: every rule that decides whether content is *publishable* —
+ * the quality profile, the verified record — runs in memory, in the process
+ * that authored the page. A page that reached disk without passing them still
+ * satisfies its schema, and there were three ways to reach disk that way: a
+ * cache hit skips those gates by design, a mock authoring run never touches
+ * them, and a file can simply be edited after it is written.
+ *
+ * So the policy is re-applied here, to the artifact rather than to the process.
+ * The point of a cold read is to trust nothing the run remembers, and "this
+ * content was acceptable" was exactly such a memory.
  */
 export const validateStage: PipelineStage = {
   name: "validate",
@@ -191,6 +206,24 @@ export const validateStage: PipelineStage = {
         linkIssues.map((issue) => `${issue.path}: ${issue.message}`),
       );
     }
+
+    // --- Content still satisfies the policy that governed it ---
+    const policyIssues = await verifyPagePolicy(pages, {
+      repoRoot: context.repoRoot,
+      projectId: context.projectId,
+    });
+
+    if (policyIssues.length > 0) {
+      throw new PipelineError(
+        "validate",
+        `${policyIssues.length} page(s) violate the content policy on disk.`,
+        policyIssues.map((issue) => `${issue.path}: ${issue.message}`),
+      );
+    }
+
+    context.notes.push(
+      `· ${pages.length} pages re-checked against their content profile and verified record`,
+    );
 
     // --- Publishing artifacts, when a site URL was configured ---
     const robots = await readIfPresent(join(context.outputDir, "robots.txt"));

@@ -1,7 +1,12 @@
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { combineHash } from "@staticforge/core";
-import type { GeneratedPageContent } from "./service.js";
+import { z } from "zod";
+
+import {
+  GeneratedPageContentSchema,
+  type GeneratedPageContent,
+} from "./content-schema.js";
 
 /**
  * Content cache.
@@ -22,6 +27,21 @@ import type { GeneratedPageContent } from "./service.js";
  * The inverse matters just as much: a run that changed none of them must hit.
  * A key that accidentally varies per run (a timestamp, an unordered object)
  * would look like a working cache while silently costing full price every time.
+ *
+ * ## The store is not a trusted input
+ *
+ * A hit returns without re-running the gates, on the reasoning that an entry
+ * was only stored because it passed them. That reasoning holds for entries this
+ * process wrote and for nothing else. The store is a directory: it is shared in
+ * CI, mounted into containers, and editable by anything with write access to
+ * the workspace. Content read back from it has not been through the schema, the
+ * profile or the grounding record in *this* run — so it is parsed on the way
+ * out, exactly as a provider response is parsed on the way in.
+ *
+ * That check is structural, which is what a cache can honestly promise: the
+ * profile depends on which profile is in force and grounding on facts the cache
+ * never saw, and both are already re-checked over the finished output before a
+ * build. What this stops is a cache entry widening the payload contract.
  */
 
 /** The seven things that decide whether cached content is still valid. */
@@ -55,11 +75,45 @@ export function buildCacheKey(parts: CacheKeyParts): string {
   ]);
 }
 
+/**
+ * The shape a stored entry must have to be usable.
+ *
+ * The key parts are validated too, not only the content: they are what an
+ * operator reads to audit why a page was reused, and an entry whose recorded
+ * identity is missing or malformed cannot answer that question.
+ */
+const CacheEntrySchema = z.object({
+  content: GeneratedPageContentSchema,
+  parts: z.object({
+    businessId: z.string().min(1),
+    serviceId: z.string().min(1),
+    locationId: z.string().min(1),
+    profileId: z.string().min(1),
+    promptVersion: z.string().min(1),
+    modelVersion: z.string().min(1),
+    sourceHash: z.string().min(1),
+  }),
+  storedAt: z.string().min(1),
+});
+
 /** A stored entry: the content plus enough context to audit a hit. */
 export interface CacheEntry {
   content: GeneratedPageContent;
   parts: CacheKeyParts;
   storedAt: string;
+}
+
+/**
+ * Parse an entry read back from storage.
+ *
+ * @returns The entry, or `undefined` when it does not satisfy the contract —
+ * which is deliberately the same answer as a miss. A malformed entry costs one
+ * regenerated page; trusting it costs a published page the gates never saw.
+ */
+export function parseCacheEntry(value: unknown): CacheEntry | undefined {
+  const parsed = CacheEntrySchema.safeParse(value);
+
+  return parsed.success ? (parsed.data as CacheEntry) : undefined;
 }
 
 /** Storage for authored content. */
@@ -115,15 +169,30 @@ export class FileContentCache implements ContentCache {
   }
 
   async get(key: string): Promise<CacheEntry | undefined> {
+    let raw: string;
+
     try {
-      const raw = await readFile(this.pathFor(key), "utf8");
-      return JSON.parse(raw) as CacheEntry;
+      raw = await readFile(this.pathFor(key), "utf8");
     } catch {
-      // A missing file is an ordinary miss. A corrupt one is treated the same:
-      // the worst outcome is paying to regenerate a page, and failing the whole
-      // run over unreadable *cache* would be a far worse trade.
+      // A missing file is an ordinary miss.
       return undefined;
     }
+
+    let value: unknown;
+
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      // A corrupt file is treated as a miss too: the worst outcome is paying to
+      // regenerate a page, and failing a whole run over unreadable *cache*
+      // would be a far worse trade.
+      return undefined;
+    }
+
+    // Parsed, not cast. This file is a boundary like any other — the previous
+    // `as CacheEntry` asserted a shape rather than checking one, so anything
+    // that could write here could hand a page straight past the gates.
+    return parseCacheEntry(value);
   }
 
   async set(key: string, entry: CacheEntry): Promise<void> {

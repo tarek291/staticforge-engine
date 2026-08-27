@@ -279,6 +279,14 @@ export interface SaveGeneratedPagesResult {
   saved: number;
   /** Stale pages deleted because this run no longer produces their slug. */
   removed: number;
+  /**
+   * Pages left exactly as they were because an operator had edited them.
+   *
+   * Reported rather than silent: an operator who edited ten pages and then
+   * pressed Generate needs to be told those ten were skipped, or they will
+   * assume the run overwrote them and go looking for the damage.
+   */
+  preserved: number;
 }
 
 /** Options for {@link saveGeneratedPages}. */
@@ -304,12 +312,28 @@ export interface SaveGeneratedPagesOptions {
  *    check outside leaves a window in which the project changes hands, and
  *    because a separate step is a step a caller can skip. A run that does not
  *    own the project writes nothing at all.
- * 2. **Delete stale pages** — rows whose slug this run no longer produces. This
+ * 2. **Find what an operator has edited** — every row this project holds with
+ *    `source: MANUAL`. Those slugs are excluded from both stages below.
+ * 3. **Delete stale pages** — rows whose slug this run no longer produces. This
  *    mirrors what `savePages` already does for files, and it is not optional:
  *    the table also carries a unique `(projectId, serviceId, locationId)`
  *    constraint, so a renamed service would otherwise leave an old row that the
  *    slug-keyed upsert cannot see and whose presence makes the insert fail.
- * 3. **Upsert each page**, keyed on `(projectId, slug)`.
+ * 4. **Upsert each page**, keyed on `(projectId, slug)`.
+ *
+ * ## Why manual edits survive a run
+ *
+ * A refresh records `source: MANUAL`, and this pass used to overwrite every row
+ * it produced a slug for, unconditionally — so an operator who spent several
+ * revision passes shaping a page lost all of it the next time anyone pressed
+ * Generate, with no warning and nothing to recover from. The two loops were
+ * never reconciled: one wrote deliberate human work, the other assumed it was
+ * the only writer.
+ *
+ * Deletion is skipped for the same rows, not only overwriting. Removing a
+ * hand-edited page because a service was renamed is the same loss by a
+ * different route, and the operator is better placed than this function to
+ * decide that the page should go.
  *
  * An empty `pages` array therefore clears the project's pages, matching the
  * file pipeline, where a run that produces nothing leaves nothing behind.
@@ -355,14 +379,33 @@ export async function saveGeneratedPages(
         throw new ProjectPayloadError(projectId, "not found.");
       }
 
+      // Rows an operator has edited by hand. Read inside the transaction, so a
+      // refresh landing mid-run is either fully visible here or not yet applied.
+      const edited = await tx.generatedPage.findMany({
+        where: { projectId, source: "MANUAL" },
+        select: { slug: true },
+      });
+      const protectedSlugs = new Set(edited.map((row) => row.slug));
+
       // Scoped through the relation as well as by id. The ownership check above
       // already settles it; expressing it again here means a future refactor that
       // drops the check still cannot delete another tenant's rows.
       const { count: removed } = await tx.generatedPage.deleteMany({
-        where: { projectId, project: { userId }, slug: { notIn: slugs } },
+        where: {
+          projectId,
+          project: { userId },
+          slug: { notIn: [...slugs, ...protectedSlugs] },
+        },
       });
 
+      let saved = 0;
+      let preserved = 0;
+
       for (const page of pages) {
+        if (protectedSlugs.has(page.slug)) {
+          preserved += 1;
+          continue;
+        }
         const fields = {
           locale: page.locale,
           title: page.title,
@@ -392,9 +435,11 @@ export async function saveGeneratedPages(
           create: { projectId, slug: page.slug, ...fields },
           update: fields,
         });
+
+        saved += 1;
       }
 
-      return { saved: pages.length, removed };
+      return { saved, removed, preserved };
     }),
   );
 }

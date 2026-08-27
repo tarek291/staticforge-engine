@@ -131,10 +131,20 @@ function parseAmount(match: string): number | undefined {
  * the Unicode letter and number classes — otherwise "Essen" would never be
  * found next to a German umlaut, and "Reinigung" would falsely match inside
  * "Büroreinigung".
+ *
+ * ## Why both sides are normalised
+ *
+ * "Düsseldorf" has two valid encodings: one code point for `ü`, or `u` followed
+ * by a combining diaeresis. They render identically and compare unequal. A
+ * model answering in the decomposed form while the verified record holds the
+ * composed one slipped past every name-based guard built on this function — the
+ * city the business does not serve, the service it does not sell — with the
+ * check reporting a clean page. Normalising both sides to NFC first makes the
+ * comparison about the text rather than about which encoding produced it.
  */
 export function containsTerm(text: string, term: string): boolean {
-  const haystack = text.toLowerCase();
-  const needle = term.toLowerCase().trim();
+  const haystack = text.normalize("NFC").toLowerCase();
+  const needle = term.normalize("NFC").toLowerCase().trim();
 
   if (needle.length === 0) {
     return false;
@@ -211,21 +221,48 @@ export function collectText(content: {
   );
 
   if (content.content.cta.secondary !== undefined) {
-    parts.push({
-      path: "content.cta.secondary.href",
-      text: content.content.cta.secondary.href,
-    });
+    parts.push(
+      // The label is rendered text on a clickable control, which makes it one
+      // of the likeliest places on the page to carry a phone number — so it is
+      // scanned like every other visible string, not skipped because it is
+      // short.
+      {
+        path: "content.cta.secondary.buttonLabel",
+        text: content.content.cta.secondary.buttonLabel,
+      },
+      {
+        path: "content.cta.secondary.href",
+        text: content.content.cta.secondary.href,
+      },
+    );
   }
 
   return parts;
 }
 
-/** Whether the operator has pre-approved a claim containing this fragment. */
+/**
+ * Whether the operator has pre-approved a claim containing this fragment.
+ *
+ * Matched on word boundaries rather than as a bare substring. A plain
+ * `includes` makes every approved claim silently approve its own fragments:
+ * approving "95 % Kundenzufriedenheit" also approves a fabricated "5 %",
+ * because the second string sits inside the first. The same holds for money —
+ * approving "150 €" would approve "50 €" — and for years inside longer digit
+ * runs. An exemption should cover what the operator wrote, not everything
+ * spellable from its characters.
+ *
+ * {@link containsTerm} supplies the boundaries, and with them the same NFC
+ * normalisation the other guards get, so a claim and a page written in
+ * different Unicode forms still match.
+ */
 function isWhitelisted(fragment: string, facts: GroundingFacts): boolean {
-  const needle = fragment.toLowerCase().trim();
-  return facts.allowedClaims.some((claim) =>
-    claim.toLowerCase().includes(needle),
-  );
+  const needle = fragment.trim();
+
+  if (needle.length === 0) {
+    return false;
+  }
+
+  return facts.allowedClaims.some((claim) => containsTerm(claim, needle));
 }
 
 // ---------------------------------------------------------------------------

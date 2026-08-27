@@ -1,15 +1,17 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import {
   DEFAULT_CONTENT_PROFILE,
-  GeneratedPageSchema,
   collectContentIssues,
   type ContentIssue,
   type ContentProfile,
   type GeneratedPage,
 } from "@staticforge/schemas";
-import type { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
+import {
+  GeneratedPageContentSchema,
+  type GeneratedPageContent,
+} from "./content-schema.js";
 import {
   AIContentRejectedError,
   AIRequestError,
@@ -61,23 +63,14 @@ import { RetryExhaustedError, withRetry, type RetryOptions } from "./retry.js";
 /**
  * The authored slice of a generated page.
  *
- * Derived from `GeneratedPageSchema` with `.pick()` — the same derivation
- * pattern `ManifestEntrySchema` uses — so the two stay aligned automatically.
- *
- * The omitted fields are deliberately not the model's to decide: `slug` is
- * derived from service + city by the generator (and guarded against
- * collisions), `businessId` / `serviceId` / `locationId` are input-data
- * identifiers the model never sees, `locale` comes from the input, and
- * `templateId` is resolved by the service → content → "default" precedence.
- * Asking the model for them would only invite plausible-looking fabrications.
+ * Re-exported rather than defined here: the cache has to parse against the
+ * same schema, and defining it in this module would make the two import each
+ * other. See `content-schema.ts`.
  */
-export const GeneratedPageContentSchema = GeneratedPageSchema.pick({
-  title: true,
-  metaDescription: true,
-  h1: true,
-  content: true,
-});
-export type GeneratedPageContent = z.infer<typeof GeneratedPageContentSchema>;
+export {
+  GeneratedPageContentSchema,
+  type GeneratedPageContent,
+} from "./content-schema.js";
 
 /** Model used for content generation. */
 export const DEFAULT_MODEL = "claude-opus-5";
@@ -546,26 +539,20 @@ export class AIGenerationService {
     return collectContentIssues(probe, this.profile);
   }
 
-  /**
-   * The user turn, with the verified record appended when one exists.
-   *
-   * Grounding is two halves of one mechanism: the record is put in front of the
-   * model so it has no reason to invent, and the same record then judges the
-   * answer. Sending the facts without checking them would be a hope; checking
-   * without sending them would be a trap.
-   */
-  private buildRequestText(request: GenerationRequest): string {
-    const userPrompt = buildUserPrompt(request);
-
-    return request.facts === undefined
-      ? userPrompt
-      : `${userPrompt}\n\n${renderGroundingFacts(request.facts)}`;
-  }
-
   /** Gate 1, with the transport retry policy wrapped around it. */
   private async callProvider(
     request: GenerationRequest,
-    buildText: () => string = () => this.buildRequestText(request),
+    /**
+     * Builds the user turn *without* the verified record.
+     *
+     * `withFacts` attaches the record below, once, on every path. It used to be
+     * attached here as well as inside the fresh-authoring builder, so every
+     * grounded call shipped the record twice — paid for twice, and put in front
+     * of the model as though the repetition carried meaning. Keeping the two
+     * responsibilities apart is what stops the two callers disagreeing about
+     * whether it has already been added.
+     */
+    buildText: () => string = () => buildUserPrompt(request),
   ): Promise<Anthropic.Message> {
     try {
       return await withRetry(

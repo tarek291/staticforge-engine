@@ -130,7 +130,7 @@ async function loadFromDatabase(
 async function persistToDatabase(
   projectId: string,
   pages: GeneratedPage[],
-): Promise<{ saved: number; removed: number }> {
+): Promise<{ saved: number; removed: number; preserved: number }> {
   const { saveGeneratedPages, prisma, resolveOperatorId } = await import(
     "@staticforge/database"
   );
@@ -264,11 +264,23 @@ async function main(): Promise<void> {
   }
 
   if (projectId !== undefined) {
-    const { saved, removed } = await persistToDatabase(projectId, pages);
+    const { saved, removed, preserved } = await persistToDatabase(projectId, pages);
     console.log(
       `✓ database updated (${saved} saved` +
-        (removed > 0 ? `, ${removed} stale removed)` : ")"),
+        (removed > 0 ? `, ${removed} stale removed` : "") +
+        (preserved > 0 ? `, ${preserved} kept` : "") +
+        ")",
     );
+
+    if (preserved > 0) {
+      // Said plainly rather than tucked into the count: an operator who edited
+      // these pages and then pressed Generate would otherwise assume the run
+      // overwrote them and go looking for damage that never happened.
+      console.log(
+        `  · ${preserved} page(s) carry manual edits and were left untouched. ` +
+          `Delete the page to let a run rewrite it.`,
+      );
+    }
   }
 
   console.log(`\nGenerated ${pages.length} pages (locale: ${locale})`);

@@ -471,9 +471,18 @@ function save(
  * which the project changes hands. Handing the callback the same mock keeps
  * every assertion below pointed at the calls it really makes.
  */
-function armTransaction(removed = 0, owned = true): void {
+function armTransaction(
+  removed = 0,
+  owned = true,
+  /** Slugs an operator has edited by hand, which the run must not overwrite. */
+  manualSlugs: string[] = [],
+): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   prisma.project.findFirst.mockResolvedValue((owned ? { id: "prj_1" } : null) as any);
+  prisma.generatedPage.findMany.mockResolvedValue(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    manualSlugs.map((slug) => ({ slug })) as any,
+  );
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   prisma.generatedPage.deleteMany.mockResolvedValue({ count: removed } as any);
   prisma.$transaction.mockImplementation(((
@@ -644,7 +653,7 @@ describe("saveGeneratedPages", () => {
       enginePage({ slug: "grundreinigung-essen" }),
     ]);
 
-    expect(result).toEqual({ saved: 2, removed: 4 });
+    expect(result).toEqual({ saved: 2, removed: 4, preserved: 0 });
   });
 
   test("an empty run clears the project's pages, as file mode does", async () => {
@@ -660,12 +669,80 @@ describe("saveGeneratedPages", () => {
       },
     });
     expect(prisma.generatedPage.upsert).not.toHaveBeenCalled();
-    expect(result).toEqual({ saved: 0, removed: 9 });
+    expect(result).toEqual({ saved: 0, removed: 9, preserved: 0 });
   });
 
   test("never opens a connection", async () => {
     await save([enginePage()]);
 
     expect(prisma.$connect).not.toHaveBeenCalled();
+  });
+});
+
+describe("manual edits survive a generation run", () => {
+  beforeEach(() => {
+    armTransaction();
+  });
+
+  test("a page an operator edited is not overwritten", async () => {
+    armTransaction(0, true, ["bueroreinigung-duisburg"]);
+
+    const result = await save([
+      enginePage(),
+      enginePage({ slug: "grundreinigung-essen" }),
+    ]);
+
+    // A refresh records source: MANUAL. This pass used to overwrite every slug
+    // it produced, so several revision passes of human work vanished the next
+    // time anyone pressed Generate, with no warning.
+    const written = prisma.generatedPage.upsert.mock.calls.map(
+      (call) => call[0]?.where?.projectId_slug?.slug,
+    );
+
+    expect(written).toEqual(["grundreinigung-essen"]);
+    expect(result).toEqual({ saved: 1, removed: 0, preserved: 1 });
+  });
+
+  test("an edited page is not deleted as stale either", async () => {
+    // Removing hand-edited work because a service was renamed is the same loss
+    // by a different route.
+    armTransaction(0, true, ["hand-written-page"]);
+
+    await save([enginePage()]);
+
+    expect(prisma.generatedPage.deleteMany).toHaveBeenCalledWith({
+      where: {
+        projectId: "prj_1",
+        project: { userId: "local-operator" },
+        slug: { notIn: ["bueroreinigung-duisburg", "hand-written-page"] },
+      },
+    });
+  });
+
+  test("looks for edits inside the transaction, before deciding anything", async () => {
+    armTransaction(0, true, []);
+
+    await save([enginePage()]);
+
+    // Read inside the transaction, so a refresh landing mid-run is either fully
+    // visible here or not yet applied.
+    expect(prisma.generatedPage.findMany).toHaveBeenCalledWith({
+      where: { projectId: "prj_1", source: "MANUAL" },
+      select: { slug: true },
+    });
+
+    const lookupOrder = prisma.generatedPage.findMany.mock.invocationCallOrder[0] ?? 0;
+    const deleteOrder = prisma.generatedPage.deleteMany.mock.invocationCallOrder[0] ?? 0;
+
+    expect(lookupOrder).toBeLessThan(deleteOrder);
+  });
+
+  test("a run with no manual pages behaves exactly as before", async () => {
+    armTransaction(2, true, []);
+
+    const result = await save([enginePage()]);
+
+    expect(prisma.generatedPage.upsert).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ saved: 1, removed: 2, preserved: 0 });
   });
 });
