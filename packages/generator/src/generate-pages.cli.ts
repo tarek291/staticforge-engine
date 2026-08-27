@@ -6,6 +6,7 @@ import {
   type Locale,
 } from "@staticforge/schemas";
 import { FileContentCache, createAnthropicService } from "@staticforge/ai";
+import { validateInternalLinks, withInternalLinks } from "@staticforge/core";
 import { loadInputData, defaultInputPaths } from "./load-data.js";
 import { validateInputData } from "./validate-input.js";
 import { buildPages } from "./build-pages.js";
@@ -163,6 +164,22 @@ async function main(): Promise<void> {
       `✓ AI content applied (${pages.length - hits} generated, ${hits} from cache)`,
     );
   }
+
+  // Internal links are computed last, over the final set of pages, because a
+  // link may only target a page that exists in this build — and AI authoring
+  // rewrites the very titles the anchors are drawn from.
+  pages = withInternalLinks(pages);
+
+  const linkIssues = validateInternalLinks(pages);
+  if (linkIssues.length > 0) {
+    throw new ValidationError(
+      "links",
+      linkIssues.map((issue) => ({ path: issue.path, message: issue.message })),
+    );
+  }
+
+  const linkCount = pages.reduce((total, page) => total + page.links.length, 0);
+  console.log(`✓ internal links (${linkCount} across ${pages.length} pages)`);
 
   // Dual-write: the static files are always produced, because Next builds from
   // them in both modes. In database mode the pages are additionally persisted.

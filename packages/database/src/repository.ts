@@ -313,6 +313,9 @@ export async function saveGeneratedPages(
         page.generation === undefined
           ? Prisma.DbNull
           : (page.generation as unknown as Prisma.InputJsonObject),
+      // Links travel with the page for the same reason provenance does: cloud
+      // mode would otherwise hold a page whose internal graph had vanished.
+      links: page.links as unknown as Prisma.InputJsonArray,
       serviceId: page.serviceId,
       locationId: page.locationId,
     };

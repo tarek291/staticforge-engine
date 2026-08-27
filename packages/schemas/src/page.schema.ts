@@ -127,6 +127,31 @@ export const SchemaOrgSchema = z.record(z.string(), z.unknown());
 export type SchemaOrg = z.infer<typeof SchemaOrgSchema>;
 
 /**
+ * Why an internal link exists.
+ *
+ * A programmatic site is a grid of service × city. The two axes of that grid
+ * are the only relations that are inherently justified: a reader on one page
+ * either wants a different service in the same place, or the same service
+ * somewhere else. A link that is neither is decoration.
+ */
+export const LinkRelationSchema = z.enum(["sameCity", "sameService"]);
+export type LinkRelation = z.infer<typeof LinkRelationSchema>;
+
+/**
+ * A link from one generated page to another.
+ *
+ * Carries the target's `slug`, not a URL: routing is the web layer's business,
+ * and baking a path in here would freeze the engine to one route shape.
+ */
+export const InternalLinkSchema = z.object({
+  slug: PageSlugSchema,
+  /** Visible text. Derived from the target page, so it needs no translation. */
+  anchor: z.string().min(1),
+  relation: LinkRelationSchema,
+});
+export type InternalLink = z.infer<typeof InternalLinkSchema>;
+
+/**
  * Provenance of an authored page.
  *
  * Records *what produced this content*, so a later run can tell whether it is
@@ -171,5 +196,9 @@ export const GeneratedPageSchema = z.object({
   // Present only on AI-authored pages. Optional and without a default, so
   // template output and every existing payload are unchanged.
   generation: PageGenerationSchema.optional(),
+  // Contextual links to sibling pages. Defaults to empty rather than being
+  // optional, so consumers never have to distinguish "no links" from "not yet
+  // computed" — a distinction that has no meaning once a page is written.
+  links: z.array(InternalLinkSchema).default([]),
 });
 export type GeneratedPage = z.infer<typeof GeneratedPageSchema>;

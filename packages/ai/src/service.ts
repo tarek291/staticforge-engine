@@ -89,7 +89,10 @@ export const TOOL_NAME = "emit_page_content";
  * chosen to satisfy every rule that is not about authored content, so any issue
  * that surfaces is genuinely the model's.
  */
-const ENGINE_OWNED_PLACEHOLDERS = {
+const ENGINE_OWNED_PLACEHOLDERS: Omit<
+  GeneratedPage,
+  "title" | "metaDescription" | "h1" | "content"
+> = {
   slug: "content-probe",
   locale: "de",
   schemaOrg: { "@type": "Service" },
@@ -97,7 +100,10 @@ const ENGINE_OWNED_PLACEHOLDERS = {
   businessId: "00000000-0000-4000-8000-000000000000",
   serviceId: "content-probe-service",
   locationId: "content-probe-location",
-} as const;
+  // Internal links are computed after authoring, over the whole build, so the
+  // model is never asked for them and the probe carries none.
+  links: [],
+};
 
 /**
  * The Zod contract, expressed as JSON Schema for the Anthropic tool.

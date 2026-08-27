@@ -201,6 +201,9 @@ function assemblePage(
     businessId: business.id,
     serviceId: service.id,
     locationId: location.id,
+    // Assembly is per-combination and cannot see the rest of the build, so it
+    // emits no links. The graph pass fills these in once every page exists.
+    links: [],
   };
 }
 
