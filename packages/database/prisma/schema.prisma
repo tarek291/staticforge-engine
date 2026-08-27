@@ -132,12 +132,26 @@ model GenerationJob {
   targetSlug String?
   feedback   String?
 
+  /// Which server instance claimed this job, and until when that claim holds.
+  ///
+  /// A job row outlives the process updating it, so "RUNNING" alone cannot mean
+  /// "alive" the moment more than one instance exists — a booting instance that
+  /// failed every RUNNING row would kill work another instance is doing right
+  /// now. The lease is the liveness signal instead: the owner renews it while it
+  /// works, and only an *expired* lease (or this instance's own leftovers, which
+  /// cannot have survived its restart) may be reclaimed.
+  lockedBy       String?
+  leaseExpiresAt DateTime?
+
   createdAt   DateTime  @default(now())
   startedAt   DateTime?
   completedAt DateTime?
 
   @@index([projectId, createdAt])
   @@index([userId, createdAt])
+  /// Orphan recovery scans by status and lease, on every instance boot. Without
+  /// this it is a full scan of every tenant's job history.
+  @@index([status, leaseExpiresAt])
 }
 
 /// Business verticals. Values match `NicheSchema` exactly, so the mapping into

@@ -98,19 +98,37 @@ function optional<T>(value: T | null): T | undefined {
  * identity or content template a page needs — a half-configured project would
  * otherwise surface much later as a confusing validation error.
  *
+ * ## Why `userId` is not optional
+ *
+ * This is the engine's read path, and it returns everything a tenant has: the
+ * trading identity, contact details, address, every service with its pricing,
+ * every location. Scoping it at the call site would mean the isolation lived in
+ * whichever caller remembered — a CLI flag, an API route, a future worker — and
+ * one that forgot would leak a whole tenant rather than fail.
+ *
+ * So the scope is folded into the query and the parameter is required. A
+ * project owned by someone else raises the *same* error as one that does not
+ * exist, deliberately: the two must stay indistinguishable, or this becomes a
+ * way to discover which ids are real.
+ *
  * @param projectId - The project to load.
+ * @param userId - The owner the caller is acting as.
  * @param prisma - The client to query with. Injected so the mapping can be
  * tested against a mock with no database.
  * @returns The project's data in the engine's input shape.
- * @throws {ProjectPayloadError} If the project, its business, or its content
- * template does not exist.
+ * @throws {ProjectPayloadError} If the project does not exist, is not owned by
+ * `userId`, or lacks its business or content template.
  */
 export async function getProjectPayload(
   projectId: string,
+  userId: string,
   prisma: PrismaClient,
 ): Promise<ProjectPayload> {
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
+  // `findFirst`, not `findUnique`: the scope is part of the lookup rather than
+  // a check applied to its result, so "not yours" cannot be reached by an early
+  // return that forgot to run.
+  const project = await prisma.project.findFirst({
+    where: { id: projectId, userId },
     include: {
       workspace: true,
       business: true,
@@ -271,14 +289,19 @@ export interface SaveGeneratedPagesOptions {
  * Everything happens inside a single `$transaction`, so a failure part-way
  * leaves the project's pages exactly as they were rather than half-updated.
  *
- * The transaction runs in two stages, and the order matters:
+ * The transaction runs in three stages, and the order matters:
  *
- * 1. **Delete stale pages** — rows whose slug this run no longer produces. This
+ * 1. **Prove ownership** — a scoped read of the project. It is the *first
+ *    statement inside the transaction* rather than a check before it, because a
+ *    check outside leaves a window in which the project changes hands, and
+ *    because a separate step is a step a caller can skip. A run that does not
+ *    own the project writes nothing at all.
+ * 2. **Delete stale pages** — rows whose slug this run no longer produces. This
  *    mirrors what `savePages` already does for files, and it is not optional:
  *    the table also carries a unique `(projectId, serviceId, locationId)`
  *    constraint, so a renamed service would otherwise leave an old row that the
  *    slug-keyed upsert cannot see and whose presence makes the insert fail.
- * 2. **Upsert each page**, keyed on `(projectId, slug)`.
+ * 3. **Upsert each page**, keyed on `(projectId, slug)`.
  *
  * An empty `pages` array therefore clears the project's pages, matching the
  * file pipeline, where a run that produces nothing leaves nothing behind.
@@ -288,14 +311,19 @@ export interface SaveGeneratedPagesOptions {
  * exactly one business, so the page's identity follows from the project.
  *
  * @param projectId - The project these pages belong to.
+ * @param userId - The owner the caller is acting as.
  * @param pages - Validated pages from the generator.
  * @param prisma - The client to write with. Injected so the write path can be
  * tested against a mock with no database.
  * @param options - Provenance of the content.
  * @returns How many pages were written and how many stale rows were removed.
+ * @throws {ProjectPayloadError} If the project does not exist or is not owned
+ * by `userId` — the same message either way, so a write cannot be used to probe
+ * which ids are real.
  */
 export async function saveGeneratedPages(
   projectId: string,
+  userId: string,
   pages: EnginePage[],
   prisma: PrismaClient,
   options: SaveGeneratedPagesOptions = {},
@@ -303,45 +331,55 @@ export async function saveGeneratedPages(
   const source: PageSource = options.source ?? "TEMPLATE";
   const slugs = pages.map((page) => page.slug);
 
-  const removeStale = prisma.generatedPage.deleteMany({
-    where: { projectId, slug: { notIn: slugs } },
-  });
-
-  const writes = pages.map((page) => {
-    const fields = {
-      locale: page.locale,
-      title: page.title,
-      metaDescription: page.metaDescription,
-      h1: page.h1,
-      content: page.content as unknown as Prisma.InputJsonObject,
-      schemaOrg: page.schemaOrg as Prisma.InputJsonObject,
-      templateId: page.templateId,
-      contentProfileId: page.contentProfileId,
-      source,
-      // Provenance travels with the page or it is lost: cloud mode would
-      // otherwise silently drop the prompt, model and source fingerprint that
-      // the file output records.
-      generation:
-        page.generation === undefined
-          ? Prisma.DbNull
-          : (page.generation as unknown as Prisma.InputJsonObject),
-      // Links travel with the page for the same reason provenance does: cloud
-      // mode would otherwise hold a page whose internal graph had vanished.
-      links: page.links as unknown as Prisma.InputJsonArray,
-      serviceId: page.serviceId,
-      locationId: page.locationId,
-    };
-
-    return prisma.generatedPage.upsert({
-      where: { projectId_slug: { projectId, slug: page.slug } },
-      create: { projectId, slug: page.slug, ...fields },
-      update: fields,
+  return prisma.$transaction(async (tx) => {
+    const owned = await tx.project.findFirst({
+      where: { id: projectId, userId },
+      select: { id: true },
     });
+
+    if (owned === null) {
+      throw new ProjectPayloadError(projectId, "not found.");
+    }
+
+    // Scoped through the relation as well as by id. The ownership check above
+    // already settles it; expressing it again here means a future refactor that
+    // drops the check still cannot delete another tenant's rows.
+    const { count: removed } = await tx.generatedPage.deleteMany({
+      where: { projectId, project: { userId }, slug: { notIn: slugs } },
+    });
+
+    for (const page of pages) {
+      const fields = {
+        locale: page.locale,
+        title: page.title,
+        metaDescription: page.metaDescription,
+        h1: page.h1,
+        content: page.content as unknown as Prisma.InputJsonObject,
+        schemaOrg: page.schemaOrg as Prisma.InputJsonObject,
+        templateId: page.templateId,
+        contentProfileId: page.contentProfileId,
+        source,
+        // Provenance travels with the page or it is lost: cloud mode would
+        // otherwise silently drop the prompt, model and source fingerprint that
+        // the file output records.
+        generation:
+          page.generation === undefined
+            ? Prisma.DbNull
+            : (page.generation as unknown as Prisma.InputJsonObject),
+        // Links travel with the page for the same reason provenance does: cloud
+        // mode would otherwise hold a page whose internal graph had vanished.
+        links: page.links as unknown as Prisma.InputJsonArray,
+        serviceId: page.serviceId,
+        locationId: page.locationId,
+      };
+
+      await tx.generatedPage.upsert({
+        where: { projectId_slug: { projectId, slug: page.slug } },
+        create: { projectId, slug: page.slug, ...fields },
+        update: fields,
+      });
+    }
+
+    return { saved: pages.length, removed };
   });
-
-  const results = await prisma.$transaction([removeStale, ...writes]);
-
-  const deleted = results[0] as { count: number } | undefined;
-
-  return { saved: pages.length, removed: deleted?.count ?? 0 };
 }

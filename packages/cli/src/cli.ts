@@ -1,6 +1,8 @@
 import { parseArgs } from "node:util";
 import { join, resolve } from "node:path";
 
+import { resolveOutputDir } from "@staticforge/core";
+
 import { formatResult, runPipeline, type PipelineContext } from "./pipeline.js";
 import { DEPLOY_STAGES } from "./stages.js";
 
@@ -59,13 +61,18 @@ async function main(): Promise<void> {
   }
 
   const repoRoot = resolveRepoRoot();
+  const projectId = values["project-id"];
 
   const context: PipelineContext = {
     repoRoot,
-    outputDir: join(repoRoot, "data", "output"),
+    // Isolated per project, and every stage below reads it from here: the
+    // validate stage re-reads this directory cold, and the build stage hands it
+    // to Next as STATICFORGE_OUTPUT_DIR. One value, so the three stages cannot
+    // disagree about which tenant's site is being published.
+    outputDir: resolveOutputDir(repoRoot, projectId),
     webDir: join(repoRoot, "apps", "web"),
     locale: values.locale ?? "de",
-    projectId: values["project-id"],
+    projectId,
     siteUrl: values["site-url"],
     notes: [],
     log: (message: string) => {

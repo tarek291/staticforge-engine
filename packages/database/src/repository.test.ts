@@ -120,20 +120,22 @@ function locationRow(overrides: Record<string, unknown> = {}) {
 }
 
 /** Point the mocked client at a row (or `null`) and return the payload. */
-function resolveWith(row: unknown) {
+function resolveWith(row: unknown, userId = "local-operator") {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  prisma.project.findUnique.mockResolvedValue(row as any);
-  return getProjectPayload("prj_1", prisma);
+  prisma.project.findFirst.mockResolvedValue(row as any);
+  return getProjectPayload("prj_1", userId, prisma);
 }
 
 describe("query shape", () => {
   test("fetches the project with workspace, business, content, services and locations", async () => {
     await resolveWith(projectRow());
 
-    expect(prisma.project.findUnique).toHaveBeenCalledTimes(1);
+    expect(prisma.project.findFirst).toHaveBeenCalledTimes(1);
 
-    const arg = prisma.project.findUnique.mock.calls[0]?.[0];
-    expect(arg?.where).toEqual({ id: "prj_1" });
+    const arg = prisma.project.findFirst.mock.calls[0]?.[0];
+    // Scoped in the query, not checked after it: the owner is part of finding
+    // the project at all.
+    expect(arg?.where).toEqual({ id: "prj_1", userId: "local-operator" });
     expect(arg?.include).toMatchObject({
       workspace: true,
       business: true,
@@ -143,6 +145,23 @@ describe("query shape", () => {
     // between runs rather than left to the database.
     expect(arg?.include?.services).toEqual({ orderBy: { createdAt: "asc" } });
     expect(arg?.include?.locations).toEqual({ orderBy: { createdAt: "asc" } });
+  });
+
+  test("carries the caller's own id into the where clause", async () => {
+    await resolveWith(projectRow(), "user_other");
+
+    expect(prisma.project.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "prj_1",
+      userId: "user_other",
+    });
+  });
+
+  test("a foreign project is indistinguishable from a missing one", async () => {
+    // The scoped query returns null in both cases, and the message must not
+    // separate them, or this becomes a way to discover which ids are real.
+    await expect(resolveWith(null, "user_other")).rejects.toThrow(
+      "Project \"prj_1\": not found.",
+    );
   });
 
   test("never opens a connection", async () => {
@@ -432,23 +451,34 @@ function enginePage(overrides: Record<string, unknown> = {}) {
 /** Call the write path with loosely typed fixtures. */
 function save(
   pages: ReturnType<typeof enginePage>[],
-  options?: Parameters<typeof saveGeneratedPages>[3],
+  options?: Parameters<typeof saveGeneratedPages>[4],
+  userId = "local-operator",
 ) {
   return saveGeneratedPages(
     "prj_1",
-    pages as unknown as Parameters<typeof saveGeneratedPages>[1],
+    userId,
+    pages as unknown as Parameters<typeof saveGeneratedPages>[2],
     prisma,
     options,
   );
 }
 
-/** Arm `$transaction` to resolve, mimicking deleteMany-then-upserts. */
-function armTransaction(removed = 0): void {
-  prisma.$transaction.mockImplementation(((operations: unknown[]) =>
-    Promise.resolve([
-      { count: removed },
-      ...operations.slice(1),
-    ])) as unknown as typeof prisma.$transaction);
+/**
+ * Arm the interactive `$transaction` so its callback runs against the mock.
+ *
+ * The write path is a callback rather than an array because the ownership check
+ * has to be *inside* the transaction: a check before it leaves a window in
+ * which the project changes hands. Handing the callback the same mock keeps
+ * every assertion below pointed at the calls it really makes.
+ */
+function armTransaction(removed = 0, owned = true): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  prisma.project.findFirst.mockResolvedValue((owned ? { id: "prj_1" } : null) as any);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  prisma.generatedPage.deleteMany.mockResolvedValue({ count: removed } as any);
+  prisma.$transaction.mockImplementation(((
+    run: (tx: typeof prisma) => Promise<unknown>,
+  ) => run(prisma)) as unknown as typeof prisma.$transaction);
 }
 
 /** The `create` payload of the nth upsert call. */
@@ -463,15 +493,43 @@ describe("saveGeneratedPages", () => {
   });
 
   test("runs every write inside a single transaction", async () => {
-    await save([enginePage()]);
+    await save([enginePage(), enginePage({ slug: "grundreinigung-essen" })]);
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
 
-    // `$transaction` is overloaded (array form and interactive callback form),
-    // so the recorded argument needs widening before it reads as the batch.
-    const batch = prisma.$transaction.mock.calls[0]?.[0] as unknown as unknown[];
-    // One deleteMany for stale rows, then one upsert per page.
-    expect(batch).toHaveLength(2);
+    // The interactive form: one callback carrying the ownership check, the
+    // stale deletion and every upsert, so a failure part-way rolls all of it
+    // back rather than leaving the project half-updated.
+    expect(typeof prisma.$transaction.mock.calls[0]?.[0]).toBe("function");
+    expect(prisma.generatedPage.upsert).toHaveBeenCalledTimes(2);
+  });
+
+  test("proves ownership inside the transaction, before any write", async () => {
+    await save([enginePage()]);
+
+    const ownershipOrder =
+      prisma.project.findFirst.mock.invocationCallOrder[0] ?? 0;
+    const deleteOrder =
+      prisma.generatedPage.deleteMany.mock.invocationCallOrder[0] ?? 0;
+
+    expect(prisma.project.findFirst).toHaveBeenCalledWith({
+      where: { id: "prj_1", userId: "local-operator" },
+      select: { id: true },
+    });
+    expect(ownershipOrder).toBeLessThan(deleteOrder);
+  });
+
+  test("writes nothing at all into a project the caller does not own", async () => {
+    armTransaction(0, false);
+
+    await expect(save([enginePage()], undefined, "user_other")).rejects.toThrow(
+      "Project \"prj_1\": not found.",
+    );
+
+    // Not "deletes but does not write", and not "writes then rolls back":
+    // neither statement is ever reached.
+    expect(prisma.generatedPage.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.generatedPage.upsert).not.toHaveBeenCalled();
   });
 
   test("deletes stale pages before writing, not after", async () => {
@@ -493,6 +551,9 @@ describe("saveGeneratedPages", () => {
     expect(prisma.generatedPage.deleteMany).toHaveBeenCalledWith({
       where: {
         projectId: "prj_1",
+        // Scoped through the relation as well as by id, so a refactor that
+        // drops the ownership check still cannot reach another tenant's rows.
+        project: { userId: "local-operator" },
         slug: { notIn: ["bueroreinigung-duisburg", "grundreinigung-essen"] },
       },
     });
@@ -592,7 +653,11 @@ describe("saveGeneratedPages", () => {
     const result = await save([]);
 
     expect(prisma.generatedPage.deleteMany).toHaveBeenCalledWith({
-      where: { projectId: "prj_1", slug: { notIn: [] } },
+      where: {
+        projectId: "prj_1",
+        project: { userId: "local-operator" },
+        slug: { notIn: [] },
+      },
     });
     expect(prisma.generatedPage.upsert).not.toHaveBeenCalled();
     expect(result).toEqual({ saved: 0, removed: 9 });

@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { createMockService } from "@staticforge/ai";
 import {
   buildSitemapArtifacts,
+  resolveOutputDir,
   validateInternalLinks,
   withInternalLinks,
 } from "@staticforge/core";
@@ -109,8 +110,9 @@ async function main(): Promise<void> {
 
   const locale: Locale = LocaleSchema.parse(values.locale);
   const repoRoot = resolveRepoRoot();
-  const outputDir = join(repoRoot, "data", "output");
   const projectId = values["project-id"];
+  // Isolated per project, matching the generate run this benchmarks.
+  const outputDir = resolveOutputDir(repoRoot, projectId);
 
   if (projectId === undefined && values.local !== true) {
     console.error("Pass --project-id <id> to benchmark a database project, or --local.");
@@ -125,8 +127,10 @@ async function main(): Promise<void> {
     if (projectId === undefined) {
       return loadInputData(defaultInputPaths(join(repoRoot, "data", "input")));
     }
-    const { getProjectPayload, prisma } = await import("@staticforge/database");
-    const payload = await getProjectPayload(projectId, prisma);
+    const { getProjectPayload, prisma, resolveOperatorId } = await import(
+      "@staticforge/database"
+    );
+    const payload = await getProjectPayload(projectId, resolveOperatorId(), prisma);
     return {
       businesses: payload.businesses,
       services: payload.services,

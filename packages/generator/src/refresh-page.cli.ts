@@ -1,6 +1,7 @@
 import { parseArgs } from "node:util";
 import { join, resolve } from "node:path";
 import { createAnthropicService, createMockService, isMockAiEnabled } from "@staticforge/ai";
+import { resolveOutputDir } from "@staticforge/core";
 import {
   CONTENT_PROFILES,
   DEFAULT_CONTENT_PROFILE,
@@ -79,12 +80,21 @@ async function main(): Promise<void> {
 
   const locale = LocaleSchema.parse(values.locale);
   const repoRoot = resolveRepoRoot();
-  const outputDir = join(repoRoot, "data", "output");
+  // The same isolated subtree the generate run wrote, or the refresh would
+  // rewrite a different tenant's output file.
+  const outputDir = resolveOutputDir(repoRoot, projectId);
 
-  const { getPageForUser, getProjectPayload, prisma, saveRefreshedPage } =
-    await import("@staticforge/database");
+  const {
+    getPageForUser,
+    getProjectPayload,
+    prisma,
+    resolveOperatorId,
+    saveRefreshedPage,
+  } = await import("@staticforge/database");
 
-  const payload = await getProjectPayload(projectId, prisma);
+  const userId = resolveOperatorId();
+
+  const payload = await getProjectPayload(projectId, userId, prisma);
   const validated = validateInputData({
     businesses: payload.businesses,
     services: payload.services,
@@ -92,12 +102,7 @@ async function main(): Promise<void> {
     content: payload.content,
   });
 
-  const stored = await getPageForUser(
-    projectId,
-    slug,
-    process.env.STATICFORGE_USER_ID ?? "local-operator",
-    prisma,
-  );
+  const stored = await getPageForUser(projectId, slug, userId, prisma);
 
   if (stored === null) {
     console.error(`No page "${slug}" in project "${projectId}".`);

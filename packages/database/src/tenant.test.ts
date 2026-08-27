@@ -290,6 +290,52 @@ describe("job lifecycle writes", () => {
     expect(data.startedAt).toBeInstanceOf(Date);
   });
 
+  test("markJobRunning claims the job for the instance running it", async () => {
+    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
+
+    const before = Date.now();
+    await markJobRunning("job_1", prisma, { instanceId: "web-1", leaseMs: 60_000 });
+
+    const data = prisma.generationJob.update.mock.calls[0]?.[0]?.data as {
+      lockedBy?: string;
+      leaseExpiresAt?: Date;
+    };
+
+    // Without a claim, "RUNNING" says only that some process once said so,
+    // which is indistinguishable from a process that has since died.
+    expect(data.lockedBy).toBe("web-1");
+    expect(data.leaseExpiresAt?.getTime() ?? 0).toBeGreaterThanOrEqual(
+      before + 60_000,
+    );
+  });
+
+  test("updateJobLogs renews the claim on the same write", async () => {
+    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
+
+    await updateJobLogs("job_1", "partial", prisma, { instanceId: "web-1" });
+
+    const data = prisma.generationJob.update.mock.calls[0]?.[0]?.data as {
+      logs?: string;
+      leaseExpiresAt?: Date;
+    };
+
+    // The flush is the heartbeat. A second periodic write would double the cost
+    // of the noisiest query in the system to say what this one already proves.
+    expect(data.logs).toBe("partial");
+    expect(data.leaseExpiresAt).toBeInstanceOf(Date);
+  });
+
+  test("finishJob releases the claim", async () => {
+    prisma.generationJob.update.mockResolvedValue(jobRow() as never);
+
+    await finishJob("job_1", { ok: true, exitCode: 0, logs: "done" }, prisma);
+
+    expect(prisma.generationJob.update.mock.calls[0]?.[0]?.data).toMatchObject({
+      lockedBy: null,
+      leaseExpiresAt: null,
+    });
+  });
+
   test("updateJobLogs replaces rather than appends", async () => {
     prisma.generationJob.update.mockResolvedValue(jobRow() as never);
 
@@ -327,17 +373,84 @@ describe("job lifecycle writes", () => {
 });
 
 describe("failOrphanedJobs", () => {
-  test("fails anything left pending or running", async () => {
+  const now = new Date("2026-08-27T12:00:00.000Z");
+
+  /** The `where` the recovery scan was built with. */
+  function recoveryWhere(): {
+    status?: { in?: string[] };
+    OR?: Array<Record<string, unknown>>;
+  } {
+    return prisma.generationJob.updateMany.mock.calls[0]?.[0]?.where as {
+      status?: { in?: string[] };
+      OR?: Array<Record<string, unknown>>;
+    };
+  }
+
+  test("closes out abandoned work and reports how much", async () => {
     prisma.generationJob.updateMany.mockResolvedValue({ count: 2 } as never);
 
-    const failed = await failOrphanedJobs(prisma);
+    const failed = await failOrphanedJobs(prisma, { instanceId: "web-1", now });
 
-    // A job row outlives the process updating it; without this, a dev-server
-    // restart mid-build leaves a job spinning and a poller waiting forever.
-    expect(prisma.generationJob.updateMany.mock.calls[0]?.[0]?.where).toEqual({
-      status: { in: ["PENDING", "RUNNING"] },
-    });
+    expect(recoveryWhere().status?.in).toEqual(["PENDING", "RUNNING"]);
     expect(failed).toBe(2);
+  });
+
+  test("never fails everything that merely says RUNNING", async () => {
+    prisma.generationJob.updateMany.mockResolvedValue({ count: 0 } as never);
+
+    await failOrphanedJobs(prisma, { instanceId: "web-1", now });
+
+    // The status alone must never be the whole condition. A second instance is
+    // doing real work under exactly that description, for every tenant at once,
+    // and a cold start that matched on status would destroy all of it.
+    const where = recoveryWhere();
+    expect(where.OR).toBeDefined();
+    expect(where.OR?.length).toBeGreaterThan(0);
+  });
+
+  test("reclaims this instance's own leftovers, and lapsed claims", async () => {
+    prisma.generationJob.updateMany.mockResolvedValue({ count: 0 } as never);
+
+    await failOrphanedJobs(prisma, {
+      instanceId: "web-1",
+      now,
+      pendingGraceMs: 300_000,
+    });
+
+    const or = recoveryWhere().OR ?? [];
+
+    // Booting, so nothing this instance still holds survived.
+    expect(or).toContainEqual({ lockedBy: "web-1" });
+    // A claim nobody renewed, whatever became of its owner.
+    expect(or).toContainEqual({ leaseExpiresAt: { lt: now } });
+    // Never claimed at all, and old enough that nothing is going to.
+    expect(or).toContainEqual({
+      leaseExpiresAt: null,
+      createdAt: { lt: new Date(now.getTime() - 300_000) },
+    });
+  });
+
+  test("leaves a job another instance is still renewing alone", async () => {
+    prisma.generationJob.updateMany.mockResolvedValue({ count: 0 } as never);
+
+    await failOrphanedJobs(prisma, { instanceId: "web-1", now });
+
+    const or = recoveryWhere().OR ?? [];
+
+    // A live job on web-2 matches none of the three: its lockedBy is not ours,
+    // its lease is in the future, and it is not unclaimed.
+    expect(or).not.toContainEqual({ lockedBy: "web-2" });
+    expect(or.some((clause) => "leaseExpiresAt" in clause)).toBe(true);
+  });
+
+  test("without an instance id, only lapsed claims are reclaimed", async () => {
+    prisma.generationJob.updateMany.mockResolvedValue({ count: 0 } as never);
+
+    await failOrphanedJobs(prisma, { now });
+
+    const or = recoveryWhere().OR ?? [];
+    expect(or.some((clause) => "lockedBy" in clause)).toBe(false);
+    expect(or).toContainEqual({ leaseExpiresAt: { lt: now } });
   });
 
   test("does not touch finished jobs", async () => {
@@ -345,9 +458,7 @@ describe("failOrphanedJobs", () => {
 
     await failOrphanedJobs(prisma);
 
-    const where = prisma.generationJob.updateMany.mock.calls[0]?.[0]?.where as {
-      status?: { in?: string[] };
-    };
+    const where = recoveryWhere();
     expect(where.status?.in).not.toContain("COMPLETED");
     expect(where.status?.in).not.toContain("FAILED");
   });

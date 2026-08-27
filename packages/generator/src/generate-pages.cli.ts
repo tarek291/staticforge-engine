@@ -12,7 +12,11 @@ import {
   createMockService,
   isMockAiEnabled,
 } from "@staticforge/ai";
-import { validateInternalLinks, withInternalLinks } from "@staticforge/core";
+import {
+  resolveOutputDir,
+  validateInternalLinks,
+  withInternalLinks,
+} from "@staticforge/core";
 import { publishSeoArtifacts, resolveSite } from "./publish-seo.js";
 import { loadInputData, defaultInputPaths } from "./load-data.js";
 import { validateInputData } from "./validate-input.js";
@@ -89,9 +93,13 @@ async function loadFromDatabase(
   projectId: string,
   locale: Locale,
 ): Promise<RawInputData> {
-  const { getProjectPayload, prisma } = await import("@staticforge/database");
+  const { getProjectPayload, prisma, resolveOperatorId } = await import(
+    "@staticforge/database"
+  );
 
-  const payload = await getProjectPayload(projectId, prisma);
+  // The owner this run acts as. A project belonging to anyone else is simply
+  // not found — the same answer as an id that never existed.
+  const payload = await getProjectPayload(projectId, resolveOperatorId(), prisma);
 
   console.log(
     `  workspace: ${payload.workspace.name} (${payload.workspace.slug})`,
@@ -123,9 +131,11 @@ async function persistToDatabase(
   projectId: string,
   pages: GeneratedPage[],
 ): Promise<{ saved: number; removed: number }> {
-  const { saveGeneratedPages, prisma } = await import("@staticforge/database");
+  const { saveGeneratedPages, prisma, resolveOperatorId } = await import(
+    "@staticforge/database"
+  );
 
-  return saveGeneratedPages(projectId, pages, prisma, {
+  return saveGeneratedPages(projectId, resolveOperatorId(), pages, prisma, {
     // Provenance, so a dashboard can tell an authored page from a templated one.
     source: isAiGenerationEnabled() ? "AI" : "TEMPLATE",
   });
@@ -135,7 +145,10 @@ async function main(): Promise<void> {
   const { locale, projectId, siteUrl } = parseOptions();
   const repoRoot = resolveRepoRoot();
   const inputDir = join(repoRoot, "data", "input");
-  const outputDir = join(repoRoot, "data", "output");
+  // Isolated per project. A database run writes its own subtree, because
+  // `savePages` clears the pages directory before writing it: two tenants
+  // sharing one directory means one run deletes the other's site.
+  const outputDir = resolveOutputDir(repoRoot, projectId);
 
   // Dual mode: --project-id switches the source of input. Everything after this
   // point — validation, page building, AI, saving — is identical either way.

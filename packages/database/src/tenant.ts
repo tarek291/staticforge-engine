@@ -23,6 +23,31 @@ import type { JobKind, JobStatus, PrismaClient } from "@prisma/client";
  */
 export const LOCAL_OPERATOR_ID = "local-operator";
 
+/** Environment variable carrying the operator a spawned command acts as. */
+export const OPERATOR_ID_ENV_VAR = "STATICFORGE_USER_ID";
+
+/**
+ * The operator this process is acting as.
+ *
+ * The engine's commands are spawned by the dashboard and run by hand, and both
+ * now have to name an owner — every scoped query requires one. Reading it from
+ * the environment rather than `argv` is the same choice the refresh feedback
+ * makes: on Windows the spawn goes through a shell, and identity is not
+ * something to hand to a shell parser.
+ *
+ * Falls back to {@link LOCAL_OPERATOR_ID} so a local run needs no setup, and so
+ * this returns the value the schema's own column default already assumes.
+ */
+export function resolveOperatorId(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const value = env[OPERATOR_ID_ENV_VAR];
+
+  return value === undefined || value.trim() === ""
+    ? LOCAL_OPERATOR_ID
+    : value.trim();
+}
+
 /** A project as a listing shows it. */
 export interface TenantProjectSummary {
   id: string;
@@ -258,33 +283,97 @@ export async function enqueueJob(
   return toJobSummary(job);
 }
 
-/** Mark a job as started. */
+/**
+ * How long a claim on a running job holds without being renewed.
+ *
+ * Long enough that an ordinary pause — a slow provider call, a stalled build
+ * step — does not look like death, short enough that a genuinely dead worker's
+ * job is reclaimed while an operator is still watching it.
+ */
+export const JOB_LEASE_MS = 120_000;
+
+/** A worker's claim on the jobs it is running. */
+export interface JobLease {
+  /**
+   * Stable identity of the server instance.
+   *
+   * Stable across a restart of the *same* instance, and distinct between
+   * instances — a hostname or a deployment slot, not a pid. That is what makes
+   * "this instance's own leftovers" a safe thing to reclaim on boot while
+   * another instance's live jobs are not.
+   */
+  instanceId: string;
+  /** How long the claim holds. Defaults to {@link JOB_LEASE_MS}. */
+  leaseMs?: number;
+}
+
+/** When a claim taken now would lapse. */
+function leaseDeadline(lease: JobLease, now: Date): Date {
+  return new Date(now.getTime() + (lease.leaseMs ?? JOB_LEASE_MS));
+}
+
+/**
+ * Mark a job as started and claim it for this instance.
+ *
+ * The claim is what makes the job's liveness observable from another process.
+ * Without it, "RUNNING" means only that some process once said so, which is
+ * indistinguishable from a process that has since died.
+ */
 export async function markJobRunning(
   jobId: string,
   prisma: PrismaClient,
+  lease?: JobLease,
 ): Promise<void> {
+  const now = new Date();
+
   await prisma.generationJob.update({
     where: { id: jobId },
-    data: { status: "RUNNING", startedAt: new Date() },
+    data: {
+      status: "RUNNING",
+      startedAt: now,
+      ...(lease === undefined
+        ? {}
+        : { lockedBy: lease.instanceId, leaseExpiresAt: leaseDeadline(lease, now) }),
+    },
   });
 }
 
 /**
- * Append progress to a running job.
+ * Append progress to a running job, and renew its claim.
  *
  * Replaces rather than concatenates: the caller owns the buffer and has already
  * trimmed it, and a database-side append would grow without bound on a job that
  * prints megabytes.
+ *
+ * The lease rides along on this write rather than taking one of its own. The
+ * flush already runs on a timer for exactly as long as the job does, so it is
+ * the heartbeat — and a second periodic write would double the cost of the
+ * noisiest query in the system to say something this one already proves.
  */
 export async function updateJobLogs(
   jobId: string,
   logs: string,
   prisma: PrismaClient,
+  lease?: JobLease,
 ): Promise<void> {
-  await prisma.generationJob.update({ where: { id: jobId }, data: { logs } });
+  await prisma.generationJob.update({
+    where: { id: jobId },
+    data: {
+      logs,
+      ...(lease === undefined
+        ? {}
+        : { leaseExpiresAt: leaseDeadline(lease, new Date()) }),
+    },
+  });
 }
 
-/** Close a job out, either way. */
+/**
+ * Close a job out, either way.
+ *
+ * The claim is released explicitly. A finished job holding a lease would be
+ * invisible to orphan recovery, which is correct but only by accident; clearing
+ * it makes "has a lease" mean "is being worked on" and nothing else.
+ */
 export async function finishJob(
   jobId: string,
   outcome: { ok: boolean; exitCode: number; logs: string },
@@ -297,6 +386,8 @@ export async function finishJob(
       exitCode: outcome.exitCode,
       logs: outcome.logs,
       completedAt: new Date(),
+      lockedBy: null,
+      leaseExpiresAt: null,
     },
   });
 }
@@ -314,20 +405,79 @@ export async function getJobForUser(
   return job === null ? null : toJobSummary(job);
 }
 
+/** How long a job may sit unclaimed before it is assumed abandoned. */
+export const PENDING_GRACE_MS = 300_000;
+
+/** Knobs for {@link failOrphanedJobs}. */
+export interface OrphanRecoveryOptions {
+  /**
+   * This instance's identity. Jobs it still holds a claim on are reclaimed
+   * unconditionally: the instance is booting, so nothing it owned survived.
+   */
+  instanceId?: string;
+  /** How long an unclaimed PENDING job may wait. Defaults to {@link PENDING_GRACE_MS}. */
+  pendingGraceMs?: number;
+  /** Injected so the recovery window is testable without waiting for a clock. */
+  now?: Date;
+}
+
 /**
- * Fail every job left RUNNING by a process that died.
+ * Fail every job that nothing is working on any more.
  *
- * A job row outlives the process that was updating it, so a dev-server restart
- * mid-build would otherwise leave a job spinning forever and a poller waiting
- * on it. Called at startup, where "running" can only mean "orphaned".
+ * ## Why this is not "everything still RUNNING"
+ *
+ * A job row outlives the process that was updating it, so a restart mid-build
+ * would otherwise leave a job spinning forever and a poller waiting on it. The
+ * obvious fix — fail everything PENDING or RUNNING at startup — is correct for
+ * exactly one deployment: a single process on a single machine. The moment a
+ * second instance exists, every cold start becomes an act of sabotage, failing
+ * work that another instance is doing *right now*, for every tenant at once.
+ *
+ * So liveness is read from the lease instead of from the status, and a job is
+ * reclaimed only when one of three things is true:
+ *
+ * - **This instance holds it.** It is booting; nothing it owned is alive.
+ * - **Its lease has lapsed.** The owner stopped renewing, whatever became of it.
+ * - **It was never claimed and has waited too long.** A PENDING row nothing
+ *   picked up. The grace period is what keeps a job enqueued moments ago from
+ *   being destroyed by a concurrent boot.
+ *
+ * A job another instance is actively renewing matches none of these, which is
+ * the whole point.
+ *
+ * @param prisma - The client to write with.
+ * @param options - This instance's identity and the recovery window.
+ * @returns How many jobs were closed out.
  */
-export async function failOrphanedJobs(prisma: PrismaClient): Promise<number> {
+export async function failOrphanedJobs(
+  prisma: PrismaClient,
+  options: OrphanRecoveryOptions = {},
+): Promise<number> {
+  const now = options.now ?? new Date();
+  const pendingCutoff = new Date(
+    now.getTime() - (options.pendingGraceMs ?? PENDING_GRACE_MS),
+  );
+
+  const abandoned: Prisma.GenerationJobWhereInput[] = [
+    { leaseExpiresAt: { lt: now } },
+    { leaseExpiresAt: null, createdAt: { lt: pendingCutoff } },
+  ];
+
+  if (options.instanceId !== undefined) {
+    abandoned.unshift({ lockedBy: options.instanceId });
+  }
+
   const result = await prisma.generationJob.updateMany({
-    where: { status: { in: ["PENDING", "RUNNING"] } },
+    where: {
+      status: { in: ["PENDING", "RUNNING"] },
+      OR: abandoned,
+    },
     data: {
       status: "FAILED",
       exitCode: -1,
-      completedAt: new Date(),
+      completedAt: now,
+      lockedBy: null,
+      leaseExpiresAt: null,
     },
   });
 

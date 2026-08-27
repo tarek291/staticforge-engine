@@ -1,4 +1,6 @@
+import { ProjectIdSchema } from "@staticforge/core";
 import { LOCAL_OPERATOR_ID, enqueueJob, prisma } from "@staticforge/database";
+import { LocaleSchema } from "@staticforge/schemas";
 
 import {
   dashboardDisabledResponse,
@@ -12,6 +14,12 @@ import { startJob } from "@/lib/dashboard/jobs";
  * Answers 202 as soon as the job row exists, then does the work in the
  * background. Waiting for a five-hundred-page build inside a request would be
  * cut off by a proxy, a browser, or a platform timeout long before it finished.
+ *
+ * Every field is parsed before it is used. Two of them end up on a command line
+ * that a shell reads on Windows, and one of them becomes a directory name, so
+ * "is a non-empty string" is not a sufficient check for either: a value that
+ * reaches `spawn` unparsed is a command, and a value that reaches `join`
+ * unparsed can leave the output tree.
  */
 export const dynamic = "force-dynamic";
 
@@ -29,8 +37,29 @@ export async function POST(request: Request): Promise<Response> {
     feedback?: string;
   };
 
-  if (typeof projectId !== "string" || projectId.length === 0) {
-    return Response.json({ error: "projectId is required." }, { status: 400 });
+  const parsedProjectId = ProjectIdSchema.safeParse(projectId);
+
+  if (!parsedProjectId.success) {
+    return Response.json(
+      {
+        error:
+          "projectId is required, and must be 1-64 characters of A-Z, a-z, " +
+          "0-9, underscore or dash.",
+      },
+      { status: 400 },
+    );
+  }
+
+  // The locale reaches `argv`. An unparsed value there is not an argument, it
+  // is a command-line fragment, so it is pinned to the supported set here
+  // rather than defaulted and forwarded.
+  const parsedLocale = LocaleSchema.safeParse(locale ?? "de");
+
+  if (!parsedLocale.success) {
+    return Response.json(
+      { error: `locale must be one of: ${LocaleSchema.options.join(", ")}.` },
+      { status: 400 },
+    );
   }
 
   if (kind !== "GENERATE" && kind !== "BUILD" && kind !== "REFRESH") {
@@ -56,7 +85,13 @@ export async function POST(request: Request): Promise<Response> {
 
   // Ownership is checked inside enqueueJob, in the same query that finds the
   // project — so a project belonging to another tenant is simply not found.
-  const job = await enqueueJob(projectId, LOCAL_OPERATOR_ID, kind, prisma, target);
+  const job = await enqueueJob(
+    parsedProjectId.data,
+    LOCAL_OPERATOR_ID,
+    kind,
+    prisma,
+    target,
+  );
 
   if (job === null) {
     // Deliberately indistinguishable from "no such project": a caller must not
@@ -64,7 +99,14 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Project not found." }, { status: 404 });
   }
 
-  startJob(job.id, projectId, kind, locale ?? "de", target);
+  startJob(
+    job.id,
+    parsedProjectId.data,
+    kind,
+    parsedLocale.data,
+    LOCAL_OPERATOR_ID,
+    target,
+  );
 
   return Response.json(job, { status: 202 });
 }
