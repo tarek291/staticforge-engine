@@ -45,6 +45,21 @@ model Project {
   /// Content locale for generated pages. Mirrors `LocaleSchema` ("de" | "en").
   locale String @default("de")
 
+  /// Absolute origin this project publishes at, e.g. "https://www.example.de".
+  /// Without it a cloud run produces pages but no sitemap or robots.txt, since
+  /// both need absolute URLs. Optional because a project may exist before its
+  /// domain does.
+  siteUrl String?
+
+  /// Owning user. Every dashboard and API query filters on this, so a project
+  /// is unreachable to anyone else even by guessing its id.
+  ///
+  /// The default exists so this column could be added to a populated table, and
+  /// names the single local operator this phase assumes. It is a placeholder
+  /// for real authentication, not a substitute: anything relying on it must
+  /// keep working when the value comes from a session instead.
+  userId String @default("local-operator")
+
   /// Project-level template default. The service-level value wins over it, and
   /// "default" applies when neither is set. Purely a rendering choice.
   templateId String @default("default")
@@ -62,12 +77,61 @@ model Project {
   services       Service[]
   locations      Location[]
   generatedPages GeneratedPage[]
+  jobs           GenerationJob[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@unique([workspaceId, slug])
   @@index([workspaceId])
+  @@index([userId])
+}
+
+/// What a job was asked to do.
+enum JobKind {
+  /// Generate pages only.
+  GENERATE
+  /// Generate, validate, then build the site.
+  BUILD
+}
+
+/// Where a job is in its life.
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// One background run of the engine.
+///
+/// Generating five hundred pages takes longer than an HTTP request may, so the
+/// dashboard records the intent, answers immediately, and lets the browser poll
+/// this row. The job is the unit of truth about a run — not the response.
+model GenerationJob {
+  id String @id @default(cuid())
+
+  kind   JobKind
+  status JobStatus @default(PENDING)
+
+  /// Combined stdout and stderr, flushed periodically while the job runs so a
+  /// poller sees progress rather than a blank screen followed by a verdict.
+  logs     String @default("")
+  exitCode Int?
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// Denormalised from the project so a job can be scoped without a join —
+  /// which matters because every read of this table is scoped.
+  userId String
+
+  createdAt   DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  @@index([projectId, createdAt])
+  @@index([userId, createdAt])
 }
 
 /// Business verticals. Values match `NicheSchema` exactly, so the mapping into

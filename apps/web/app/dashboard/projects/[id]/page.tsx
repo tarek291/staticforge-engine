@@ -4,7 +4,12 @@ import type { ReactElement } from "react";
 
 import { ControlPanel } from "../../_components/ControlPanel";
 import { isDashboardEnabled } from "@/lib/dashboard/guard";
-import { getProjectDetail, isDatabaseReachable } from "@/lib/dashboard/queries";
+import {
+  LOCAL_OPERATOR_ID,
+  getProjectForUser,
+  isDatabaseReachable,
+  prisma,
+} from "@staticforge/database";
 
 /** One project: its entities, its pages, and the two buttons that rebuild it. */
 export const dynamic = "force-dynamic";
@@ -32,11 +37,13 @@ function Stat({ label, value }: { label: string; value: string }): ReactElement 
 export default async function ProjectPage({ params }: Props): Promise<ReactElement> {
   const { id } = await params;
 
-  if (!(await isDatabaseReachable())) {
+  if (!(await isDatabaseReachable(prisma))) {
     notFound();
   }
 
-  const project = await getProjectDetail(id);
+  // Scoped to the owner in the query itself: a project belonging to another
+  // tenant is indistinguishable from one that does not exist.
+  const project = await getProjectForUser(id, LOCAL_OPERATOR_ID, prisma);
 
   if (project === null) {
     notFound();

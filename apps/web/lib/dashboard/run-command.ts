@@ -57,6 +57,8 @@ export function runCommand(
   command: string,
   args: string[],
   env: Record<string, string> = {},
+  /** Called as output arrives, so a long run can report progress. */
+  onOutput?: (output: string) => void,
 ): Promise<CommandResult> {
   const started = Date.now();
   const root = repoRoot();
@@ -112,6 +114,7 @@ export function runCommand(
       if (output.length > MAX_OUTPUT * 2) {
         output = output.slice(-MAX_OUTPUT);
       }
+      onOutput?.(stripAnsi(output.slice(-MAX_OUTPUT)));
     };
 
     child.stdout.on("data", capture);
@@ -128,6 +131,7 @@ export function runCommand(
 export function runGenerate(
   projectId: string | undefined,
   locale: string,
+  onOutput?: (output: string) => void,
 ): Promise<CommandResult> {
   const args = [
     "tsx",
@@ -140,13 +144,14 @@ export function runGenerate(
     args.push("--project-id", projectId);
   }
 
-  return runCommand("npx", args);
+  return runCommand("npx", args, {}, onOutput);
 }
 
 /** Run the full deploy pipeline: generate, validate, build. */
 export function runPipeline(
   projectId: string | undefined,
   locale: string,
+  onOutput?: (output: string) => void,
 ): Promise<CommandResult> {
   const args = ["tsx", "packages/cli/src/cli.ts", "build", "--locale", locale];
 
@@ -154,5 +159,5 @@ export function runPipeline(
     args.push("--project-id", projectId);
   }
 
-  return runCommand("npx", args);
+  return runCommand("npx", args, {}, onOutput);
 }

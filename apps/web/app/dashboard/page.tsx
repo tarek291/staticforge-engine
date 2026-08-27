@@ -2,7 +2,13 @@ import Link from "next/link";
 import type { ReactElement } from "react";
 
 import { DASHBOARD_ENV_VAR, isDashboardEnabled } from "@/lib/dashboard/guard";
-import { isDatabaseReachable, listProjects } from "@/lib/dashboard/queries";
+import {
+  LOCAL_OPERATOR_ID,
+  failOrphanedJobs,
+  isDatabaseReachable,
+  listProjectsForUser,
+  prisma,
+} from "@staticforge/database";
 
 /**
  * The dashboard index: every project the database holds.
@@ -23,8 +29,16 @@ export const metadata = {
 };
 
 export default async function DashboardPage(): Promise<ReactElement> {
-  const reachable = await isDatabaseReachable();
-  const projects = reachable ? await listProjects() : [];
+  const reachable = await isDatabaseReachable(prisma);
+
+  if (reachable) {
+    // A job row outlives the process that was updating it, so anything still
+    // RUNNING when this page loads was orphaned by a restart. Closing them out
+    // here keeps a poller from waiting on a job nothing will ever finish.
+    await failOrphanedJobs(prisma);
+  }
+
+  const projects = reachable ? await listProjectsForUser(LOCAL_OPERATOR_ID, prisma) : [];
 
   return (
     <div className="flex flex-col gap-8">

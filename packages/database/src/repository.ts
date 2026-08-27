@@ -39,6 +39,9 @@ export interface ContentTemplatePayload {
   faqs: Array<{ q: string; a: string }>;
   templateId?: string;
   contentProfileId?: string;
+  /** Absolute origin, from the project. Without it a cloud run publishes no
+   * sitemap, because sitemap entries must be absolute URLs. */
+  siteUrl?: string;
 }
 
 /**
@@ -233,6 +236,9 @@ export async function getProjectPayload(
       // Project-level defaults. Service-level values still win over them.
       templateId: project.templateId,
       contentProfileId: project.contentProfileId,
+      // Carried on the content block because that is where the generator reads
+      // it from in file mode; one code path, one lookup.
+      ...(project.siteUrl !== null ? { siteUrl: project.siteUrl } : {}),
     },
   };
 }

@@ -44,6 +44,7 @@ const PROJECT = {
   description: "Synthetic tenant for load testing. Not real data.",
   locale: "de",
   templateId: "default",
+  siteUrl: "https://scale.example",
 } as const;
 
 /** German service names, enough to reach the service count. */
@@ -122,7 +123,7 @@ async function seed(): Promise<void> {
       workspaceId_slug: { workspaceId: workspace.id, slug: PROJECT.slug },
     },
     create: { ...PROJECT, workspaceId: workspace.id },
-    update: { name: PROJECT.name, locale: PROJECT.locale },
+    update: { name: PROJECT.name, locale: PROJECT.locale, siteUrl: PROJECT.siteUrl },
   });
 
   const business = {

@@ -39,6 +39,9 @@ const PROJECT = {
   description: "Sample project seeded from data/input.",
   locale: "de",
   templateId: "default",
+  // Without this a cloud run generates pages but publishes no sitemap, since
+  // sitemap entries must be absolute URLs.
+  siteUrl: "https://www.glanzfix.de",
 } as const;
 
 const BUSINESS = {
@@ -219,6 +222,7 @@ async function seed(): Promise<void> {
       description: PROJECT.description,
       locale: PROJECT.locale,
       templateId: PROJECT.templateId,
+      siteUrl: PROJECT.siteUrl,
     },
   });
 

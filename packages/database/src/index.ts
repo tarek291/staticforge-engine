@@ -39,6 +39,7 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 export * from "./repository.js";
+export * from "./tenant.js";
 
 export { PrismaClient } from "@prisma/client";
 export type {
@@ -47,6 +48,9 @@ export type {
   Service,
   Location,
   GeneratedPage,
+  GenerationJob,
+  JobKind,
+  JobStatus,
   PageSource,
   Prisma,
 } from "@prisma/client";
