@@ -2,10 +2,8 @@ import Link from "next/link";
 import type { ReactElement } from "react";
 
 import { DASHBOARD_ENV_VAR, isDashboardEnabled } from "@/lib/dashboard/guard";
-import { instanceId } from "@/lib/dashboard/instance";
 import {
   LOCAL_OPERATOR_ID,
-  failOrphanedJobs,
   isDatabaseReachable,
   listProjectsForUser,
   prisma,
@@ -32,16 +30,11 @@ export const metadata = {
 export default async function DashboardPage(): Promise<ReactElement> {
   const reachable = await isDatabaseReachable(prisma);
 
-  if (reachable) {
-    // A job row outlives the process that was updating it, so a restart can
-    // leave one saying RUNNING that nothing will ever finish. Closing those out
-    // keeps a poller from waiting forever.
-    //
-    // Scoped to this instance's own leftovers and to claims that have lapsed —
-    // never to "everything still RUNNING". A second instance is doing real work
-    // under exactly that description, and for every tenant at once.
-    await failOrphanedJobs(prisma, { instanceId: instanceId() });
-  }
+  // Orphan recovery is deliberately not done here any more. A job whose lease
+  // lapsed is not failed, it is *reclaimed*: the worker picks it up and the run
+  // resumes from the pages the previous attempt already wrote. Failing it from
+  // the dashboard would throw that work away, and would do so from a process
+  // that no longer knows anything about who is running what.
 
   const projects = reachable ? await listProjectsForUser(LOCAL_OPERATOR_ID, prisma) : [];
 

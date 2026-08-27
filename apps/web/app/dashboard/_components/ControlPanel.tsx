@@ -16,13 +16,81 @@ import { useEffect, useRef, useState, type ReactElement } from "react";
 
 interface Job {
   id: string;
-  kind: "GENERATE" | "BUILD";
+  kind: "GENERATE" | "BUILD" | "REFRESH";
   status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
   logs: string;
   exitCode: number | null;
   startedAt: string | null;
   completedAt: string | null;
   finished: boolean;
+  progress: number;
+  totalCount: number | null;
+  completedCount: number;
+  failedCount: number;
+}
+
+/**
+ * How far along a run is, in the two forms a person reads differently.
+ *
+ * The bar answers "roughly how much is left" at a glance; the count answers
+ * "is it actually moving" — which is the question that matters during the
+ * twenty minutes a five-hundred-page run spends looking identical. Both come
+ * from the same row, so they cannot disagree.
+ *
+ * A queued job has no total yet and says so, rather than drawing an empty bar
+ * that is indistinguishable from a stalled one.
+ */
+function JobProgress({ job }: { job: Job }): ReactElement {
+  const known = job.totalCount !== null && job.totalCount > 0;
+  const done = job.completedCount + job.failedCount;
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-baseline justify-between gap-3 text-xs">
+        <span className="text-neutral-500">
+          {known
+            ? `${done}/${job.totalCount} pages`
+            : job.status === "PENDING"
+              ? "Waiting for a worker to pick this up"
+              : "Counting pages…"}
+          {job.failedCount > 0 && (
+            <span className="text-red-600 dark:text-red-400">
+              {" "}
+              · {job.failedCount} failed
+            </span>
+          )}
+        </span>
+        {known && (
+          <span className="font-mono tabular-nums text-neutral-500">
+            {job.progress}%
+          </span>
+        )}
+      </div>
+
+      <div
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={known ? job.progress : undefined}
+        aria-label={`${job.kind.toLowerCase()} progress`}
+        className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800"
+      >
+        <div
+          className={
+            "h-full rounded-full transition-[width] duration-500 ease-out " +
+            (job.status === "FAILED"
+              ? "bg-red-500"
+              : job.status === "COMPLETED"
+                ? "bg-emerald-500"
+                : "bg-neutral-900 dark:bg-white")
+          }
+          // Width is the one thing here that cannot come from a class: it is a
+          // continuous value from the server, not one of a fixed set.
+          style={{ width: `${known ? job.progress : 0}%` }}
+        />
+      </div>
+    </div>
+  );
 }
 
 interface Props {
@@ -157,6 +225,8 @@ export function ControlPanel({ projectId, locale }: Props): ReactElement {
             <span className="text-neutral-500"> · {job.kind.toLowerCase()}</span>
           </p>
 
+          <JobProgress job={job} />
+
           <pre className="max-h-96 overflow-auto rounded-md bg-neutral-100 p-4 text-xs leading-relaxed dark:bg-neutral-900">
             {job.logs.length > 0 ? job.logs : "Waiting for output…"}
           </pre>
@@ -164,6 +234,16 @@ export function ControlPanel({ projectId, locale }: Props): ReactElement {
           {job.status === "COMPLETED" && (
             <p className="text-sm text-neutral-500">
               Reload to see the updated pages.
+            </p>
+          )}
+
+          {job.status === "PENDING" && (
+            <p className="text-sm text-neutral-500">
+              Queued. A worker picks this up on its next poll — start one with{" "}
+              <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-xs dark:bg-neutral-900">
+                pnpm staticforge worker
+              </code>
+              .
             </p>
           )}
         </div>

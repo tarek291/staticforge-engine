@@ -102,6 +102,12 @@ export interface JobSummary {
   completedAt: string | null;
   /** Whether the job has stopped, either way. */
   finished: boolean;
+  /** Whole percentage, 0-100, derived from the counts below. */
+  progress: number;
+  /** Pages this run expects, or `null` before it has loaded its input. */
+  totalCount: number | null;
+  completedCount: number;
+  failedCount: number;
 }
 
 /** Shape a Prisma job row for transport. */
@@ -114,6 +120,10 @@ function toJobSummary(job: {
   createdAt: Date;
   startedAt: Date | null;
   completedAt: Date | null;
+  progress: number;
+  totalCount: number | null;
+  completedCount: number;
+  failedCount: number;
 }): JobSummary {
   return {
     id: job.id,
@@ -125,6 +135,10 @@ function toJobSummary(job: {
     startedAt: job.startedAt?.toISOString() ?? null,
     completedAt: job.completedAt?.toISOString() ?? null,
     finished: job.status === "COMPLETED" || job.status === "FAILED",
+    progress: job.progress,
+    totalCount: job.totalCount,
+    completedCount: job.completedCount,
+    failedCount: job.failedCount,
   };
 }
 

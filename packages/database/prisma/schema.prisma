@@ -132,6 +132,28 @@ model GenerationJob {
   targetSlug String?
   feedback   String?
 
+  /// How far along the run is, as a whole percentage of 0-100.
+  ///
+  /// Derived from the counts below rather than reported independently, so a
+  /// progress bar and a page count can never disagree. Stored rather than
+  /// computed on read because the dashboard polls this row and the counts it
+  /// would divide are on the same row anyway - one number the UI can bind to.
+  progress Int @default(0)
+
+  /// Pages this run expects to produce. Null until the run has loaded its input
+  /// and knows: a job that has not started yet cannot honestly report a total,
+  /// and zero would read as "nothing to do".
+  totalCount Int?
+
+  /// Pages finished so far, including ones skipped because a previous attempt
+  /// had already written them.
+  completedCount Int @default(0)
+
+  /// Pages this run could not produce. Kept apart from `completedCount` so a
+  /// run that finished with failures is distinguishable from a clean one
+  /// without reading the log.
+  failedCount Int @default(0)
+
   /// Which server instance claimed this job, and until when that claim holds.
   ///
   /// A job row outlives the process updating it, so "RUNNING" alone cannot mean

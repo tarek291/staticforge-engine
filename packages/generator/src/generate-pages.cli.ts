@@ -121,6 +121,22 @@ async function loadFromDatabase(
 }
 
 /**
+ * Environment variable naming the queue job this run belongs to.
+ *
+ * Set by the worker. Its presence is what turns an ordinary generation into a
+ * *reported* one: the run writes its progress back to the job row a dashboard
+ * is polling. Absent — a run started by hand — and nothing is reported, because
+ * there is no row to report to.
+ */
+const JOB_ID_ENV_VAR = "STATICFORGE_JOB_ID";
+
+/** The job this run is reporting to, if any. */
+function resolveJobId(): string | undefined {
+  const value = process.env[JOB_ID_ENV_VAR]?.trim();
+  return value === undefined || value === "" ? undefined : value;
+}
+
+/**
  * Persist a run's pages for one project.
  *
  * Runs only in database mode, after validation and the optional AI pass have
@@ -169,6 +185,23 @@ async function main(): Promise<void> {
   let pages = buildPages(validated, { locale });
   console.log(`✓ pages built (${pages.length})`);
 
+  const jobId = resolveJobId();
+
+  // The total is reported as soon as it is known and not before: a job that has
+  // not loaded its input cannot honestly say how many pages it will produce,
+  // and zero would read as "nothing to do".
+  if (jobId !== undefined && projectId !== undefined) {
+    const { prisma, reportJobProgress, resolveOperatorId } = await import(
+      "@staticforge/database"
+    );
+    await reportJobProgress(
+      jobId,
+      { totalCount: pages.length, completedCount: 0, failedCount: 0 },
+      resolveOperatorId(),
+      prisma,
+    );
+  }
+
   // Opt-in only. Without USE_AI_GENERATION=true the deterministic pages built
   // above are saved unchanged, exactly as before.
   if (isAiGenerationEnabled()) {
@@ -196,29 +229,78 @@ async function main(): Promise<void> {
     }
 
     let hits = 0;
+    let resumedCount = 0;
+
+    // Pages a previous attempt at this project already authored. Only available
+    // in database mode: a local file run has no earlier attempt to resume from.
+    const resumeFrom =
+      projectId === undefined
+        ? undefined
+        : await (async () => {
+            const { loadResumablePages, prisma, resolveOperatorId } = await import(
+              "@staticforge/database"
+            );
+            const found = await loadResumablePages(
+              projectId,
+              resolveOperatorId(),
+              prisma,
+            );
+            if (found.size > 0) {
+              console.log(
+                `  · ${found.size} page(s) from an earlier attempt are available to resume`,
+              );
+            }
+            return found;
+          })();
+
+    // Reported after every page, so a dashboard polling the job row sees a run
+    // advancing rather than a blank bar followed by a verdict.
+    const reportCount =
+      jobId === undefined || projectId === undefined
+        ? undefined
+        : async ({ completed, total }: { completed: number; total: number }) => {
+            const { prisma, reportJobProgress, resolveOperatorId } = await import(
+              "@staticforge/database"
+            );
+            await reportJobProgress(
+              jobId,
+              { completedCount: completed, totalCount: total },
+              resolveOperatorId(),
+              prisma,
+            ).catch(() => {
+              // A failed progress write must not abort the run it only reports
+              // on. The next page reports again, and the lease is what proves
+              // the run is alive.
+            });
+          };
 
     pages = await applyAiContent(
       pages,
       validated,
       (request) => router.authorPage(request),
       {
+        ...(resumeFrom !== undefined ? { resumeFrom } : {}),
+        ...(reportCount !== undefined ? { onCount: reportCount } : {}),
         // Rate-limit pacing is meaningless against a mock, and at scale it
         // would dominate the run: 500 pages three seconds apart is 25 minutes
         // of sleeping.
         ...(mocked ? { delayMs: 0 } : {}),
-        onProgress: ({ done, total, slug, cacheHit }) => {
+        onProgress: ({ done, total, slug, cacheHit, resumed }) => {
           if (cacheHit) hits += 1;
+          if (resumed) resumedCount += 1;
           // One line per page buries the result at scale, so report in batches
           // once a run is large.
           if (total <= 20 || done % 50 === 0 || done === total) {
-            console.log(`  · ${done}/${total} ${slug}${cacheHit ? " (cached)" : ""}`);
+            const mark = resumed ? " (resumed)" : cacheHit ? " (cached)" : "";
+            console.log(`  · ${done}/${total} ${slug}${mark}`);
           }
         },
       },
     );
 
     console.log(
-      `✓ AI content applied (${pages.length - hits} generated, ${hits} from cache` +
+      `✓ AI content applied (${pages.length - hits - resumedCount} generated, ` +
+        `${hits} from cache, ${resumedCount} resumed` +
         `, profiles: ${router.profilesUsed.join(", ")})`,
     );
   }
@@ -281,6 +363,28 @@ async function main(): Promise<void> {
           `Delete the page to let a run rewrite it.`,
       );
     }
+  }
+
+  // The closing progress report.
+  //
+  // Needed for its own sake, not merely as a rounding-up: the per-page counter
+  // lives inside the AI pass, so a deterministic run never touches it and a
+  // finished template job would sit at 0% while reading COMPLETED. A run that
+  // reached here produced every page it set out to, and the row should say so
+  // before the worker writes the verdict.
+  if (jobId !== undefined && projectId !== undefined) {
+    const { prisma, reportJobProgress, resolveOperatorId } = await import(
+      "@staticforge/database"
+    );
+    await reportJobProgress(
+      jobId,
+      { totalCount: pages.length, completedCount: pages.length },
+      resolveOperatorId(),
+      prisma,
+    ).catch(() => {
+      // The pages are written and the run succeeded. Failing it now over a
+      // progress row would turn a completed build into a reported failure.
+    });
   }
 
   console.log(`\nGenerated ${pages.length} pages (locale: ${locale})`);

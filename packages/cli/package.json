@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@staticforge/core": "workspace:*",
+    "@staticforge/database": "workspace:*",
     "@staticforge/generator": "workspace:*",
     "@staticforge/schemas": "workspace:*"
   },

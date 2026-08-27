@@ -269,6 +269,75 @@ export async function getProjectPayload(
   };
 }
 
+/**
+ * Authored content an earlier attempt already wrote, keyed by slug.
+ *
+ * Only the fields a resume needs: the authored slice, and the provenance that
+ * says what produced it. The caller compares the stored `sourceHash` against
+ * the one it computes now and reuses the content only when they agree.
+ */
+export interface ResumablePage {
+  slug: string;
+  title: string;
+  metaDescription: string;
+  h1: string;
+  content: unknown;
+  generation: unknown;
+}
+
+/**
+ * Load the pages a previous attempt at this project already authored.
+ *
+ * This is what makes an interrupted run resumable rather than merely
+ * restartable. A five-hundred-page authoring run that died at page four hundred
+ * has four hundred pages of paid content sitting in this table; starting over
+ * would buy every one of them a second time, and the tenant would be charged
+ * for the crash.
+ *
+ * Only `AI` rows are returned. A template page costs nothing to rebuild, and a
+ * `MANUAL` one is protected by the write path already — reusing it here would
+ * be a second, quieter way to let a run decide what an operator's edit says.
+ *
+ * @param projectId - The project being generated.
+ * @param userId - The owner the caller is acting as.
+ * @returns Every reusable page, by slug. Empty when there is nothing to resume.
+ */
+export async function loadResumablePages(
+  projectId: string,
+  userId: string,
+  prisma: PrismaClient,
+): Promise<Map<string, ResumablePage>> {
+  const rows = await withDbRetry(() =>
+    prisma.generatedPage.findMany({
+      where: { projectId, project: { userId }, source: "AI" },
+      select: {
+        slug: true,
+        title: true,
+        metaDescription: true,
+        h1: true,
+        content: true,
+        generation: true,
+      },
+    }),
+  );
+
+  return new Map(
+    rows.map((row) => [
+      row.slug,
+      {
+        slug: row.slug,
+        title: row.title,
+        metaDescription: row.metaDescription,
+        h1: row.h1,
+        content: row.content,
+        // Zod's `.optional()` means absent, not null, so the two are reconciled
+        // at the boundary rather than at every call site.
+        generation: row.generation === null ? undefined : row.generation,
+      },
+    ]),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Write path
 // ---------------------------------------------------------------------------

@@ -88,6 +88,9 @@ importers:
       '@staticforge/core':
         specifier: workspace:*
         version: link:../core
+      '@staticforge/database':
+        specifier: workspace:*
+        version: link:../database
       '@staticforge/generator':
         specifier: workspace:*
         version: link:../generator

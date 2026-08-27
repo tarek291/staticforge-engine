@@ -40,6 +40,7 @@ if (process.env.NODE_ENV !== "production") {
 
 export * from "./retry.js";
 export * from "./repository.js";
+export * from "./queue.js";
 export * from "./tenant.js";
 
 export { PrismaClient } from "@prisma/client";

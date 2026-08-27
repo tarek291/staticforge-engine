@@ -54,6 +54,28 @@ export interface AiProgress {
   slug: string;
   /** Whether the content came from the cache rather than a paid call. */
   cacheHit: boolean;
+  /**
+   * Whether the content came from a previous, interrupted attempt at this same
+   * project rather than from this run at all.
+   */
+  resumed: boolean;
+}
+
+/**
+ * Authored content a previous attempt already produced, by slug.
+ *
+ * Shaped as the engine's own page fields plus the provenance that says what
+ * produced them, because that provenance is the only thing that makes reuse
+ * safe: the stored `sourceHash` has to match the one computed now, or the
+ * inputs have moved and the stored prose describes a page that no longer
+ * exists.
+ */
+export interface ResumableContent {
+  title: string;
+  metaDescription: string;
+  h1: string;
+  content: unknown;
+  generation: unknown;
 }
 
 /**
@@ -111,11 +133,52 @@ export interface ApplyAiContentOptions {
    * for the same reason: a wall-clock assertion is a slow test and a flaky one.
    */
   sleepFn?: (ms: number) => Promise<void>;
+  /**
+   * Content an interrupted attempt at this project already wrote, by slug.
+   *
+   * Consulted before the provider is. A page whose stored provenance carries
+   * the same `sourceHash` this run computes was authored from identical inputs
+   * by the same prompt, model and profile — so re-buying it would produce the
+   * same prose and charge for it twice.
+   *
+   * Omit to disable resumption, which is what a local file run does: there is
+   * no earlier attempt to resume from.
+   */
+  resumeFrom?: ReadonlyMap<string, ResumableContent>;
+  /**
+   * Called after every page with the running totals, so a long run can report
+   * progress somewhere durable. Awaited, because a progress write that races
+   * the next page is a progress bar that jumps backwards.
+   */
+  onCount?: (counts: { completed: number; total: number }) => Promise<void>;
 }
 
 /** Index a list of identified entities by id. */
 function indexById<T extends { id: string }>(items: T[]): Map<string, T> {
   return new Map(items.map((item) => [item.id, item]));
+}
+
+/**
+ * Whether stored content may stand in for a fresh authoring call.
+ *
+ * The single question that matters: was it written from the inputs this run is
+ * about to use? `sourceHash` fingerprints the business, the service, the city
+ * and the content template, so a match means the model would be handed exactly
+ * what it was handed last time. Anything else — a renamed service, an edited
+ * description, a different prompt version recorded alongside it — and the
+ * stored prose is about a page that no longer exists.
+ *
+ * Missing or malformed provenance is treated as "no", not as "probably fine".
+ * A page that cannot say what produced it cannot be shown to be current.
+ */
+function isReusable(stored: ResumableContent, sourceHash: string): boolean {
+  const generation = stored.generation;
+
+  if (typeof generation !== "object" || generation === null) {
+    return false;
+  }
+
+  return (generation as { sourceHash?: unknown }).sourceHash === sourceHash;
 }
 
 /**
@@ -170,6 +233,15 @@ function realignSchemaOrg(
  * Fails fast rather than collecting issues across all pages — every iteration
  * costs a paid API call, so continuing past a failure would waste tokens.
  *
+ * ## Resuming
+ *
+ * When `resumeFrom` is supplied, each page is checked against what a previous
+ * attempt at this project already wrote. A stored page whose provenance carries
+ * the same `sourceHash` this run computes was authored from identical inputs,
+ * so it is reused outright: no provider call, no pacing delay, no second charge
+ * for prose that already exists. That is what turns a run killed at page four
+ * hundred from a total loss into a hundred pages of remaining work.
+ *
  * Does not mutate `pages`; a new array of new objects is returned.
  *
  * @param pages - Deterministic pages produced by `buildPages`.
@@ -186,7 +258,13 @@ export async function applyAiContent(
   generateContentFn: GenerateContentFn,
   options: ApplyAiContentOptions = {},
 ): Promise<GeneratedPage[]> {
-  const { onProgress, delayMs = AI_CALL_DELAY_MS, sleepFn = sleep } = options;
+  const {
+    onProgress,
+    delayMs = AI_CALL_DELAY_MS,
+    sleepFn = sleep,
+    resumeFrom,
+    onCount,
+  } = options;
 
   const businesses = indexById(input.businesses);
   const services = indexById(input.services);
@@ -213,6 +291,47 @@ export async function applyAiContent(
     }
 
     const sourceHash = computeSourceHash(business, service, location, input.content);
+
+    // Resume before spending anything. A previous attempt at this project may
+    // already hold this exact page, written from these exact inputs, and paid
+    // for once.
+    const stored = resumeFrom?.get(page.slug);
+    const reusable =
+      stored !== undefined && isReusable(stored, sourceHash) ? stored : undefined;
+
+    if (reusable !== undefined) {
+      const restored = GeneratedPageSchema.safeParse({
+        ...page,
+        title: reusable.title,
+        metaDescription: reusable.metaDescription,
+        h1: reusable.h1,
+        content: reusable.content,
+        schemaOrg: realignSchemaOrg(page.schemaOrg, {
+          h1: reusable.h1,
+          metaDescription: reusable.metaDescription,
+        }),
+        generation: reusable.generation,
+      });
+
+      if (restored.success) {
+        authored.push(restored.data);
+        onProgress?.({
+          done: index + 1,
+          total: pages.length,
+          slug: page.slug,
+          cacheHit: false,
+          resumed: true,
+        });
+        await onCount?.({ completed: index + 1, total: pages.length });
+        // No provider call was made, so there is no rate limit to respect and
+        // nothing to pace.
+        continue;
+      }
+
+      // Stored content that no longer satisfies the contract is not a reason to
+      // fail the run — the page is simply authored again, which is what would
+      // have happened without a previous attempt at all.
+    }
 
     const { content, provenance } = await generateContentFn({
       businessName: business.name,
@@ -281,7 +400,9 @@ export async function applyAiContent(
       total: pages.length,
       slug: page.slug,
       cacheHit: provenance.cacheHit,
+      resumed: false,
     });
+    await onCount?.({ completed: index + 1, total: pages.length });
 
     // Pace the calls. Skipped after the final page, where the delay would only
     // add dead time before the run ends — and skipped entirely on a cache hit,

@@ -1,30 +1,35 @@
 import { ProjectIdSchema } from "@staticforge/core";
-import {
-  LOCAL_OPERATOR_ID,
-  countExpectedPages,
-  enqueueJob,
-  prisma,
-} from "@staticforge/database";
+import { LOCAL_OPERATOR_ID, enqueueJob, prisma } from "@staticforge/database";
 import { LocaleSchema } from "@staticforge/schemas";
 
 import {
   dashboardDisabledResponse,
   isDashboardEnabled,
 } from "@/lib/dashboard/guard";
-import { startJob } from "@/lib/dashboard/jobs";
 
 /**
  * Queue an engine run.
  *
- * Answers 202 as soon as the job row exists, then does the work in the
- * background. Waiting for a five-hundred-page build inside a request would be
- * cut off by a proxy, a browser, or a platform timeout long before it finished.
+ * Writes one row and answers. That is the whole of it now.
  *
- * Every field is parsed before it is used. Two of them end up on a command line
- * that a shell reads on Windows, and one of them becomes a directory name, so
- * "is a non-empty string" is not a sufficient check for either: a value that
- * reaches `spawn` unparsed is a command, and a value that reaches `join`
- * unparsed can leave the output tree.
+ * ## Why this route no longer runs anything
+ *
+ * It used to spawn the engine and supervise it in the background of the Next.js
+ * process. That worked on one developer's machine and could not survive
+ * anywhere else: an HTTP server holding an hour-long build cannot be restarted,
+ * replicated or deployed without destroying the work in flight, so the web tier
+ * could neither scale nor ship. The coupling also put an unbounded, host-level
+ * capability behind a request handler, which is why the whole surface had to be
+ * gated behind a local-only environment variable to be safe at all.
+ *
+ * A separate worker claims this row and does the work. The server's job is to
+ * record the intent and get out of the way, and a queued job now survives the
+ * server being restarted — because nothing about it depended on this process.
+ *
+ * Every field is parsed before it is stored. Two of them end up on a command
+ * line that a shell reads on Windows, and one becomes a directory name, so "is
+ * a non-empty string" is not a sufficient check for either — even though this
+ * route no longer builds that command itself.
  */
 export const dynamic = "force-dynamic";
 
@@ -55,9 +60,9 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  // The locale reaches `argv`. An unparsed value there is not an argument, it
-  // is a command-line fragment, so it is pinned to the supported set here
-  // rather than defaulted and forwarded.
+  // The locale reaches the worker's `argv`. An unparsed value there is not an
+  // argument, it is a command-line fragment, so it is pinned to the supported
+  // set here rather than defaulted and forwarded.
   const parsedLocale = LocaleSchema.safeParse(locale ?? "de");
 
   if (!parsedLocale.success) {
@@ -104,26 +109,8 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Project not found." }, { status: 404 });
   }
 
-  // Budget the run from the grid it will walk. A flat timeout either kills a
-  // large project part-way — which is what the ten-minute limit did to every
-  // real authoring run — or leaves a small one an hour in which to hang.
-  // Falls back to zero, which buys only the base allowance, if the count is
-  // unavailable for any reason.
-  const pageCount = (await countExpectedPages(
-    parsedProjectId.data,
-    LOCAL_OPERATOR_ID,
-    prisma,
-  )) ?? 0;
-
-  startJob(
-    job.id,
-    parsedProjectId.data,
-    kind,
-    parsedLocale.data,
-    LOCAL_OPERATOR_ID,
-    pageCount,
-    target,
-  );
-
+  // 202: recorded, not done. Whether a worker is running is deliberately not
+  // checked here — a job queued with no worker up is not an error, it is a job
+  // waiting, and it will be claimed when one starts.
   return Response.json(job, { status: 202 });
 }
