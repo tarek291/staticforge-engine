@@ -22,7 +22,12 @@ import {
   type GroundingFacts,
   type GroundingOptions,
 } from "./grounding.js";
-import { buildSystemPrompt, buildUserPrompt } from "./prompts.js";
+import {
+  buildCacheKey,
+  type CacheKeyParts,
+  type ContentCache,
+} from "./cache.js";
+import { PROMPT_VERSION, buildSystemPrompt, buildUserPrompt } from "./prompts.js";
 import type { PagePromptDetails } from "./prompts.js";
 import { RetryExhaustedError, withRetry, type RetryOptions } from "./retry.js";
 
@@ -141,6 +146,10 @@ export interface AIGenerationServiceOptions {
   onRetry?: (notice: GenerationRetryNotice) => void;
   /** Grounding guard configuration. */
   grounding?: GroundingOptions;
+  /** Where accepted content is stored and looked up. Omit to disable caching. */
+  cache?: ContentCache;
+  /** Version recorded on output and folded into the cache key. */
+  promptVersion?: string;
   /**
    * Refuse to generate at all when no verified record is supplied.
    *
@@ -151,10 +160,45 @@ export interface AIGenerationServiceOptions {
   requireFacts?: boolean;
 }
 
+/**
+ * The identity a cached page is keyed on, minus the parts the service knows
+ * itself (profile, prompt version, model).
+ *
+ * Supplied by the caller because only it knows which entities and which source
+ * data produced this request. Omit it and caching is skipped: a key that cannot
+ * be built reliably is worse than no cache, because a wrong key serves the
+ * wrong page.
+ */
+export interface CacheIdentity {
+  businessId: string;
+  serviceId: string;
+  locationId: string;
+  /** Fingerprint of the source entities and content template. */
+  sourceHash: string;
+}
+
 /** A page to author, with the verified record it must stay inside. */
 export interface GenerationRequest extends PagePromptDetails {
   /** The verified record. Omit to skip the grounding gate. */
   facts?: GroundingFacts;
+  /** Identity for caching. Omit to bypass the cache. */
+  cacheIdentity?: CacheIdentity;
+}
+
+/** What produced a piece of content, recorded on the page it becomes. */
+export interface ContentProvenance {
+  promptVersion: string;
+  modelVersion: string;
+  profileId: string;
+  sourceHash: string | undefined;
+  /** Whether this came from the cache rather than the provider. */
+  cacheHit: boolean;
+}
+
+/** Authored content together with its provenance. */
+export interface AuthoredContent {
+  content: GeneratedPageContent;
+  provenance: ContentProvenance;
 }
 
 export class AIGenerationService {
@@ -166,6 +210,8 @@ export class AIGenerationService {
   private readonly onRetry: ((notice: GenerationRetryNotice) => void) | undefined;
   private readonly groundingOptions: GroundingOptions;
   private readonly requireFacts: boolean;
+  private readonly cache: ContentCache | undefined;
+  private readonly promptVersion: string;
   private readonly systemPrompt: string;
 
   constructor(options: AIGenerationServiceOptions) {
@@ -177,6 +223,8 @@ export class AIGenerationService {
     this.onRetry = options.onRetry;
     this.groundingOptions = options.grounding ?? {};
     this.requireFacts = options.requireFacts ?? false;
+    this.cache = options.cache;
+    this.promptVersion = options.promptVersion ?? PROMPT_VERSION;
     // Rendered once: the prompt is derived from the profile, so it changes only
     // when the profile does.
     this.systemPrompt = buildSystemPrompt(this.profile);
@@ -203,6 +251,82 @@ export class AIGenerationService {
    * @throws {AIContentRejectedError} The content violated the contract.
    */
   async generatePageContent(
+    request: GenerationRequest,
+  ): Promise<GeneratedPageContent> {
+    return (await this.authorPage(request)).content;
+  }
+
+  /**
+   * Author a page, returning the content together with what produced it.
+   *
+   * Consults the cache first. A hit returns without touching the provider and
+   * without re-running the gates: the entry was only stored because it passed
+   * them, under a key that encodes every input that shaped it.
+   *
+   * Only accepted content is stored. A rejection is never cached — caching a
+   * refusal would turn one bad answer into a permanent one.
+   */
+  async authorPage(request: GenerationRequest): Promise<AuthoredContent> {
+    const cacheParts = this.cacheParts(request);
+    const key = cacheParts === undefined ? undefined : buildCacheKey(cacheParts);
+
+    if (key !== undefined && this.cache !== undefined) {
+      const cached = await this.cache.get(key);
+
+      if (cached !== undefined) {
+        return {
+          content: cached.content,
+          provenance: this.provenance(request, true),
+        };
+      }
+    }
+
+    const content = await this.callAndVerify(request);
+
+    if (key !== undefined && cacheParts !== undefined && this.cache !== undefined) {
+      await this.cache.set(key, {
+        content,
+        parts: cacheParts,
+        storedAt: new Date().toISOString(),
+      });
+    }
+
+    return { content, provenance: this.provenance(request, false) };
+  }
+
+  /** The full cache key parts, or undefined when the caller supplied no identity. */
+  private cacheParts(request: GenerationRequest): CacheKeyParts | undefined {
+    if (request.cacheIdentity === undefined) {
+      return undefined;
+    }
+
+    return {
+      businessId: request.cacheIdentity.businessId,
+      serviceId: request.cacheIdentity.serviceId,
+      locationId: request.cacheIdentity.locationId,
+      profileId: this.profile.id,
+      promptVersion: this.promptVersion,
+      modelVersion: this.model,
+      sourceHash: request.cacheIdentity.sourceHash,
+    };
+  }
+
+  /** What produced this content. */
+  private provenance(
+    request: GenerationRequest,
+    cacheHit: boolean,
+  ): ContentProvenance {
+    return {
+      promptVersion: this.promptVersion,
+      modelVersion: this.model,
+      profileId: this.profile.id,
+      sourceHash: request.cacheIdentity?.sourceHash,
+      cacheHit,
+    };
+  }
+
+  /** Call the provider and run every gate. */
+  private async callAndVerify(
     request: GenerationRequest,
   ): Promise<GeneratedPageContent> {
     if (this.requireFacts && request.facts === undefined) {

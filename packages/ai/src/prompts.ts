@@ -18,6 +18,20 @@ import {
  * language.
  */
 
+/**
+ * Version of the authoring prompt.
+ *
+ * Recorded on every page this prompt writes, and part of the cache key, so a
+ * rewritten prompt invalidates previously cached content instead of serving it
+ * forever.
+ *
+ * **Bump this whenever the prompt text changes.** A test fingerprints the
+ * rendered prompt and fails if it moves without a bump — the drift is otherwise
+ * invisible, and its symptom is a cache that keeps returning content written by
+ * a prompt that no longer exists.
+ */
+export const PROMPT_VERSION = "1.0.0";
+
 /** The authoring standard, independent of any particular profile. */
 const CRAFT_GUIDANCE = `You are a senior SEO engineer and content strategist specializing in programmatic SEO at scale.
 

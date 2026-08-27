@@ -5,7 +5,7 @@ import {
   type GeneratedPage,
   type Locale,
 } from "@staticforge/schemas";
-import { generatePageContent } from "@staticforge/ai";
+import { FileContentCache, createAnthropicService } from "@staticforge/ai";
 import { loadInputData, defaultInputPaths } from "./load-data.js";
 import { validateInputData } from "./validate-input.js";
 import { buildPages } from "./build-pages.js";
@@ -138,12 +138,30 @@ async function main(): Promise<void> {
   // above are saved unchanged, exactly as before.
   if (isAiGenerationEnabled()) {
     console.log(`… authoring content with AI (${pages.length} pages)`);
-    pages = await applyAiContent(pages, validated, generatePageContent, {
-      onProgress: ({ done, total, slug }) => {
-        console.log(`  · ${done}/${total} ${slug}`);
-      },
+
+    // Cached content survives between runs, so an unrelated rebuild does not
+    // re-buy pages whose source has not moved.
+    const service = createAnthropicService({
+      cache: new FileContentCache(join(repoRoot, "data", "cache", "content")),
     });
-    console.log("✓ AI content applied");
+
+    let hits = 0;
+
+    pages = await applyAiContent(
+      pages,
+      validated,
+      (request) => service.authorPage(request),
+      {
+        onProgress: ({ done, total, slug, cacheHit }) => {
+          if (cacheHit) hits += 1;
+          console.log(`  · ${done}/${total} ${slug}${cacheHit ? " (cached)" : ""}`);
+        },
+      },
+    );
+
+    console.log(
+      `✓ AI content applied (${pages.length - hits} generated, ${hits} from cache)`,
+    );
   }
 
   // Dual-write: the static files are always produced, because Next builds from

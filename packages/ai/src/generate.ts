@@ -1,10 +1,13 @@
 import { DEFAULT_CONTENT_PROFILE, type ContentProfile } from "@staticforge/schemas";
 
 import { getAnthropicClient } from "./client.js";
+import type { ContentCache } from "./cache.js";
 import type { PagePromptDetails } from "./prompts.js";
 import {
   AIGenerationService,
+  type AuthoredContent,
   type GeneratedPageContent,
+  type GenerationRequest,
 } from "./service.js";
 
 /**
@@ -55,4 +58,25 @@ export async function generatePageContent(
   return getService(profile).generatePageContent(details);
 }
 
-export type { GeneratedPageContent };
+/**
+ * Build a service wired to the ambient credential.
+ *
+ * The caller owns the cache, because only it knows where cached content should
+ * live — a repository directory, a temp dir in a test, or nowhere at all.
+ */
+export function createAnthropicService(options: {
+  profile?: ContentProfile;
+  cache?: ContentCache;
+  requireFacts?: boolean;
+}): AIGenerationService {
+  return new AIGenerationService({
+    client: getAnthropicClient(),
+    profile: options.profile ?? DEFAULT_CONTENT_PROFILE,
+    ...(options.cache !== undefined ? { cache: options.cache } : {}),
+    ...(options.requireFacts !== undefined
+      ? { requireFacts: options.requireFacts }
+      : {}),
+  });
+}
+
+export type { AuthoredContent, GeneratedPageContent, GenerationRequest };

@@ -1,4 +1,8 @@
-import type { PageSource, Prisma, PrismaClient } from "@prisma/client";
+// `Prisma` is a value import, not a type-only one: clearing a nullable Json
+// column requires the `Prisma.DbNull` sentinel. A plain `null` is rejected,
+// because for Json columns it is ambiguous with the JSON value `null`.
+import { Prisma } from "@prisma/client";
+import type { PageSource, PrismaClient } from "@prisma/client";
 import type {
   Business,
   GeneratedPage as EnginePage,
@@ -302,6 +306,13 @@ export async function saveGeneratedPages(
       schemaOrg: page.schemaOrg as Prisma.InputJsonObject,
       templateId: page.templateId,
       source,
+      // Provenance travels with the page or it is lost: cloud mode would
+      // otherwise silently drop the prompt, model and source fingerprint that
+      // the file output records.
+      generation:
+        page.generation === undefined
+          ? Prisma.DbNull
+          : (page.generation as unknown as Prisma.InputJsonObject),
       serviceId: page.serviceId,
       locationId: page.locationId,
     };

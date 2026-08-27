@@ -229,6 +229,11 @@ model GeneratedPage {
   templateId String     @default("default")
   source     PageSource @default(TEMPLATE)
 
+  /// Provenance of authored content: prompt version, model, content profile and
+  /// the source fingerprint. Null on deterministic template pages — there is no
+  /// model to attribute. Mirrors `PageGenerationSchema`.
+  generation Json?
+
   projectId  String
   project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   serviceId  String

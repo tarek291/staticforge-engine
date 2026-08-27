@@ -12,6 +12,9 @@ out/
 .next/
 next-env.d.ts
 
+# AI content cache (regenerable, may be large)
+data/cache/
+
 # Generated site output
 data/output/*
 !data/output/.gitkeep

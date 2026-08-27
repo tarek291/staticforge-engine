@@ -1,6 +1,12 @@
-import type { GeneratedPageContent, PagePromptDetails } from "@staticforge/ai";
-import { sleep } from "@staticforge/core";
+import {
+  buildGroundingFacts,
+  type AuthoredContent,
+  type GenerationRequest,
+} from "@staticforge/ai";
+import { sleep, stableHash } from "@staticforge/core";
 import { GeneratedPageSchema, type GeneratedPage } from "@staticforge/schemas";
+
+import type { Business, Location, Service } from "@staticforge/schemas";
 
 import { ValidationError, type ValidationIssue } from "./errors.js";
 import type { ValidatedInputData } from "./types.js";
@@ -29,19 +35,65 @@ export function isAiGenerationEnabled(): boolean {
 /**
  * Authors the content for one page.
  *
- * Structurally identical to `generatePageContent` from `@staticforge/ai`; it is
- * injected rather than imported directly so the merge can be tested against a
- * stub without any network call or API key.
+ * Structurally identical to `AIGenerationService.authorPage`; it is injected
+ * rather than imported directly so the merge can be tested against a stub
+ * without any network call or API key.
+ *
+ * Takes the full request — including the verified record and the cache
+ * identity — rather than three names, so the grounding gate and the cache are
+ * live in a real run instead of only in the AI package's own tests.
  */
 export type GenerateContentFn = (
-  details: PagePromptDetails,
-) => Promise<GeneratedPageContent>;
+  request: GenerationRequest,
+) => Promise<AuthoredContent>;
 
 /** Reported after each page is authored, for CLI progress output. */
 export interface AiProgress {
   done: number;
   total: number;
   slug: string;
+  /** Whether the content came from the cache rather than a paid call. */
+  cacheHit: boolean;
+}
+
+/**
+ * Fingerprint the source data behind one page.
+ *
+ * Covers everything the authored content is derived from: the business
+ * identity, the service, the city, and the shared content template. Edit any of
+ * them and the fingerprint moves, the cache misses, and the page is rewritten —
+ * which is the point. Leave them alone and a re-run costs nothing.
+ *
+ * Only the fields that actually reach the model or the grounding record are
+ * included. A change to, say, a service's internal id would otherwise force a
+ * pointless rewrite of identical prose.
+ */
+export function computeSourceHash(
+  business: Business,
+  service: Service,
+  location: Location,
+  content: ValidatedInputData["content"],
+): string {
+  return stableHash({
+    business: {
+      name: business.name,
+      description: business.description,
+      niche: business.niche,
+      foundedYear: business.foundedYear,
+      contactEmail: business.contactEmail,
+      contactPhone: business.contactPhone,
+      serviceIds: business.serviceIds,
+      locationIds: business.locationIds,
+    },
+    service: {
+      name: service.name,
+      description: service.description,
+      benefits: service.benefits,
+      pricing: service.pricing,
+    },
+    location: { city: location.city, state: location.state, country: location.country },
+    content,
+  });
 }
 
 /** Optional knobs for {@link applyAiContent}. */
@@ -122,10 +174,24 @@ export async function applyAiContent(
       throw new ValidationError("ai-content", missing);
     }
 
-    const content = await generateContentFn({
+    const sourceHash = computeSourceHash(business, service, location, input.content);
+
+    const { content, provenance } = await generateContentFn({
       businessName: business.name,
       serviceName: service.name,
       cityName: location.city,
+      // The verified record. Supplying it is what activates the grounding gate:
+      // without facts there is nothing to check a claim against.
+      facts: buildGroundingFacts(business, service, {
+        services: input.services,
+        locations: input.locations,
+      }),
+      cacheIdentity: {
+        businessId: page.businessId,
+        serviceId: page.serviceId,
+        locationId: page.locationId,
+        sourceHash,
+      },
     });
 
     const merged = {
@@ -134,6 +200,15 @@ export async function applyAiContent(
       metaDescription: content.metaDescription,
       h1: content.h1,
       content: content.content,
+      // Provenance travels with the page, so a later run can tell what wrote it
+      // without re-reading the text.
+      generation: {
+        promptVersion: provenance.promptVersion,
+        modelVersion: provenance.modelVersion,
+        profileId: provenance.profileId,
+        sourceHash,
+        generatedAt: new Date().toISOString(),
+      },
     };
 
     const result = GeneratedPageSchema.safeParse(merged);
@@ -148,7 +223,12 @@ export async function applyAiContent(
     }
 
     authored.push(result.data);
-    onProgress?.({ done: index + 1, total: pages.length, slug: page.slug });
+    onProgress?.({
+      done: index + 1,
+      total: pages.length,
+      slug: page.slug,
+      cacheHit: provenance.cacheHit,
+    });
 
     // Pace the calls — skipped after the final page, where the delay would
     // only add dead time before the run ends.

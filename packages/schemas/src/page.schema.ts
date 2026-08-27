@@ -126,6 +126,30 @@ export type PageContent = z.infer<typeof PageContentSchema>;
 export const SchemaOrgSchema = z.record(z.string(), z.unknown());
 export type SchemaOrg = z.infer<typeof SchemaOrgSchema>;
 
+/**
+ * Provenance of an authored page.
+ *
+ * Records *what produced this content*, so a later run can tell whether it is
+ * still current without re-reading the page: which prompt wrote it, which model
+ * answered, which quality policy judged it, and a fingerprint of the source
+ * data it was written from. When any of those change, the page is stale.
+ *
+ * Absent on deterministic template pages — there is no model to attribute.
+ */
+export const PageGenerationSchema = z.object({
+  /** Version of the prompt that produced this content. */
+  promptVersion: z.string().min(1),
+  /** Model that answered, e.g. "claude-opus-5". */
+  modelVersion: z.string().min(1),
+  /** Content profile the output was judged against. */
+  profileId: z.string().min(1),
+  /** Fingerprint of the business, service, location and content template. */
+  sourceHash: z.string().min(1),
+  /** ISO timestamp of the authoring run. */
+  generatedAt: z.string().min(1).optional(),
+});
+export type PageGeneration = z.infer<typeof PageGenerationSchema>;
+
 /** A fully resolved page ready to be rendered to static HTML. */
 export const GeneratedPageSchema = z.object({
   // Routable by construction: the slug becomes a URL segment.
@@ -144,5 +168,8 @@ export const GeneratedPageSchema = z.object({
   businessId: z.string(),
   serviceId: z.string(),
   locationId: z.string(),
+  // Present only on AI-authored pages. Optional and without a default, so
+  // template output and every existing payload are unchanged.
+  generation: PageGenerationSchema.optional(),
 });
 export type GeneratedPage = z.infer<typeof GeneratedPageSchema>;
