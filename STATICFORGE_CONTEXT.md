@@ -4,10 +4,11 @@
 instance. Generation, persistence, queueing, sync, headless editing and
 incremental publishing are all verified end to end, and an RBAC organization
 layer now gates every write and a shared token bucket keeps several workers
-inside one tenant's provider allowance. Not yet deployed, and there is still no
-authentication — Phase 23 decides what a user may do, not who they are.
+inside one tenant's provider allowance. Not yet deployed. Machine callers now
+authenticate with hashed per-organization API keys (Phase 25); people still do
+not authenticate at all.
 **Audience:** Product and platform planning for the SaaS layer.
-**Last updated:** 2026-08-28 (reflects phases 01–24)
+**Last updated:** 2026-08-28 (reflects phases 01–25)
 
 ---
 
@@ -38,9 +39,10 @@ boundary, the persistence layer, the job queue, the data-sync boundary, the
 headless editing API, the incremental publishing path and the distributed rate
 limiter are built, tested, and exercised against the real database. A change now re-authors only the pages it
 actually reached, and a drained queue triggers the static host's build.
-**What remains is the commercial surface: authentication, deployment, and
-billing.** Authorization and tenant scoping are built as of Phase 23; proving
-*who* a caller is, rather than taking their word for it, is not.
+**What remains is the commercial surface: human authentication, deployment, and
+billing.** Authorization and tenant scoping are built as of Phase 23, and a
+machine caller can prove which organization it is as of Phase 25. Proving *which
+person* a caller is, rather than taking their word for it, is not.
 
 ---
 
@@ -651,14 +653,103 @@ observable through a mocked client, which is why the concurrency guarantee is
 verified against the live database and reported with the change rather than
 asserted in a suite that never opens a connection.
 
-### 3.16 SEO publishing and internal linking *(Phases 05–06)*
+### 3.16 Organizational API keys *(Phase 25)*
+
+The sync webhook trusted a single `STATICFORGE_WEBHOOK_SECRET`. That value
+authenticated the *caller* and said nothing about which tenant they were, so
+anyone holding it could sync any project the operator owned. The endpoint's own
+comment named this as the reason it could never be handed to a customer.
+
+Keys replace it, and the old path was **deleted** rather than left beside the
+new one. Two ways in means the weaker one defines the security, and a
+dead-but-exported shared-secret verifier is a working alternative sitting in the
+public API of `@staticforge/core`, waiting for someone to wire it back in.
+
+**Only a hash is stored.** `generateApiKey` returns the plaintext, nothing
+persists it, and no other function can produce it. A database dump, a log
+aggregator, a support engineer with `SELECT`, or a backup left in a bucket
+yields a list of values that cannot be replayed. The cost — a lost key is
+replaced, not recovered — is stated by the command at the moment it matters.
+
+**Why SHA-256 and not bcrypt.** Slow hashes exist to make *low-entropy* secrets
+expensive to guess. A key here is 256 bits of `randomBytes`, so there is nothing
+to guess at any work factor: an attacker who cannot find the key cannot
+brute-force it, and one who has it does not need to.
+
+What a slow, salted hash would actually cost is the ability to *look one up*.
+Verification would become a scan of every key row with a comparison each — O(n)
+per request, growing as a customer adds keys — where a fast hash over a
+high-entropy secret is a single indexed lookup. The unique constraint on
+`keyHash` is what makes that lookup, and it also makes a collision impossible
+rather than improbable.
+
+**The key does not carry the organization it grants.** A credential containing
+its own identity leaks that identity to anyone who sees it in a log line, a bug
+report or a screenshot — and, worse, invites code that reads the tenant *out of
+the key* rather than out of the row the key resolves to. The first such reader
+turns a forged prefix into a tenant crossing. So `sf_org_` names the *kind* of
+principal, not a particular one, and which organization a key belongs to is
+discoverable only by presenting it. The prefix is fixed because a fixed prefix
+is what lets secret scanners recognise one of these in a public repository
+before somebody else does.
+
+**A key is a member of its organization**, and that is the decision the rest
+follows from. A verified key resolves to an organization, and then something has
+to decide whether it may do what it is asking. The alternative to reusing the
+role gate is a second permission path just for keys — and a second path is how
+one of them ends up missing a check the other has.
+
+So a key gets a principal id (`apikey:<id>`) and a membership row written in the
+same transaction as the key itself: either both exist or neither does, because a
+key with no membership would authenticate and then be refused everything, which
+reads as a permissions bug rather than as the half-finished write it is. Every
+existing `requireCapability` call works on it unchanged.
+
+It defaults to **EDITOR** — enough to sync and to queue generation, not enough
+to delete a project or manage members, and therefore not enough to mint another
+key. A credential that can create its own successors survives its own
+revocation.
+
+**The endpoint asks three questions and the order is load-bearing:**
+
+1. *Who is this?* An unresolvable key stops before anything reads a project. An
+   endpoint that touched a project first would give an unauthenticated caller a
+   way to measure which ids exist.
+2. *Is the project theirs?* A project in another organization answers exactly as
+   a project that is not there. Two different answers would turn a valid key for
+   one tenant into a probe for every other tenant's project ids.
+3. *May they do this?* `requireCapability`, inside the operation — so a key
+   issued as a VIEWER authenticates and is still refused the write.
+
+Absent, malformed, unknown and revoked are four things internally and one answer
+to a caller. Three extra messages are three bits of information handed to
+whoever is guessing.
+
+**Revocation stamps a time rather than deleting the row.** The audit trail still
+needs to say which key did something last month and when it was stopped; a
+deleted row takes that answer with it. It also deletes the membership, so the
+principal loses access by two independent mechanisms rather than one.
+
+The authorisation rule lives in `@staticforge/database` as
+`authorizeProjectAccess`, not in the route. A decision written inside an HTTP
+handler can only be tested by standing up an HTTP handler, and a rule that is
+hard to test gets one test instead of twelve. The route turns a verdict into a
+status code and does nothing else.
+
+**This is machine authentication, not human authentication.** An organization
+can now prove it holds a credential. There is still no user table, no session
+and no login, so on every path other than this webhook a human `userId` is
+asserted by the caller rather than proved — and the two must not be confused
+when reading the gaps below.
+
+### 3.17 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.17 Zero-JavaScript presentation layer
+### 3.18 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -677,15 +768,15 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.18 Test coverage
+### 3.19 Test coverage
 
-**1020 tests across 52 files in six packages**, all under Vitest, all passing.
+**1065 tests across 53 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
 | `ai` | 243 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop |
-| `core` | 280 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, tenant paths, job budget |
-| `database` | 238 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail and the rate limiter's statement shape — entirely against a mocked Prisma client |
+| `core` | 290 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, tenant paths, job budget |
+| `database` | 273 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle — entirely against a mocked Prisma client |
 | `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
 | `cli` | 50 | Pipeline stages, the standalone worker, and queue-drain detection |
@@ -715,6 +806,7 @@ migration.
 
 ```
 Organization  →  OrganizationMember[]   (OWNER | EDITOR | VIEWER)
+              →  ApiKey[]                (SHA-256 hashed; each is also a member)
               →  Workspace  →  Project  →  Business
                        →  ContentTemplate
                        →  Service[]
@@ -839,9 +931,10 @@ mean something.
 
 ### Known gaps, stated plainly
 
-- **No authentication.** Authorization exists and is enforced as of Phase 23,
-  but `userId` is asserted by the caller and never proved. Do not read "we have
-  RBAC" as "we have auth".
+- **No authentication for people.** Machine callers authenticate with API keys
+  as of Phase 25, and authorization is enforced as of Phase 23 — but a human
+  `userId` is still asserted by the caller and never proved. Do not read "we
+  have RBAC" or "we have API keys" as "we have auth".
 - **No row-level security.** Tenant isolation is application-level `where`
   clauses only; the database would not refuse a query that forgot one.
 - **The gate is only as complete as its call sites.** `syncProject` and

@@ -2,14 +2,15 @@
 
 A schema-driven static site generation engine, organized as a pnpm monorepo.
 
-> **Status:** 🟢 Phases 01–24 delivered. End-to-end pipeline working against a
+> **Status:** 🟢 Phases 01–25 delivered. End-to-end pipeline working against a
 > live Supabase PostgreSQL instance, with a standalone queue worker, a data-sync
 > boundary, headless block editing, database-backed templates, a plugin runtime,
 > a read-only AI gap analyst, incremental publishing that re-authors only the
 > pages a change reached, an RBAC organization layer with a database audit
-> trail, and a distributed token bucket that keeps several workers inside one
-> tenant's provider allowance. **Not yet deployed, and there is no
-> authentication layer** (Phase 23 added authorization, not identity) — see
+> trail, a distributed token bucket that keeps several workers inside one
+> tenant's provider allowance, and hashed per-organization API keys. **Not yet deployed, and there is no
+> authentication layer for people** (Phase 23 added authorization; Phase 25
+> added machine credentials, not human identity) — see
 > [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md)
 > for the full state and the outstanding technical debt.
 
@@ -93,7 +94,7 @@ corepack pnpm generate    # run the generator pipeline → data/output/
 corepack pnpm dev:web     # start the Next.js dev server
 corepack pnpm build:web   # build the static site
 corepack pnpm typecheck   # typecheck every workspace package
-corepack pnpm test        # run every package's test suite (1020 tests)
+corepack pnpm test        # run every package's test suite (1065 tests)
 corepack pnpm verify      # generate + typecheck (all) + test (all) + web build
 ```
 
@@ -104,6 +105,7 @@ corepack pnpm staticforge build --project-id <id>    # generate one tenant's pro
 corepack pnpm staticforge worker                     # claim and run queued jobs
 corepack pnpm staticforge sync --project-id <id> --url <csv> --dry-run
 corepack pnpm staticforge analyze --project-id <id>  # AI gap analysis (read-only)
+corepack pnpm staticforge api-keys create --org-id <id> --name "CI pipeline"
 corepack pnpm staticforge help
 ```
 
@@ -129,7 +131,8 @@ data/output/
 Phases 01–13 established the content contract and the AI engine; phases 14–20
 turned it into a service; phases 21–22 made publishing incremental; phase 23
 added the enterprise layer; phase 24 made rate limiting survive a second
-worker. Every phase below is merged into `main`.
+worker; phase 25 gave organizations a credential they can prove they hold.
+Every phase below is merged into `main`.
 
 ### 01–13 — engine and hardening (summary)
 
@@ -502,6 +505,82 @@ STATICFORGE_RATE_LIMIT_REFILL_PER_SEC=2600    # sustained ceiling
 A refill rate of `0` is a valid policy — a hard quota that never tops up. A
 bucket in that state that lacks the tokens is reported as exhausted rather than
 as a wait, because waiting would never help.
+
+
+### 25 — Organizational API keys
+
+The sync webhook used to trust a single `STATICFORGE_WEBHOOK_SECRET`. That value
+authenticated the *caller* and said nothing about which tenant they were, so
+anyone holding it could sync any project the operator owned — one trust domain,
+and the reason the endpoint could never be handed to a customer. Keys replace
+it, and the old path was **deleted** rather than left beside the new one: two
+ways in means the weaker one defines the security.
+
+```bash
+corepack pnpm staticforge api-keys create --org-id <id> --name "CI pipeline"
+corepack pnpm staticforge api-keys list   --org-id <id>
+corepack pnpm staticforge api-keys revoke --org-id <id> --key-id <id>
+```
+
+The plaintext is printed **once**. Nothing stores it, and no function can
+produce it again — a lost key is replaced, not recovered.
+
+**Only a hash is stored, and it is SHA-256 rather than bcrypt.** Slow hashes
+exist to make *low-entropy* secrets expensive to guess; a key here is 256 bits
+of `randomBytes`, so there is nothing to guess at any work factor. What a salted
+hash would actually cost is the ability to look one up: verification would
+become a scan of every key row with a comparison each — O(n) per request, and
+slower as a customer adds keys. A fast hash over a high-entropy secret is
+indexable and gives up nothing that matters here.
+
+**The key does not contain the organization it grants.** A credential carrying
+its own identity leaks that identity to anyone who sees it in a log line or a
+screenshot, and invites code that reads the tenant *out of the key* rather than
+out of the row it resolves to — the first such reader turns a forged prefix into
+a tenant crossing. `sf_org_` names the *kind* of principal, not a particular
+one. The prefix is fixed because a fixed prefix is what lets secret scanners
+recognise one of these in a public repository before someone else does.
+
+**A key is a member of its organization.** That is the decision the rest follows
+from: the alternative is a second permission path just for keys, and a second
+path is how one of them ends up missing a check the other has. A key gets a
+principal id (`apikey:<id>`) and a membership row written in the same
+transaction, so every existing `requireCapability` call works on it unchanged.
+
+It defaults to **EDITOR** — enough to sync, not enough to delete a project or
+add members, and therefore **not enough to mint another key**. A credential that
+can create its own successors survives its own revocation. `--role VIEWER` makes
+a read-only integration key.
+
+**The endpoint asks three questions, in an order that is load-bearing:**
+
+1. **Who is this?** An unresolvable key stops before anything reads a project —
+   an endpoint that touched one first would let an unauthenticated caller
+   measure which ids exist.
+2. **Is the project theirs?** A project in another organization answers exactly
+   as a project that is not there. Two different answers would turn a valid key
+   for one tenant into a probe for every other tenant's project ids.
+3. **May they do this?** `requireCapability`, inside the operation — so a key
+   issued as a VIEWER authenticates and is still refused the write.
+
+Absent, malformed, unknown and revoked are four things internally and **one
+answer** to a caller: `401 Unauthorized`. Three extra messages are three bits
+handed to whoever is guessing.
+
+**Revocation stamps a time rather than deleting the row** — the audit trail
+still needs to say which key did something last month and when it was stopped —
+and it deletes the membership, so the principal loses access by two independent
+mechanisms.
+
+The rule lives in `@staticforge/database` (`authorizeProjectAccess`) rather than
+in the route. A decision written inside an HTTP handler can only be tested by
+standing up an HTTP handler, and a rule that is hard to test gets one test
+instead of twelve.
+
+> **This is machine authentication, not human authentication.** An organization
+> can now prove it holds a credential. There is still no user table, no session
+> and no login, so on every path other than this webhook a human `userId` is
+> asserted by the caller rather than proved.
 
 ---
 
