@@ -2,7 +2,12 @@
 
 A schema-driven static site generation engine, organized as a pnpm monorepo.
 
-> **Status:** 🟢 MVP — end-to-end pipeline working: structured data → validated pages → static HTML routes.
+> **Status:** 🟢 Phases 01–20 delivered. End-to-end pipeline working against a
+> live Supabase PostgreSQL instance, with a standalone queue worker, a data-sync
+> boundary, headless block editing, database-backed templates, a plugin runtime,
+> and a read-only AI gap analyst. **Not yet deployed, and there is no
+> authentication layer** — see [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md)
+> for the full state and the outstanding technical debt.
 
 ---
 
@@ -23,9 +28,11 @@ staticforge-engine/
 │  └─ web/              # Next.js front-end / preview app
 ├─ packages/
 │  ├─ schemas/          # Shared data schemas & validation
-│  ├─ core/             # Core engine logic
+│  ├─ core/             # Core engine logic, sync adapters, plugin runtime
 │  ├─ generator/        # Static site generation pipeline
-│  ├─ templates/        # Site templates
+│  ├─ database/         # Prisma data access, multi-tenant repository, job queue
+│  ├─ cli/              # The `staticforge` binary: build | worker | sync | analyze
+│  ├─ templates/        # Site templates (placeholder — still empty)
 │  └─ ai/               # AI-assisted generation helpers
 ├─ data/
 │  ├─ input/            # Source input data
@@ -82,8 +89,18 @@ corepack pnpm generate    # run the generator pipeline → data/output/
 corepack pnpm dev:web     # start the Next.js dev server
 corepack pnpm build:web   # build the static site
 corepack pnpm typecheck   # typecheck every workspace package
-corepack pnpm test        # run every package's test suite
+corepack pnpm test        # run every package's test suite (830 tests)
 corepack pnpm verify      # generate + typecheck (all) + test (all) + web build
+```
+
+Database-backed commands, via the `staticforge` binary:
+
+```bash
+corepack pnpm staticforge build --project-id <id>    # generate one tenant's project
+corepack pnpm staticforge worker                     # claim and run queued jobs
+corepack pnpm staticforge sync --project-id <id> --url <csv> --dry-run
+corepack pnpm staticforge analyze --project-id <id>  # AI gap analysis (read-only)
+corepack pnpm staticforge help
 ```
 
 ### Generated output structure
@@ -100,6 +117,140 @@ data/output/
 - `/` — home (reads the manifest, lists sample slugs)
 - `/bueroreinigung-duisburg`
 - `/grundreinigung-essen`
+
+---
+
+## Delivered phases
+
+Phases 01–13 established the content contract and the AI engine; phases 14–20
+turned it into a service. Every phase below is merged into `main`.
+
+### 01–13 — engine and hardening (summary)
+
+| Phase | Delivered |
+| --- | --- |
+| 01 | Strict content contract and validation schemas |
+| 02 | AI content engine under strict Zod enforcement |
+| 03 | Fact grounding and hallucination rejection guards |
+| 04 | Content versioning and the caching layer |
+| 05 | Internal linking graph and contextual linking rules |
+| 06 | SEO publishing layer — sitemaps, metadata, rendered links |
+| 07 | Scale test: 500 pages, benchmark metrics, language-neutral cleanup |
+| 08 | Unified deploy pipeline (generate → validate → build) |
+| 09 | Visual templates decoupled from content profiles |
+| 10 | Minimal dashboard for engine orchestration |
+| 11 | SaaS foundation: `siteUrl`, tenant isolation, async generation jobs |
+| 12 | Autonomous refresh loop with feedback prompts and targeted rewrites |
+| 13 | Atomic writes, dynamic timeouts, DB retries, and the SF-01…SF-25 security audit sweep |
+
+### 14 — Standalone queue worker, progress tracking, job resumability
+
+The engine moved out of the web server. The `GenerationJob` table *is* the
+queue — no broker, because Postgres already holds the row the dashboard polls.
+
+- `claimNextJob` takes a job with a **conditional update** whose `where` repeats
+  the condition that made it claimable, so the claim is decided by the database
+  rather than by the gap between reading and writing. Safe without
+  `FOR UPDATE SKIP LOCKED`.
+- A `RUNNING` job whose lease lapsed is **reclaimed, not failed** — failing it
+  would discard content the tenant already paid for.
+- **Resumability:** a stored AI page is reused only when its `sourceHash`
+  matches what this run computes. A 500-page run killed at 400 costs 100 pages.
+- `progress` is derived from the counts, so a bar reading 80% beside "12/500" is
+  unrepresentable.
+- The jobs route now writes one row and answers `202`; process spawning and
+  supervision left the Next.js process entirely.
+
+Run it with `corepack pnpm staticforge worker`.
+
+### 15 — Data sync layer, webhooks, and change detection
+
+One boundary for external data, drawn once instead of once per source.
+
+- A `DataSyncAdapter` does **shape only** — no I/O, no database, no policy. Both
+  shipped adapters reduce to the entity schemas.
+- **Pull:** `staticforge sync --project-id <id> --url <csv>`, with `--dry-run`.
+  The URL is guarded: http(s) only, no loopback or private ranges, size cap,
+  timeout.
+- **Push:** `POST /api/webhooks/sync`. The token is hashed and compared with
+  `timingSafeEqual`; an unset or placeholder `STATICFORGE_WEBHOOK_SECRET`
+  refuses every call.
+- **Change detection:** incoming data is fingerprinted over the fields that
+  reach a page — not `updatedAt`, not row order. No difference, no write, no
+  job. Without it, a nightly cron re-uploading the same sheet re-buys hundreds
+  of pages of identical prose.
+- **An absent collection is not an empty one.** A sheet with no recognisable
+  rows is refused, because an unpublished Google Sheet returns an HTML sign-in
+  page that parses as a header with zero rows.
+
+### 16–17 — Headless block patching with strict re-validation
+
+`PATCH /api/dashboard/projects/[id]/pages/[slug]/block`, built on the premise
+that a partial edit is *more* dangerous than a whole rewrite.
+
+- `parseBlockPath` / `getAtPath` / `setAtPath` refuse prototype-chain segments
+  at any depth, never auto-vivify (so `content.hero.titel` fails instead of
+  growing a field), treat an out-of-range index as a mistake rather than an
+  append, and never mutate their input.
+- The merged result passes the **same three gates a model's answer faces** —
+  structural contract, quality profile, verified record. Any failure discards
+  the patch whole; the published page is untouched.
+- Only the authored slice is editable. Slugs, entity ids and the link graph are
+  not. `schemaOrg` is realigned when the copy it describes changes.
+- A successful patch stamps `source: MANUAL`, protecting the edit from the next
+  generation run.
+
+### 18 — Dynamic templates and content profiles
+
+Profiles and templates became rows instead of compile-time constants.
+
+- `ContentProfile` and `Template` carry `key`, `name`, JSON `definition`,
+  `isGlobal`, and an owner. `key` is separate from `id` so two tenants can each
+  have a "premium" profile.
+- The owner column is **not nullable** — a `__global__` sentinel, because
+  `UNIQUE(key, userId)` over a nullable owner would accept two rows both
+  claiming to be the global default.
+- Definitions are parsed out of the database against the engine's own schemas. A
+  malformed row is an error naming that row and field — never skipped.
+- **A definition configures a view that already exists in code; it cannot
+  introduce one.** A template carrying markup or component code from a row into
+  a React tree would be remote code execution with a marketplace's branding on
+  it. `.strict()` throughout.
+
+### 19 — Event-driven plugin architecture
+
+Extensible without becoming editable.
+
+- **Listeners observe; they do not transform.** Payloads are flat, frozen,
+  already-serialisable summaries. A plugin able to alter content after the three
+  gates could publish anything.
+- **A failing plugin cannot fail a run:** throws and rejections are caught per
+  listener, `emit` never rejects, and the thrown value reaches the failure
+  report rather than being discarded.
+- **A hang is a failure too** — listeners run under a deadline and are abandoned
+  past it.
+- A plugin whose `setup` throws is skipped and reported; the rest install.
+  Listeners are auto-tagged with their plugin's name, so none can register
+  anonymously and later be unattributable.
+
+### 20 — Proactive AI gap analyst
+
+The engine's first proactive model call: not "write this page" but "what should
+the operator do next".
+
+- The engine computes which service-in-city pairs are missing (a set difference,
+  exact and free); the model advises which of them matter and why.
+  `--gaps-only` answers the question without buying an opinion about it.
+- **Two gates:** a strict schema with a floor on every rationale, then a
+  grounding check that matches each recommendation back against the catalogue
+  the model was shown. Unmatched, duplicate or already-covered rows are dropped
+  **and reported** — the discard count is the signal.
+- **Read-only by construction:** the agent module imports no database client, no
+  queue, no file handle. It cannot enqueue what it recommends.
+- Not cached, deliberately — a cached analysis is stale advice with a fresh
+  timestamp.
+
+Run it with `corepack pnpm staticforge analyze --project-id <id>`.
 
 ---
 

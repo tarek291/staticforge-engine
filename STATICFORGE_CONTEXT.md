@@ -1,8 +1,10 @@
 # StaticForge — Architecture & Capability Briefing
 
-**Status:** Engine complete, data loop closed. Not yet connected to a live database or deployed.
+**Status:** Engine complete and running against a live Supabase PostgreSQL
+instance. Generation, persistence, queueing, sync and headless editing are all
+verified end to end. Not yet deployed, and there is still no authentication.
 **Audience:** Product and platform planning for the SaaS layer.
-**Last updated:** 2026-08-27
+**Last updated:** 2026-08-28 (reflects phases 01–20)
 
 ---
 
@@ -22,41 +24,48 @@ pages that rank for nothing.
 
 StaticForge takes structured business data — services, locations, contact
 identity, a content template — and produces validated, statically rendered
-landing pages for every eligible service-and-city combination. Content can be
-assembled deterministically from templates or authored by Claude under a strict
-schema contract. Every page is validated against a shared data contract before
-it is written, so invalid output cannot reach a build.
+landing pages for every eligible service-and-city pair. Content can be assembled
+deterministically from templates or authored by Claude under a strict schema
+contract, grounded in verified facts. Every page is validated against a shared
+data contract before it is written, so invalid output cannot reach a build.
 
-The engine currently runs as a local tool and as a database-backed multi-tenant
-service. The multi-tenant data model, the tenant isolation boundary, and the
-persistence layer are built and tested. **What remains is the commercial surface
-around it: authentication, a dashboard, hosting, and billing.**
+The engine runs as a local CLI, as a database-backed multi-tenant service, and
+as a standalone queue worker. The multi-tenant data model, the tenant isolation
+boundary, the persistence layer, the job queue, the data-sync boundary and the
+headless editing API are built, tested, and exercised against the real database.
+**What remains is the commercial surface: authentication and tenant scoping,
+deployment, and billing.**
 
 ---
 
 ## 2. Architecture & Tech Stack
 
-A pnpm monorepo of six workspace packages plus a Next.js application, in
+A pnpm monorepo of seven workspace packages plus a Next.js application, in
 TypeScript under strict mode across every package.
 
 | Package | Responsibility |
 | --- | --- |
 | `@staticforge/schemas` | Shared Zod data contracts. The single source of truth for every entity shape. |
-| `@staticforge/core` | Pure utilities: slug generation, SEO helpers, phone normalization, CSV ingestion. |
+| `@staticforge/core` | Pure utilities: slugs, SEO, phone normalization, CSV ingestion, link graph, content hashing, block-path patching, plugin runtime, sync adapters. |
 | `@staticforge/generator` | The pipeline: load → validate → build → author → persist. |
-| `@staticforge/ai` | Claude integration with schema-constrained structured output. |
-| `@staticforge/database` | Prisma data access, multi-tenant repository, seed. |
-| `@staticforge/templates` | Reserved for extracting the presentation layer. Not yet populated. |
-| `apps/web` | Next.js 15 static site generator and preview surface. |
+| `@staticforge/ai` | Claude integration: schema-constrained output, grounding, caching, retry, refresh loop, gap-analysis agent. |
+| `@staticforge/database` | Prisma data access, multi-tenant repository, job queue, seed. |
+| `@staticforge/cli` | The `staticforge` binary: `build`, `worker`, `sync`, `analyze`. |
+| `@staticforge/templates` | Reserved for extracting the presentation layer. **Still an empty placeholder.** |
+| `apps/web` | Next.js 15 static site generator, preview surface, dashboard, and headless API. |
 
 **Language and validation.** TypeScript strict mode is enabled repo-wide, with
 `noUncheckedIndexedAccess`, `noUnusedLocals`, and `verbatimModuleSyntax` on.
 Zod carries the runtime contract. The two are deliberately not redundant: the
 compiler governs code, Zod governs data crossing a boundary — file input, model
-output, database rows, and the manifest the web app reads at build time.
+output, database rows, webhook payloads, editor patches, and the manifest the
+web app reads at build time.
 
-**Persistence.** Prisma ORM against PostgreSQL, targeting Supabase. The schema
-is written and validated; no database is connected yet.
+**Persistence.** Prisma ORM against PostgreSQL on Supabase. **The database is
+connected and in use.** The schema has been pushed with `db push`, the seed runs
+against it, and generation, queueing and page persistence have each been
+verified against the live instance rather than against mocks alone. The
+connection string lives in a git-ignored `.env`.
 
 **AI.** The Anthropic SDK, using Claude Opus 5 with adaptive thinking. Output is
 constrained by converting the Zod contract to JSON Schema for a forced tool
@@ -110,7 +119,7 @@ machine that has no database.
 This matters commercially: the same engine serves a local power user, a hosted
 tenant, and a CI build, without a fork.
 
-### 3.3 AI content generation
+### 3.3 AI content generation, grounding and caching
 
 Content authoring is strictly opt-in behind an environment flag. Without it the
 pipeline is deterministic and free.
@@ -121,18 +130,28 @@ tool arguments are then parsed back through Zod before anything downstream sees
 them — the model can fail, but it cannot silently produce a differently shaped
 page.
 
-The system prompt targets *information gain*: content that says something the
-ten competing pages do not, with an explicit prohibition on invented prices,
-credentials, and review counts. It instructs the model to write in the language
-of the input data rather than naming any language, which keeps the engine
-locale-agnostic.
-
 **Critically, the model is only asked for what it can legitimately author** —
 title, meta description, H1, and body content. Slugs, locale, template
 selection, and entity identifiers are resolved deterministically by the engine
 and merged in afterwards. The model is never in a position to invent an
 identifier or rename a published URL. Every merged page is re-validated before
 it is persisted.
+
+**Fact grounding.** Generated copy is checked against the verified record the
+engine actually holds. Invented prices, credentials, certifications and review
+counts are rejected rather than published — a page claiming a licence the
+operator does not hold is a liability, not a lead. Grounding is a gate on the
+way in, not a lint applied afterwards.
+
+**Caching and versioning.** Authored content is fingerprinted over the inputs
+that actually reach a page — business, service, city, template, prompt version —
+so an unchanged page is not re-authored and not re-billed. A prompt change
+invalidates the cache by design, because the same inputs under a new prompt are
+not the same request.
+
+**The refresh loop.** Pages can be re-authored selectively against feedback
+rather than regenerated wholesale, so improving one section does not cost a full
+rebuild of content that was already correct.
 
 Calls are paced with a delay between pages to stay inside provider rate limits,
 and the pass fails fast rather than continuing past an error, since every
@@ -142,8 +161,8 @@ iteration is a paid call.
 
 In database mode, pages are written to both PostgreSQL and the static JSON
 output. The files are not a legacy path: the Next.js build reads them, so they
-are required in both modes. The database is the queryable record a dashboard
-will read.
+are required in both modes. The database is the queryable record the dashboard
+reads.
 
 The database write is a single atomic transaction. Within it, pages whose slugs
 this run no longer produces are deleted *before* the remaining pages are
@@ -154,51 +173,224 @@ see and whose presence makes the insert fail. A partial failure leaves the
 tenant's pages exactly as they were.
 
 Each stored page records its provenance — template-assembled, AI-authored, or
-manually edited — which the dashboard will need to show operators what has been
-touched and by what.
+manually edited — and a manually edited page is protected from being overwritten
+by a later generation run.
 
-### 3.5 Zero-JavaScript presentation layer
+### 3.5 Queue worker and job resumability *(Phase 14)*
 
-Two templates are registered: a clean default and a dark, high-ticket
-"luxury landing" design. Any page can be previewed through any template on a
-dedicated static preview route, without touching the canonical site.
+The engine runs **outside the web server**. The `GenerationJob` table is the
+queue; there is no broker, because a second thing to run, secure and reason
+about is not worth it for a workload measured in jobs per hour, and Postgres
+already holds the row the dashboard polls.
+
+- **The claim is decided by the database.** `claimNextJob` picks a candidate and
+  then takes it with a *conditional* update whose `where` repeats the condition
+  that made it claimable. Two workers racing for the same row both issue that
+  update; Postgres serialises them, the first wins, the second matches nothing
+  and moves on. Safe without `FOR UPDATE SKIP LOCKED` and the raw SQL it needs.
+- **Lapsed leases are reclaimed, not failed.** A `RUNNING` job whose lease
+  expired becomes claimable again. Failing it would throw away content the
+  tenant has already paid for.
+- **Runs resume.** Stored AI pages are reused only when their `sourceHash`
+  matches what this run computes — same business, service, city and template.
+  Anything else is authored again rather than trusted. A five-hundred-page run
+  killed at four hundred costs a hundred pages, not five hundred.
+- **Progress is derived, not reported.** `progress` comes from the counts, so a
+  bar reading 80% beside "12/500" is unrepresentable.
+
+The jobs API route writes one row and answers `202`. Spawning and supervising
+the engine inside the Next.js process is gone: the web tier can now be
+restarted, replicated and deployed without destroying work in flight.
+
+Verified against Supabase: a job enqueued through the real path was claimed by
+`staticforge worker`, run to completion at 100% (9/9, exit 0), with the lease
+released and output written to the project's isolated directory.
+
+### 3.6 Data sync layer and webhooks *(Phase 15)*
+
+A tenant's services and locations live somewhere before they live here. This is
+the boundary they cross, drawn once instead of once per source.
+
+- **Adapters do shape, nothing else.** A `DataSyncAdapter` takes one source's
+  native form and produces the engine's entities, or says precisely why it
+  cannot. No I/O, no database, no policy. Both shipped adapters reduce to the
+  entity schemas, because an adapter validating its own way would become a
+  second definition of a service and the two would drift.
+- **Pull:** `staticforge sync --project-id <id> --url <csv>` fetches a published
+  sheet and applies it; `--dry-run` reports what would change and writes
+  nothing. The URL is checked — http(s) only, no loopback or private ranges, a
+  size cap and a timeout — because the day a "sync from a URL" field reaches the
+  dashboard is the day SSRF matters.
+- **Push:** `POST /api/webhooks/sync` takes the same payload as JSON. The token
+  is compared by hashing both sides and using `timingSafeEqual`. An unset or
+  placeholder `STATICFORGE_WEBHOOK_SECRET` refuses every call: a forgotten
+  environment variable must fail closed on a route that writes tenant data and
+  queues paid work.
+- **Change detection is the point.** These sources re-send by nature. Incoming
+  data is fingerprinted over the fields that actually reach a page — not
+  `updatedAt`, not row order — and compared before anything is written. No
+  difference, no write, no job. Without this, a nightly cron re-uploading the
+  same sheet is a standing order to re-buy a few hundred pages of identical
+  prose.
+- **An absent collection is not an empty one.** A sheet listing only locations
+  must not read as an instruction to delete every service. Relatedly, a sheet
+  with no recognisable rows is refused: an unpublished Google Sheet returns an
+  HTML sign-in page that parses as a header with zero rows, and handed on as
+  data it would clear the project.
+
+### 3.7 Headless block editing *(Phases 16–17)*
+
+The infrastructure a visual editor needs, built on the premise that a partial
+edit is *more* dangerous than a whole rewrite. A rewrite arrives as a complete
+page and is judged as one; a patch arrives as a fragment and looks too small to
+check. An editor that clears a required heading sends a perfectly well-formed
+request, and a person typing a phone number into a text box is exactly as
+unverified as a model inventing one.
+
+`PATCH /api/dashboard/projects/[id]/pages/[slug]/block` applies a scoped edit.
+
+- **Path safety.** A block path is a string the client chose, driving a mutation
+  of a structure the client does not own. Segments naming the prototype chain
+  are refused at any depth. Nothing is auto-vivified, so `content.hero.titel`
+  fails instead of growing a field. An index past the end of a list is a
+  mistake, not an append. Nothing mutates its input.
+- **The same three gates a model faces.** The merged result goes through the
+  structural contract, the quality profile the page names, and the verified
+  record. A failure at any gate discards the patch whole — there is no partial
+  application, and the published page is untouched.
+- **What cannot move.** Only the authored slice is editable. Slugs are published
+  URLs and every inbound link pointing at them; the link graph is computed over
+  the whole build; entity ids are what the page *is*. `schemaOrg` is not
+  editable but is realigned when the copy it describes changes.
+- **Provenance.** A successful patch stamps `source: MANUAL`, which protects the
+  edit from the next generation run.
+
+### 3.8 Dynamic templates and content profiles *(Phase 18)*
+
+Profiles and templates were compile-time constants, which made every new policy
+a code change and a deploy — the wrong shape for something a tenant is meant to
+pick and eventually buy. They are rows now: `ContentProfile` and `Template`,
+each with a `key`, a `name`, a JSON `definition`, `isGlobal`, and an owner.
+
+- `key` is separate from `id` because two tenants must both be able to have a
+  "premium" profile, which a shared primary key would forbid.
+- The owner column is **not nullable**. Postgres treats NULL as distinct from
+  every other NULL, so `UNIQUE(key, userId)` over a nullable owner would accept
+  two rows both claiming to be the global "default" — the exact duplicate the
+  constraint exists to prevent. A `__global__` sentinel makes the constraint
+  mean what it reads as.
+- Every definition is parsed on the way out of the database against the same
+  schemas the engine's types come from. A malformed row is an error naming that
+  row and the field that failed — not skipped, because a skipped tenant override
+  would silently restore the global policy the tenant had edited away from.
+- **A template definition names a view that already exists in code and
+  configures it. It cannot introduce one.** That boundary is the whole security
+  story: a template carrying markup or component code from a row into a React
+  tree would be remote code execution with a marketplace's branding on it. So
+  selling a template means selling a configuration; a genuinely new look stays a
+  code change. `.strict()` throughout.
+
+### 3.9 Plugin architecture *(Phase 19)*
+
+The engine needs to be extensible without becoming editable — different things,
+and the difference decided the design.
+
+- **Listeners observe; they do not transform.** A hook that took a value and
+  returned a changed one would be a hole through everything the engine is:
+  content passes three gates before publication, and a plugin able to alter
+  content after those gates could publish anything. Payloads are flat,
+  already-serialisable summaries — ids, counts, slugs — and they are frozen.
+- **A failing plugin cannot fail a run.** Each listener is isolated: throws and
+  rejections are caught, the next listener still runs, and `emit` never rejects.
+  The thrown value is carried into the failure report rather than discarded.
+- **A hang is a failure too, and the quieter one.** Listeners run under a
+  deadline and are abandoned past it. Nothing can cancel arbitrary code; it can
+  decline to wait.
+- **Setup failures are survived.** A plugin whose `setup` throws is skipped and
+  reported; the rest install. Listeners are tagged with their plugin's name
+  automatically, so a plugin cannot register anonymously and then be
+  unattributable when it misbehaves.
+
+Emission points include the worker after a job's verdict is durable, and the
+sync layer on both outcomes.
+
+### 3.10 Gap analyst *(Phase 20)*
+
+The engine's first *proactive* use of a model. Every previous call answered a
+question the engine had already framed — write this page, revise that paragraph.
+This one asks what the operator should do next.
+
+- **The model is not asked to do arithmetic.** Which service-in-city pairs lack
+  a page is a set difference over two lists: the engine computes it exactly, in
+  memory, for free. The model advises which of it matters and why. `--gaps-only`
+  answers the question without buying an opinion about it.
+- **Two gates, because one is not enough.** A schema pins the shape, with a
+  floor on every rationale — "good opportunity" should not pass. But a schema
+  cannot tell an invented identifier from a real one: `svc-gartenpflege` is
+  well-formed whether or not the project has such a service. So every
+  recommendation is matched back against the catalogue that was put in front of
+  the model, and anything unmatched is dropped **and reported** — an analyst
+  quietly discarding a third of its own answer is one nobody should trust.
+- **Read-only, structurally.** The agent module imports nothing that writes: no
+  database client, no queue, no file handle. `staticforge analyze` loads a
+  project, asks, and prints. An analyst that enqueued what it recommended would
+  turn a suggestion into a purchase order.
+- **Not cached, deliberately.** A cached analysis is stale advice wearing a
+  fresh timestamp.
+
+Verified read-only against the live database: 3 × 3 = 9 possible pages, 9
+existing, 0 missing, with job and page counts unchanged afterwards.
+
+### 3.11 SEO publishing and internal linking *(Phases 05–06)*
+
+Sitemaps, robots, canonical metadata and structured data are generated as part
+of the build rather than bolted on. An internal link graph is computed across
+the whole page set with contextual linking rules, so pages reference their
+siblings meaningfully instead of carrying a footer link dump.
+
+### 3.12 Zero-JavaScript presentation layer
+
+Two views are registered: a clean default and a dark, high-ticket "luxury
+landing" design. Any page can be previewed through any template on a dedicated
+static preview route, without touching the canonical site.
 
 The luxury template ships **zero client-side JavaScript**. Entrance animations
-that would conventionally require an animation library are implemented as CSS
-keyframes with staggered delays, which kept the template a pure Server
-Component. The route's first-load JavaScript is unchanged by its addition.
-Reduced-motion preferences are honoured.
+that would conventionally require an animation library are CSS keyframes with
+staggered delays, which kept the template a pure Server Component. Reduced
+motion is honoured.
 
 The template contains no hardcoded human-language text — section and question
 markers are numerals, which read identically in any locale. Every visible string
-comes from tenant data. This is not a stylistic choice: it is what allows one
-template to serve a German cleaning company and an English security firm without
-a fork.
+comes from tenant data. This is not stylistic: it is what allows one template to
+serve a German cleaning company and an English security firm without a fork.
 
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.6 Test coverage
+### 3.13 Test coverage
 
-**102 tests across three packages**, all under Vitest.
+**830 tests across 42 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
-| `database` | 43 | Repository read mapping and atomic write path, entirely against a mocked Prisma client |
-| `generator` | 40 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, output persistence |
-| `core` | 19 | CSV import: slug handling, optional columns, and fail-loud validation |
+| `ai` | 225 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis |
+| `core` | 203 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, tenant paths, job budget |
+| `database` | 161 | Repository read mapping, atomic write path, queue claim — entirely against a mocked Prisma client |
+| `generator` | 159 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, output persistence |
+| `schemas` | 41 | The shared data contracts themselves |
+| `cli` | 41 | Pipeline stages and the standalone worker |
 
 The database suite never opens a connection — one test asserts that explicitly,
-so the guarantee cannot rot silently. The AI merge suite runs against an
-injected stub, so it costs nothing and needs no API key.
+so the guarantee cannot rot silently. AI suites run against injected stubs, so
+they cost nothing and need no API key.
 
-Two properties of this suite are worth noting for anyone assessing risk. First,
-tests were repeatedly validated by *mutation* — deliberately breaking the code
-under test to confirm the relevant tests fail, then reverting. A test that has
-never failed has not been shown to work. Second, the assertions in the generator
-package deliberately use Node's strict assertion library rather than the test
-framework's, because the framework's loose equality would have weakened 60
-existing comparisons during the runner migration.
+Two properties are worth noting for anyone assessing risk. First, tests were
+repeatedly validated by *mutation* — deliberately breaking the code under test
+to confirm the relevant tests fail, then reverting. A test that has never failed
+has not been shown to work. Second, the generator assertions deliberately use
+Node's strict assertion library rather than the framework's, because loose
+equality would have weakened 60 existing comparisons during the runner
+migration.
 
 ---
 
@@ -212,6 +404,9 @@ Workspace  →  Project  →  Business
                        →  Service[]
                        →  Location[]
                        →  GeneratedPage[]
+                       →  GenerationJob[]
+
+ContentProfile / Template  →  owned by a user, or global via a __global__ sentinel
 ```
 
 **Workspace** is the tenant root — an agency or a customer account. **Project**
@@ -254,24 +449,26 @@ This is what prevents the classic programmatic-SEO failure of publishing a page
 promising a service in a city the operator does not actually cover — a page that
 converts into a complaint rather than a lead.
 
-*Planning note:* the file pipeline supports this today. The database read path
-currently returns every service and location on a project as eligible. Exposing
-per-business eligibility through the data model is a known, scoped gap, and the
-dashboard will need a UI for it.
+*Planning note:* the file pipeline supports this today. **The database read path
+still returns every service and location on a project as eligible.** Exposing
+per-business eligibility through the data model remains a known, scoped gap, and
+the dashboard will need a UI for it.
 
 ### 4.4 Template resolution
 
 Template selection resolves through a defined precedence — service-level, then
 project-level, then a default — so an operator can style one high-value service
 differently without touching the rest of the site. The resolved identifier is
-recorded on every generated page and indexed in the manifest.
+recorded on every generated page and indexed in the manifest. Since Phase 18 the
+registry can be injected from database rows rather than compiled in.
 
 ### 4.5 Validation as an architectural boundary
 
 Data is validated at every point it crosses into the system: CSV rows at import,
-input at load, each assembled page before it is written, model output before it
-is merged, merged pages before they are persisted, and the manifest when the web
-app reads it.
+input at load, sync payloads at the adapter boundary, each assembled page before
+it is written, model output before it is merged, editor patches before they are
+applied, profile and template rows on the way out of the database, merged pages
+before they are persisted, and the manifest when the web app reads it.
 
 Notably, the database adapter deliberately does **not** validate. It reshapes
 rows into the input contract and hands them to the same validator the file path
@@ -282,39 +479,50 @@ than forking into two implementations that drift.
 
 ## 5. Immediate Technical Next Steps
 
-Ordered by dependency. The first item gates everything below it.
+Ordered by dependency.
 
-**1. Connect Supabase.** Provision the PostgreSQL instance, push the schema, and
-run the seed. The seed is idempotent and reproduces the sample tenant with
-identifiers matching the file fixtures, so the two modes can be compared
-directly on first run. *This is the largest open risk in the project: the entire
-database layer is verified against mocks and has never executed against a real
-PostgreSQL server. Connection pooling for a serverless runtime is also unproven.*
+**1. Authentication and tenant scoping.** Users, workspace membership, and roles.
+Every query must be scoped to the caller's workspace, and Postgres row-level
+security should back that up rather than relying on application code alone. The
+subtree data model makes this enforceable, but **nothing enforces it yet — there
+is no authentication layer at all today.** This is now the largest open risk in
+the project: the dashboard and the headless API write tenant data with no caller
+identity behind them.
 
-**2. Authentication and tenant scoping.** Users, workspace membership, and roles.
-Every query must be scoped to the caller's workspace. The subtree data model
-makes this enforceable, but nothing enforces it yet — there is no authentication
-layer at all today.
+**2. Prove the AI path against a live model.** `ANTHROPIC_API_KEY` is not
+configured in this environment. Every AI suite runs against injected doubles, so
+the prompts and tool schemas — including Phase 20's gap-analysis contract — have
+never been exercised against a real provider round-trip. This is cheap to close
+and blocks confidence in everything paid.
 
-**3. Dashboard.** The operator surface: CRUD for services and locations, CSV
-upload, triggering generation, previewing pages across templates, and reviewing
-AI-authored content before publication. The preview route and provenance
-tracking already exist to support the review workflow.
+**3. Deployment and CI/CD.** Vercel for the Next.js application, with the
+existing `verify` gate wired into CI, plus a host for the standalone worker —
+which now has to be deployed as its own long-running process rather than living
+inside the web tier.
 
-**4. Deployment and CI/CD.** Vercel for the Next.js application, with the
-existing `verify` gate wired into CI. Generation currently runs as a local CLI;
-hosted generation needs to become a background job, since an AI run is paced and
-long-running by design and will exceed a request timeout.
-
-**5. Billing.** Not started. The natural metering dimensions the data model
+**4. Billing.** Not started. The natural metering dimensions the data model
 already supports are projects per workspace, pages per project, and AI-authored
-pages — the last being the only line with a real marginal cost.
+pages — the last being the only line with a real marginal cost. Job rows already
+carry the counts a meter would read.
+
+**5. Extract the presentation layer.** `packages/templates` is still a
+`.gitkeep`; templates remain route-local in `apps/web`. Phase 18 made template
+*configuration* sellable; extracting the views is what would make the package
+mean something.
 
 ### Known gaps, stated plainly
 
-- No database has ever been connected; the persistence layer is mock-verified only.
-- No authentication, no authorization, no tenant scoping enforcement.
-- The AI path has been executed end-to-end but is not covered by a live integration test.
-- Per-business eligibility is not yet exposed through the database read path.
-- The `templates` package is an empty placeholder; templates remain route-local.
-- Businesses and content templates cannot be imported from CSV, only services and locations.
+- **No authentication, no authorization, no tenant scoping enforcement, no RLS.**
+- **No `ANTHROPIC_API_KEY` configured**; the AI path is covered only by injected
+  doubles and has no live integration test.
+- **`packages/templates` is an empty placeholder**; templates remain route-local.
+- **Per-business eligibility is not exposed through the database read path** —
+  the DB path treats every service and location on a project as eligible.
+- **No CI pipeline and no deployment**; `verify` is run by hand, and the worker
+  has no host.
+- **Billing is not started.**
+- Businesses and content templates cannot be imported from CSV, only services
+  and locations.
+- `refresh-page` does not yet pass the realigned `schemaOrg` through
+  `saveRefreshedPage`, so that path still carries the drift Phases 16–17 fixed
+  elsewhere.
