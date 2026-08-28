@@ -3,10 +3,11 @@
 **Status:** Engine complete and running against a live Supabase PostgreSQL
 instance. Generation, persistence, queueing, sync, headless editing and
 incremental publishing are all verified end to end, and an RBAC organization
-layer now gates every write. Not yet deployed, and there is still no
+layer now gates every write and a shared token bucket keeps several workers
+inside one tenant's provider allowance. Not yet deployed, and there is still no
 authentication — Phase 23 decides what a user may do, not who they are.
 **Audience:** Product and platform planning for the SaaS layer.
-**Last updated:** 2026-08-28 (reflects phases 01–23)
+**Last updated:** 2026-08-28 (reflects phases 01–24)
 
 ---
 
@@ -34,8 +35,8 @@ data contract before it is written, so invalid output cannot reach a build.
 The engine runs as a local CLI, as a database-backed multi-tenant service, and
 as a standalone queue worker. The multi-tenant data model, the tenant isolation
 boundary, the persistence layer, the job queue, the data-sync boundary, the
-headless editing API and the incremental publishing path are built, tested, and
-exercised against the real database. A change now re-authors only the pages it
+headless editing API, the incremental publishing path and the distributed rate
+limiter are built, tested, and exercised against the real database. A change now re-authors only the pages it
 actually reached, and a drained queue triggers the static host's build.
 **What remains is the commercial surface: authentication, deployment, and
 billing.** Authorization and tenant scoping are built as of Phase 23; proving
@@ -566,14 +567,98 @@ Anyone able to set it is any user. This phase decides what a user *may* do; it
 does not establish who they are, and the two must not be confused when reading
 the gaps below.
 
-### 3.15 SEO publishing and internal linking *(Phases 05–06)*
+### 3.15 Distributed rate limiting *(Phase 24)*
+
+Rate limiting held in process memory works exactly until there is a second
+process, and Phase 14 made the worker a thing you are meant to run more than one
+of. Two workers each politely holding themselves to the provider's limit will
+together exceed it, every time, and the failure arrives as 429s in the middle of
+a paid run rather than as anything anyone designed.
+
+The limit belongs to the **tenant and the provider**, not to a process, so the
+state has to live where every process can see it. Postgres rather than Redis: it
+already holds the queue those processes coordinate through, and a second thing
+to run and secure is a poor trade for a row updated a few times a minute.
+
+**Why the decision is one statement.** The obvious implementation reads the row,
+works out whether there is room, and writes the new count back — and between
+that read and that write is the entire bug. Both workers read the same balance,
+both decide there is room, both spend it, and nothing in the code looks wrong.
+
+So the grant is a single `INSERT ... ON CONFLICT DO UPDATE ... WHERE` with the
+arithmetic inside it. Postgres takes a row lock on the conflict and re-evaluates
+both the `SET` expressions and the `WHERE` against the current tuple, so a
+second caller arriving mid-flight sees the first one's deduction. The database
+decides, not the gap between two queries.
+
+**A denial writes nothing**, including the clock. The time a refused caller
+spends waiting is time the bucket is still filling; advancing `lastRefillAt` on
+a denial would charge a caller for its own wait and, under a busy queue, could
+hold a bucket permanently empty.
+
+**The fractional remainder is carried in the timestamp.** Tokens are stored as
+an integer, so a refill of 0.4 tokens has nowhere to go. Discarding it and
+advancing the clock to `NOW()` loses that fraction on every call — a caller
+polling ten times a second at one token per second would earn nothing, forever,
+while every dashboard insists it is being topped up. So the clock advances by
+exactly the time the *whole* tokens represent and the remainder stays owed. The
+only case where time is deliberately discarded is a bucket already at capacity,
+which is what a bucket means.
+
+**A request larger than the whole capacity** is refused before the database is
+touched and reported as *unsatisfiable* rather than as a long wait. Separating
+the two is what lets the AI layer fail immediately on a misconfiguration instead
+of burning a two-minute budget to reach the same conclusion. A refill rate of
+zero — a legitimate hard-quota policy — is handled the same way once the bucket
+is empty: exhausted, not busy.
+
+**Where the gate sits.** At `callProvider`, the one choke point every provider
+call passes through, fresh authoring and refresh alike. A limiter with two entry
+points is a limiter with one entry point somebody forgot. It is asked *before*
+the request is built, because asking afterwards would debit the bucket for a
+call already made and paid for — an accounting record rather than a limiter. A
+page served from the cache costs the bucket nothing, since the gate is at the
+call and not at the entry point.
+
+The limiter reaches `@staticforge/ai` as a bound function taking a token count
+and nothing else. It cannot choose its bucket or raise its capacity — a
+component able to widen its own limit is not limited — and it carries no
+database client, which is what keeps the AI package free of Prisma. The
+composition root in the generator CLI is the only place that knows both the
+project id and the database.
+
+**Waiting is bounded three ways:** a per-pause ceiling, so a huge computed wait
+cannot starve a job-lease renewal; a floor, so a limiter reporting zero cannot
+spin the loop into a denial of service against our own Postgres; and a total
+budget, so a misconfigured bucket cannot turn a run into a process that is
+alive, holding a lease, and never finishing — the worst of the three outcomes,
+because it looks like progress. Every pause is announced, because an operator
+watching a silent process decides it has hung and kills it, throwing away pages
+already paid for.
+
+**The duplication, stated plainly.** The refill formula exists twice: in the SQL,
+which is authoritative and atomic, and in `planTokenConsumption`, which computes
+how long a denied caller should sleep. Doing the grant in TypeScript would
+reintroduce the race this exists to close; computing the wait in SQL would leave
+the arithmetic with no test that runs without a database. The two are kept
+literally parallel and both are exercised by the live verification.
+
+**What the mocks could not have caught.** Two real bugs were found only by
+running it against Postgres: a `Prisma.sql` built from an already-joined string
+carries no placeholders, so every parameter silently failed to bind; and a
+refill rate of zero divided by zero in both implementations. Neither is
+observable through a mocked client, which is why the concurrency guarantee is
+verified against the live database and reported with the change rather than
+asserted in a suite that never opens a connection.
+
+### 3.16 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.16 Zero-JavaScript presentation layer
+### 3.17 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -592,15 +677,15 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.17 Test coverage
+### 3.18 Test coverage
 
-**962 tests across 49 files in six packages**, all under Vitest, all passing.
+**1020 tests across 52 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
-| `ai` | 225 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis |
-| `core` | 256 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, tenant paths, job budget |
-| `database` | 222 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate and the audit trail — entirely against a mocked Prisma client |
+| `ai` | 243 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop |
+| `core` | 280 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, tenant paths, job budget |
+| `database` | 238 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail and the rate limiter's statement shape — entirely against a mocked Prisma client |
 | `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
 | `cli` | 50 | Pipeline stages, the standalone worker, and queue-drain detection |
@@ -765,6 +850,11 @@ mean something.
   worker calls it to complete a job that was already authorised at enqueue time.
 - **The audit trail is best-effort**, written after the action by a listener the
   bus may abandon. Failures are loud, but a lost row is possible.
+- **The rate limiter has never held back a real provider call.** With no
+  `ANTHROPIC_API_KEY` configured, the bucket and the wait loop are verified
+  against Postgres and against injected doubles respectively, but the last inch
+  — a held-back call reaching the provider late rather than not at all — is
+  unproven.
 - **No `ANTHROPIC_API_KEY` configured**; the AI path is covered only by injected
   doubles and has no live integration test.
 - **`packages/templates` is an empty placeholder**; templates remain route-local.

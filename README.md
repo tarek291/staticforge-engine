@@ -2,12 +2,13 @@
 
 A schema-driven static site generation engine, organized as a pnpm monorepo.
 
-> **Status:** 🟢 Phases 01–23 delivered. End-to-end pipeline working against a
+> **Status:** 🟢 Phases 01–24 delivered. End-to-end pipeline working against a
 > live Supabase PostgreSQL instance, with a standalone queue worker, a data-sync
 > boundary, headless block editing, database-backed templates, a plugin runtime,
 > a read-only AI gap analyst, incremental publishing that re-authors only the
-> pages a change reached, and an RBAC organization layer with a database audit
-> trail. **Not yet deployed, and there is no
+> pages a change reached, an RBAC organization layer with a database audit
+> trail, and a distributed token bucket that keeps several workers inside one
+> tenant's provider allowance. **Not yet deployed, and there is no
 > authentication layer** (Phase 23 added authorization, not identity) — see
 > [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md)
 > for the full state and the outstanding technical debt.
@@ -92,7 +93,7 @@ corepack pnpm generate    # run the generator pipeline → data/output/
 corepack pnpm dev:web     # start the Next.js dev server
 corepack pnpm build:web   # build the static site
 corepack pnpm typecheck   # typecheck every workspace package
-corepack pnpm test        # run every package's test suite (830 tests)
+corepack pnpm test        # run every package's test suite (1020 tests)
 corepack pnpm verify      # generate + typecheck (all) + test (all) + web build
 ```
 
@@ -127,7 +128,8 @@ data/output/
 
 Phases 01–13 established the content contract and the AI engine; phases 14–20
 turned it into a service; phases 21–22 made publishing incremental; phase 23
-added the enterprise layer. Every phase below is merged into `main`.
+added the enterprise layer; phase 24 made rate limiting survive a second
+worker. Every phase below is merged into `main`.
 
 ### 01–13 — engine and hardening (summary)
 
@@ -427,6 +429,79 @@ STATICFORGE_AUDIT_LOG=true  # write it to stdout as well
 > **This is authorization, not authentication.** There is still no user table, no
 > session, and no login: `userId` is supplied by the caller rather than proved.
 > The gate decides what a user may do; it does not establish who they are.
+
+
+### 24 — Distributed rate limiting
+
+Rate limiting in process memory works exactly until there is a second process,
+and Phase 14 made the worker a thing you are meant to run more than one of. Two
+workers each politely holding themselves to the provider's limit will together
+exceed it, every time, and the failure arrives as 429s in the middle of a paid
+run rather than as anything anyone designed.
+
+The limit belongs to the **tenant and the provider**, not to a process, so the
+state lives in Postgres — which already holds the queue those processes
+coordinate through. A `RateLimitState` row is one shared token bucket.
+
+**The grant is a single statement.** The obvious implementation reads the row,
+decides, and writes the count back — and between that read and that write is the
+entire bug: both workers read the same balance, both decide there is room, both
+spend it.
+
+```sql
+INSERT INTO "RateLimitState" ... VALUES (...)
+ON CONFLICT ("id") DO UPDATE SET ... WHERE <refilled> >= <requested>
+RETURNING "availableTokens"
+```
+
+Postgres takes a row lock on the conflict and re-evaluates both the `SET`
+expressions and the `WHERE` against the current tuple, so a second caller
+arriving mid-flight sees the first one's deduction. The database decides, not
+the gap between two queries.
+
+**A denial writes nothing at all**, including `lastRefillAt`. The time a refused
+caller spends waiting is time the bucket is still filling; advancing the clock
+on a denial would charge a caller for its own wait.
+
+**The fractional remainder is carried, not discarded.** Tokens are an integer, so
+a refill of 0.4 has nowhere to go. Setting the clock to `NOW()` would lose that
+fraction on *every* call, and a caller polling faster than one token's worth of
+time would then earn nothing forever while every dashboard insisted it was being
+topped up. So the clock advances by exactly the time the whole tokens represent.
+The only case where time is deliberately discarded is a bucket already at
+capacity — which is what a bucket means.
+
+**A request larger than the whole capacity** is refused before the database is
+touched and reported as *unsatisfiable* rather than as a long wait. Telling a
+caller to wait for it would be telling it to wait for ever.
+
+**The gate sits at `callProvider`** — the one choke point every provider call
+passes through, fresh authoring and refresh alike. A limiter with two entry
+points is a limiter with one entry point somebody forgot. It is asked *before*
+the request is built: asking afterwards would debit the bucket for a call
+already made and paid for, which is an accounting record rather than a limiter.
+A page served from the cache costs the bucket nothing.
+
+The limiter reaches `@staticforge/ai` as a **bound function taking a token count
+and nothing else**. It cannot choose its bucket or raise its capacity — a
+component able to widen its own limit is not limited — and it carries no
+database client, which is what keeps the AI package free of Prisma.
+
+Waiting is bounded three ways: a per-pause ceiling so a huge computed wait
+cannot starve a lease renewal, a floor so a limiter reporting zero cannot spin
+the loop into a denial of service against our own Postgres, and a total budget
+so a misconfigured bucket cannot turn a run into a process that is alive,
+holding a lease, and never finishing. Each pause is announced, because an
+operator watching a silent process decides it has hung and kills it.
+
+```bash
+STATICFORGE_RATE_LIMIT_CAPACITY=160000        # burst ceiling, in tokens
+STATICFORGE_RATE_LIMIT_REFILL_PER_SEC=2600    # sustained ceiling
+```
+
+A refill rate of `0` is a valid policy — a hard quota that never tops up. A
+bucket in that state that lacks the tokens is reported as exhausted rather than
+as a wait, because waiting would never help.
 
 ---
 
