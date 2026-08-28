@@ -1,3 +1,5 @@
+import { noopHookBus, type HookBus } from "@staticforge/core";
+
 import { runEngine, type EngineResult } from "./run-engine.js";
 
 /**
@@ -71,6 +73,15 @@ export interface WorkerOptions {
   /** How long to wait after finding no work. */
   idleMs?: number;
   log?: (message: string) => void;
+  /**
+   * Lifecycle bus. Defaults to one with nothing installed.
+   *
+   * Always present rather than optional at the emission site, so the code that
+   * announces a finished job never branches on whether anyone is listening —
+   * an `if` that is almost always false is an `if` that eventually gets it
+   * wrong.
+   */
+  hooks?: HookBus;
 }
 
 /** Heartbeat comfortably inside the lease, so one missed tick is not fatal. */
@@ -204,6 +215,22 @@ export async function runWorkerOnce(
     { ok: result.ok, exitCode: result.exitCode, logs: result.output },
     job.userId,
   );
+
+  // Announced after the verdict is durable, not before. A plugin told a job
+  // succeeded must be able to rely on that being true even if this worker dies
+  // in the next instant — and every listener failure here is absorbed, because
+  // a run that finished is finished whatever an audit logger thinks.
+  await (options.hooks ?? noopHookBus()).emit("afterJobCompleted", {
+    jobId: job.id,
+    projectId: job.projectId,
+    userId: job.userId,
+    kind: job.kind,
+    ok: result.ok,
+    exitCode: result.exitCode,
+    resumed: job.resumed,
+    durationMs: result.durationMs,
+    completedAt: new Date().toISOString(),
+  });
 
   log(
     `  ${result.ok ? "✓" : "✗"} ${job.id} — exit ${result.exitCode} in ` +

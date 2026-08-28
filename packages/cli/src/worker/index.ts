@@ -1,5 +1,12 @@
 import { hostname } from "node:os";
-import { sleep } from "@staticforge/core";
+import {
+  createAuditLoggerPlugin,
+  isAuditLogEnabled,
+  registerPlugins,
+  sleep,
+  type HookBus,
+  type StaticForgePlugin,
+} from "@staticforge/core";
 
 import { runEngine } from "./run-engine.js";
 import {
@@ -67,15 +74,77 @@ export async function createWorkerDeps(): Promise<WorkerDeps> {
   };
 }
 
+/**
+ * The plugins this worker installs.
+ *
+ * A list, not a discovery mechanism. Loading plugins from a directory or a
+ * config file means a deployment can gain third-party code without anyone
+ * changing a file that gets reviewed — which is how a supply chain becomes an
+ * attack surface. Installing one stays an explicit edit here.
+ *
+ * The audit logger is opt-in on top of that: a second stream of output is not
+ * something to start writing because a variable was almost set.
+ */
+export function defaultPlugins(
+  env: NodeJS.ProcessEnv = process.env,
+): StaticForgePlugin[] {
+  return isAuditLogEnabled(env) ? [createAuditLoggerPlugin()] : [];
+}
+
+/**
+ * Build the lifecycle bus this worker emits on.
+ *
+ * Setup failures are reported and survived. A worker that refused to boot
+ * because one audit logger had a typo would be a worse outcome than a worker
+ * running without it — the jobs still need doing.
+ *
+ * @param log - Where plugin failures are reported. The worker passes its own
+ * logger, so a misbehaving plugin appears where an operator already looks.
+ */
+export function buildHookBus(
+  plugins: readonly StaticForgePlugin[],
+  log: (message: string) => void,
+): HookBus {
+  const { hooks, installed, failed } = registerPlugins(plugins, {
+    onFailure: (failure) => {
+      log(
+        `  ! plugin "${failure.plugin}" ${failure.reason} on ${failure.hook}: ` +
+          `${failure.error instanceof Error ? failure.error.message : String(failure.error)}`,
+      );
+    },
+  });
+
+  if (installed.length > 0) {
+    log(`  plugins: ${installed.join(", ")}`);
+  }
+
+  for (const failure of failed) {
+    log(
+      `  ! plugin "${failure.plugin}" failed to install and was skipped: ` +
+        `${failure.error instanceof Error ? failure.error.message : String(failure.error)}`,
+    );
+  }
+
+  return hooks;
+}
+
 /** Start a worker wired to the real database. */
 export async function startDatabaseWorker(
-  options: Omit<WorkerOptions, "instanceId"> & { instanceId?: string },
+  options: Omit<WorkerOptions, "instanceId"> & {
+    instanceId?: string;
+    plugins?: readonly StaticForgePlugin[];
+  },
 ): Promise<WorkerHandle> {
   const deps = await createWorkerDeps();
+  const log = options.log ?? (() => {});
 
   return startWorker(
     deps,
-    { ...options, instanceId: options.instanceId ?? workerInstanceId() },
+    {
+      ...options,
+      instanceId: options.instanceId ?? workerInstanceId(),
+      hooks: buildHookBus(options.plugins ?? defaultPlugins(), log),
+    },
     sleep,
   );
 }

@@ -11,3 +11,6 @@ export * from "./sync/adapter.js";
 export * from "./sync/adapters.js";
 export * from "./sync/webhook-auth.js";
 export * from "./patch/block-path.js";
+export * from "./plugins/hooks.js";
+export * from "./plugins/plugin.js";
+export * from "./plugins/audit-logger.js";

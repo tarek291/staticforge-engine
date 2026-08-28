@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ManifestSchema, type GeneratedPage } from "@staticforge/schemas";
 
+import { createHookBus } from "@staticforge/core";
+
 import { savePages } from "./save-output.js";
 
 /**
@@ -187,6 +189,77 @@ describe("savePages writes without destroying the live site first", () => {
       await savePages([page("first")], nested);
 
       assert.deepEqual(await livePages(nested), ["first.json"]);
+    });
+  });
+});
+
+describe("lifecycle events around the write", () => {
+  test("announces the write before and after, with the same context", async () => {
+    await withTempDir(async (dir) => {
+      const seen: Array<{ hook: string; count: number }> = [];
+      const hooks = createHookBus();
+
+      hooks.on("beforePagesWritten", (p) =>
+        void seen.push({ hook: "before", count: p.pageCount }),
+      );
+      hooks.on("afterPagesWritten", (p) =>
+        void seen.push({ hook: "after", count: p.pageCount }),
+      );
+
+      await savePages([page("first"), page("second")], dir, {
+        hooks,
+        projectId: "prj_1",
+      });
+
+      assert.deepEqual(seen, [
+        { hook: "before", count: 2 },
+        { hook: "after", count: 2 },
+      ]);
+    });
+  });
+
+  test("a throwing plugin does not stop the pages being written", async () => {
+    await withTempDir(async (dir) => {
+      const hooks = createHookBus();
+      hooks.on("beforePagesWritten", () => {
+        throw new Error("plugin exploded before the write");
+      });
+      hooks.on("afterPagesWritten", () => {
+        throw new Error("plugin exploded after it");
+      });
+
+      await savePages([page("first")], dir, { hooks });
+
+      // The site is the deliverable. A plugin cannot be allowed to prevent it.
+      assert.deepEqual(await livePages(dir), ["first.json"]);
+    });
+  });
+
+  test("a plugin cannot veto a write by hanging", async () => {
+    await withTempDir(async (dir) => {
+      const hooks = createHookBus({ listenerTimeoutMs: 20 });
+      hooks.on("beforePagesWritten", () => new Promise<void>(() => {}));
+
+      await savePages([page("first")], dir, { hooks });
+
+      assert.deepEqual(await livePages(dir), ["first.json"]);
+    });
+  });
+
+  test("the after event fires once the pages are actually readable", async () => {
+    await withTempDir(async (dir) => {
+      let visibleAtEvent: string[] = [];
+      const hooks = createHookBus();
+
+      hooks.on("afterPagesWritten", async () => {
+        visibleAtEvent = await livePages(dir);
+      });
+
+      await savePages([page("first"), page("second")], dir, { hooks });
+
+      // Announced after the swap, so a listener told the pages are written can
+      // rely on a reader seeing them.
+      assert.deepEqual(visibleAtEvent, ["first.json", "second.json"]);
     });
   });
 });

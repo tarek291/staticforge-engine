@@ -6,6 +6,8 @@ import {
   type GeneratedPage,
   type Manifest,
 } from "@staticforge/schemas";
+import { noopHookBus, type HookBus } from "@staticforge/core";
+
 import { ValidationError, type ValidationIssue } from "./errors.js";
 
 /** Build a readable, dotted/bracketed path like `pages[slug].content.hero.heading`. */
@@ -31,6 +33,16 @@ function mapPageIssues(error: z.ZodError, slug: string): ValidationIssue[] {
     path: formatPath(issue.path, `pages[${slug}]`),
     message: issue.message,
   }));
+}
+
+/** Context a page-write listener is told about. */
+export interface SavePagesOptions {
+  /** Lifecycle bus. Defaults to one with nothing installed. */
+  hooks?: HookBus;
+  /** Database project this run belongs to, or null in local file mode. */
+  projectId?: string | null;
+  /** Locale the pages carry. Read from the first page when omitted. */
+  locale?: string;
 }
 
 /** Prefix for a directory being built. Dot-led, so it reads as internal. */
@@ -125,11 +137,13 @@ async function sweepLeftovers(outputDir: string): Promise<void> {
  *
  * @param pages - The pages to persist.
  * @param outputDir - Directory to write into (created if missing).
+ * @param options - Lifecycle bus and the context a listener needs.
  * @throws {ValidationError} If any page fails schema validation.
  */
 export async function savePages(
   pages: GeneratedPage[],
   outputDir: string,
+  options: SavePagesOptions = {},
 ): Promise<void> {
   // Validate everything first so a bad page never produces partial output.
   const validated: GeneratedPage[] = [];
@@ -145,6 +159,21 @@ export async function savePages(
   if (issues.length > 0) {
     throw new ValidationError("pages", issues);
   }
+
+  const hooks = options.hooks ?? noopHookBus();
+  const context = {
+    projectId: options.projectId ?? null,
+    outputDir,
+    locale: options.locale ?? validated[0]?.locale ?? "de",
+    pageCount: validated.length,
+    slugs: validated.map((page) => page.slug),
+  };
+
+  // Announced before the destructive part, and observational only: a listener
+  // cannot stop this or change what is written. Offering a veto here would put
+  // a plugin between validated content and the disk, which is precisely where
+  // nothing third-party belongs.
+  await hooks.emit("beforePagesWritten", context);
 
   await mkdir(outputDir, { recursive: true });
   await sweepLeftovers(outputDir);
@@ -233,4 +262,11 @@ export async function savePages(
 
   await discard(retiredPages);
   await discard(stagingDir);
+
+  // After the swap, so a listener told the pages are written can rely on a
+  // reader seeing them.
+  await hooks.emit("afterPagesWritten", {
+    ...context,
+    writtenAt: new Date().toISOString(),
+  });
 }

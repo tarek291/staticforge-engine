@@ -1,5 +1,10 @@
 import type { PrismaClient } from "@prisma/client";
-import { stableHash, type SyncPayload } from "@staticforge/core";
+import {
+  noopHookBus,
+  stableHash,
+  type HookBus,
+  type SyncPayload,
+} from "@staticforge/core";
 import type { Location, Service } from "@staticforge/schemas";
 
 import { withDbRetry } from "./retry.js";
@@ -254,6 +259,37 @@ export interface SyncOptions {
   enqueue?: boolean;
   /** Injected so the orchestration is testable without a queue. */
   enqueueJob?: (projectId: string, userId: string) => Promise<string | null>;
+  /**
+   * Lifecycle bus. Defaults to one with nothing installed.
+   *
+   * A sync that changed nothing is still worth announcing: "we checked and it
+   * was current" is the answer an audit trail needs most often, and a plugin
+   * that only heard about changes could not tell a quiet system from a broken
+   * integration.
+   */
+  hooks?: HookBus;
+}
+
+/** Announce a finished sync. Every listener failure is absorbed. */
+async function announceSync(
+  hooks: HookBus,
+  projectId: string,
+  userId: string,
+  result: SyncResult,
+): Promise<void> {
+  await hooks.emit("afterProjectSync", {
+    projectId,
+    userId,
+    changed: result.changed,
+    jobId: result.jobId,
+    servicesAdded: result.diff.services.added.length,
+    servicesUpdated: result.diff.services.updated.length,
+    servicesRemoved: result.diff.services.removed.length,
+    locationsAdded: result.diff.locations.added.length,
+    locationsUpdated: result.diff.locations.updated.length,
+    locationsRemoved: result.diff.locations.removed.length,
+    syncedAt: new Date().toISOString(),
+  });
 }
 
 /**
@@ -283,15 +319,21 @@ export async function syncProject(
 
   const diff = diffSyncPayload(payload, snapshot);
 
+  const hooks = options.hooks ?? noopHookBus();
+
   if (!diff.changed) {
     // The point of the whole module. Writing identical rows would be harmless;
     // queueing the run that follows would not.
-    return {
+    const unchanged: SyncResult = {
       changed: false,
       diff,
       jobId: null,
       note: "The incoming data matches what this project already holds.",
     };
+
+    await announceSync(hooks, projectId, userId, unchanged);
+
+    return unchanged;
   }
 
   const enqueue = options.enqueue ?? true;
@@ -301,6 +343,9 @@ export async function syncProject(
     // what a sheet would do *before* letting it do anything — reporting that
     // from the far side of the transaction would answer the question honestly
     // and have already changed the answer.
+    //
+    // Deliberately not announced: nothing happened, and a plugin told a project
+    // synced when it did not would be lying to an audit trail.
     return {
       changed: true,
       diff,
@@ -383,17 +428,24 @@ export async function syncProject(
 
   if (options.enqueueJob === undefined) {
     // The data was applied, but this caller supplied no way to queue a run.
-    return {
+    const applied: SyncResult = {
       changed: true,
       diff,
       jobId: null,
       note: "Applied, but no run was queued: this caller supplied no queue.",
     };
+
+    await announceSync(hooks, projectId, userId, applied);
+
+    return applied;
   }
 
   const jobId = await options.enqueueJob(projectId, userId);
+  const result: SyncResult = { changed: true, diff, jobId };
 
-  return { changed: true, diff, jobId };
+  await announceSync(hooks, projectId, userId, result);
+
+  return result;
 }
 
 /** Render a diff as a line an operator can read. */

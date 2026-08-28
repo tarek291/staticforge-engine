@@ -1,5 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 
+import { createHookBus, registerPlugins } from "@staticforge/core";
+
 import {
   runWorkerOnce,
   startWorker,
@@ -284,5 +286,128 @@ describe("startWorker", () => {
 
     // At most the one job it had already begun.
     expect(claim.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("a plugin cannot break the run it is observing", () => {
+  test("the lifecycle event reaches a listener with the job's own data", async () => {
+    const seen: unknown[] = [];
+    const hooks = createHookBus();
+    hooks.on("afterJobCompleted", (payload) => {
+      seen.push(payload);
+    });
+
+    const d = deps({
+      claimNextJob: vi.fn().mockResolvedValue(job({ resumed: true })),
+    });
+
+    await runWorkerOnce(d, { ...OPTIONS, hooks });
+
+    expect(seen[0]).toMatchObject({
+      jobId: "job_1",
+      projectId: "prj_1",
+      userId: "local-operator",
+      kind: "GENERATE",
+      ok: true,
+      exitCode: 0,
+      resumed: true,
+    });
+  });
+
+  test("a throwing plugin does not fail the job", async () => {
+    // The whole point of the isolation. A plugin is third-party code inside a
+    // paid, hour-long build; if it can abort one, installing it is a risk
+    // nobody should take.
+    const hooks = createHookBus();
+    hooks.on("afterJobCompleted", () => {
+      throw new Error("audit endpoint is down");
+    }, "flaky-plugin");
+
+    const d = deps({ claimNextJob: vi.fn().mockResolvedValue(job()) });
+
+    const tick = await runWorkerOnce(d, { ...OPTIONS, hooks });
+
+    expect(tick).toEqual({ jobId: "job_1", ok: true, resumed: false });
+    expect(d.finishJob).toHaveBeenCalledTimes(1);
+  });
+
+  test("a hanging plugin does not hold the worker open", async () => {
+    const hooks = createHookBus({ listenerTimeoutMs: 20 });
+    hooks.on("afterJobCompleted", () => new Promise<void>(() => {}));
+
+    const d = deps({ claimNextJob: vi.fn().mockResolvedValue(job()) });
+
+    const tick = await runWorkerOnce(d, { ...OPTIONS, hooks });
+
+    expect(tick.ok).toBe(true);
+  });
+
+  test("the plugin is told only after the verdict is durable", async () => {
+    const order: string[] = [];
+    const hooks = createHookBus();
+    hooks.on("afterJobCompleted", () => {
+      order.push("plugin");
+    });
+
+    const d = deps({
+      claimNextJob: vi.fn().mockResolvedValue(job()),
+      finishJob: vi.fn().mockImplementation(() => {
+        order.push("finishJob");
+        return Promise.resolve(true);
+      }),
+    });
+
+    await runWorkerOnce(d, { ...OPTIONS, hooks });
+
+    // A plugin told a job succeeded must be able to rely on that being true
+    // even if the worker dies in the next instant.
+    expect(order).toEqual(["finishJob", "plugin"]);
+  });
+
+  test("a worker that lost its claim announces nothing", async () => {
+    const hooks = createHookBus();
+    const heard = vi.fn();
+    hooks.on("afterJobCompleted", heard);
+
+    let release: (() => void) | undefined;
+    const d = deps({
+      claimNextJob: vi.fn().mockResolvedValue(job()),
+      renewJobLease: vi.fn().mockResolvedValue(false),
+      runEngine: vi.fn().mockImplementation(
+        () =>
+          new Promise<EngineResult>((resolve) => {
+            release = () => {
+              resolve(engineResult());
+            };
+          }),
+      ),
+    });
+
+    const running = runWorkerOnce(d, { ...OPTIONS, heartbeatMs: 1, hooks });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release?.();
+    await running;
+
+    // The job belongs to another worker now. Announcing a completion this
+    // worker did not record would put a lie into an audit trail.
+    expect(heard).not.toHaveBeenCalled();
+  });
+
+  test("a plugin whose setup throws leaves the worker able to run", async () => {
+    const { hooks, failed } = registerPlugins([
+      {
+        name: "broken",
+        setup() {
+          throw new Error("bad config");
+        },
+      },
+    ]);
+
+    const d = deps({ claimNextJob: vi.fn().mockResolvedValue(job()) });
+
+    const tick = await runWorkerOnce(d, { ...OPTIONS, hooks });
+
+    expect(failed[0]?.plugin).toBe("broken");
+    expect(tick.ok).toBe(true);
   });
 });
