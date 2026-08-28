@@ -35,6 +35,15 @@ export interface JobCompletedEvent {
   jobId: string;
   projectId: string;
   userId: string;
+  /**
+   * The organization this job belonged to, or `null` outside one.
+   *
+   * On the payload rather than looked up by a listener. A listener that had to
+   * resolve it would need a database client, which the plugin contract does not
+   * give it — and an audit row that cannot be scoped to a tenant is an audit
+   * row that tenant can never be shown.
+   */
+  organizationId: string | null;
   kind: string;
   ok: boolean;
   exitCode: number;
@@ -48,6 +57,8 @@ export interface JobCompletedEvent {
 export interface ProjectSyncEvent {
   projectId: string;
   userId: string;
+  /** The organization this project belongs to, or `null` outside one. */
+  organizationId: string | null;
   /** Whether the incoming data differed from what the project held. */
   changed: boolean;
   /** The run queued because of it, if any. */

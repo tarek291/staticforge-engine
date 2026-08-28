@@ -183,22 +183,38 @@ async function runSync(values: Record<string, unknown>): Promise<void> {
 
   const userId = resolveOperatorId();
 
-  const result = await syncProject(projectId, userId, parsed.payload, prisma, {
-    enqueue: !dryRun,
-    enqueueJob: async (project, owner, scope) => {
-      // The scope travels with the job so the run re-authors only the pages the
-      // change reached. Empty means a full run.
-      const job = await enqueueJob(
-        project,
-        owner,
-        "GENERATE",
-        prisma,
-        undefined,
-        scope,
-      );
-      return job?.id ?? null;
-    },
-  });
+  let result: Awaited<ReturnType<typeof syncProject>>;
+
+  try {
+    result = await syncProject(projectId, userId, parsed.payload, prisma, {
+      enqueue: !dryRun,
+      enqueueJob: async (project, owner, scope) => {
+        // The scope travels with the job so the run re-authors only the pages
+        // the change reached. Empty means a full run.
+        const job = await enqueueJob(
+          project,
+          owner,
+          "GENERATE",
+          prisma,
+          undefined,
+          scope,
+        );
+        return job?.id ?? null;
+      },
+    });
+  } catch (error: unknown) {
+    // A refusal is a sentence, not a stack trace. An operator whose role is too
+    // weak needs to know who to ask, and one who is not a member at all is told
+    // only that they have no access — the same answer an id that does not exist
+    // would give.
+    if (error instanceof Error && error.name === "AccessDeniedError") {
+      console.error(`✗ ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    throw error;
+  }
 
   if (result === null) {
     // The same answer a project that does not exist would give: a sync must not

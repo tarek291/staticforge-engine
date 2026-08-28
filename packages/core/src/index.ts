@@ -15,4 +15,6 @@ export * from "./plugins/hooks.js";
 export * from "./plugins/plugin.js";
 export * from "./plugins/audit-logger.js";
 export * from "./plugins/build-trigger.js";
+export * from "./plugins/database-audit-logger.js";
+export * from "./access/roles.js";
 export * from "./net/outbound-url.js";

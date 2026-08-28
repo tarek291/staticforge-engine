@@ -18,6 +18,7 @@ const JOB_EVENT = {
   jobId: "job_1",
   projectId: "prj_1",
   userId: "local-operator",
+  organizationId: "org-1",
   kind: "GENERATE",
   ok: true,
   exitCode: 0,
@@ -91,6 +92,7 @@ describe("a listener receives what it was told about", () => {
       locationsUpdated: 0,
       locationsRemoved: 0,
       scopedPages: 0,
+      organizationId: "org-1",
       syncedAt: "2026-08-27T12:00:00.000Z",
     })).resolves.toMatchObject({ delivered: 0, failures: [] });
   });
@@ -394,6 +396,7 @@ describe("the audit logger plugin", () => {
       locationsUpdated: 0,
       locationsRemoved: 0,
       scopedPages: 0,
+      organizationId: "org-1",
       syncedAt: "2026-08-27T12:00:00.000Z",
     });
 

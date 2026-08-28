@@ -51,6 +51,8 @@ export interface ClaimedJobLike {
   id: string;
   projectId: string;
   userId: string;
+  /** The organization this job belongs to, for the audit trail. */
+  organizationId: string | null;
   kind: "GENERATE" | "BUILD" | "REFRESH";
   locale: string;
   targetSlug: string | null;
@@ -237,6 +239,7 @@ export async function runWorkerOnce(
     jobId: job.id,
     projectId: job.projectId,
     userId: job.userId,
+    organizationId: job.organizationId,
     kind: job.kind,
     ok: result.ok,
     exitCode: result.exitCode,

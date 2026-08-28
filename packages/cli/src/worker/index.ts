@@ -2,9 +2,12 @@ import { hostname } from "node:os";
 import {
   createAuditLoggerPlugin,
   createBuildTriggerFromEnv,
+  createDatabaseAuditLoggerPlugin,
   isAuditLogEnabled,
+  isDatabaseAuditEnabled,
   registerPlugins,
   sleep,
+  type AuditRecordWriter,
   type HookBus,
   type StaticForgePlugin,
 } from "@staticforge/core";
@@ -89,11 +92,19 @@ export async function createWorkerDeps(): Promise<WorkerDeps> {
 export function defaultPlugins(
   env: NodeJS.ProcessEnv = process.env,
   log: (message: string) => void = () => {},
+  auditWriter?: AuditRecordWriter,
 ): StaticForgePlugin[] {
   const plugins: StaticForgePlugin[] = [];
 
   if (isAuditLogEnabled(env)) {
     plugins.push(createAuditLoggerPlugin());
+  }
+
+  // The database audit trail. Opt-in and *given* its writer rather than
+  // building one: the plugin contract hands a plugin no database client, and
+  // this is the one visible place that decides what it may reach.
+  if (auditWriter !== undefined && isDatabaseAuditEnabled(env)) {
+    plugins.push(createDatabaseAuditLoggerPlugin({ write: auditWriter }));
   }
 
   // Configured by presence: a worker with no deploy hook is the ordinary local
@@ -166,12 +177,20 @@ export async function startDatabaseWorker(
   const deps = await createWorkerDeps();
   const log = options.log ?? (() => {});
 
+  // Built here, in the composition root, and handed to the plugin rather than
+  // reached for by it.
+  const { createAuditWriter, prisma } = await import("@staticforge/database");
+  const auditWriter = createAuditWriter(prisma);
+
   return startWorker(
     deps,
     {
       ...options,
       instanceId: options.instanceId ?? workerInstanceId(),
-      hooks: buildHookBus(options.plugins ?? defaultPlugins(process.env, log), log),
+      hooks: buildHookBus(
+        options.plugins ?? defaultPlugins(process.env, log, auditWriter),
+        log,
+      ),
     },
     sleep,
   );

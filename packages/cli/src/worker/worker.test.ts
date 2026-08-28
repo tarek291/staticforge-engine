@@ -40,6 +40,7 @@ function job(over: Partial<ClaimedJobLike> = {}): ClaimedJobLike {
     id: "job_1",
     projectId: "prj_1",
     userId: "local-operator",
+    organizationId: "org-1",
     kind: "GENERATE",
     locale: "de",
     targetSlug: null,

@@ -177,7 +177,14 @@ describe("getProjectForUser", () => {
 
 describe("enqueueJob", () => {
   test("verifies ownership in the same query, not before it", async () => {
-    prisma.project.findFirst.mockResolvedValue({ id: "prj_1" } as never);
+    prisma.project.findFirst.mockResolvedValue({
+      id: "prj_1",
+      organizationId: "org-1",
+    } as never);
+    // Phase 23: enqueuing is a write and is gated on `project:write`.
+    prisma.organizationMember.findUnique.mockResolvedValue({
+      role: "EDITOR",
+    } as never);
     prisma.generationJob.create.mockResolvedValue(jobRow() as never);
 
     await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "BUILD", prisma);
@@ -197,7 +204,14 @@ describe("enqueueJob", () => {
   });
 
   test("stamps the job with the owner, so reads need no join", async () => {
-    prisma.project.findFirst.mockResolvedValue({ id: "prj_1" } as never);
+    prisma.project.findFirst.mockResolvedValue({
+      id: "prj_1",
+      organizationId: "org-1",
+    } as never);
+    // Phase 23: enqueuing is a write and is gated on `project:write`.
+    prisma.organizationMember.findUnique.mockResolvedValue({
+      role: "EDITOR",
+    } as never);
     prisma.generationJob.create.mockResolvedValue(jobRow() as never);
 
     await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "GENERATE", prisma);
@@ -211,7 +225,14 @@ describe("enqueueJob", () => {
   });
 
   test("starts a job pending and unfinished", async () => {
-    prisma.project.findFirst.mockResolvedValue({ id: "prj_1" } as never);
+    prisma.project.findFirst.mockResolvedValue({
+      id: "prj_1",
+      organizationId: "org-1",
+    } as never);
+    // Phase 23: enqueuing is a write and is gated on `project:write`.
+    prisma.organizationMember.findUnique.mockResolvedValue({
+      role: "EDITOR",
+    } as never);
     prisma.generationJob.create.mockResolvedValue(jobRow() as never);
 
     const job = await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "BUILD", prisma);

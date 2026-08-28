@@ -7,6 +7,7 @@ import {
 } from "@staticforge/core";
 import type { Location, Service } from "@staticforge/schemas";
 
+import { requireCapability } from "./access.js";
 import { affectedSlugs, findAffectedPages } from "./impact.js";
 import { withDbRetry } from "./retry.js";
 
@@ -39,6 +40,14 @@ import { withDbRetry } from "./retry.js";
 export interface SyncSnapshot {
   services: Map<string, string>;
   locations: Map<string, string>;
+  /**
+   * The organization the project belongs to.
+   *
+   * Read here rather than in a second query, because the authorisation gate
+   * needs it and a gate that costs an extra round trip is a gate somebody
+   * eventually argues for skipping.
+   */
+  organizationId: string;
 }
 
 /**
@@ -183,6 +192,7 @@ export async function loadSyncSnapshot(
       where: { id: projectId, userId },
       select: {
         id: true,
+        organizationId: true,
         services: true,
         locations: true,
       },
@@ -194,6 +204,7 @@ export async function loadSyncSnapshot(
   }
 
   return {
+    organizationId: project.organizationId,
     services: new Map(
       project.services.map((row) => [
         row.id,
@@ -330,11 +341,13 @@ async function announceSync(
   hooks: HookBus,
   projectId: string,
   userId: string,
+  organizationId: string | null,
   result: SyncResult,
 ): Promise<void> {
   await hooks.emit("afterProjectSync", {
     projectId,
     userId,
+    organizationId,
     changed: result.changed,
     jobId: result.jobId,
     servicesAdded: result.diff.services.added.length,
@@ -443,6 +456,17 @@ export async function syncProject(
     return null;
   }
 
+  // The authorisation gate, and it is the first thing that happens after the
+  // project is located. A sync writes tenant data and enqueues paid work, so it
+  // needs `project:write` — which a VIEWER does not have. Placed here rather
+  // than in each of the three callers, because a check per caller is a check
+  // somebody forgets to add to the fourth.
+  //
+  // This throws rather than returning null. A refusal is not "no such project",
+  // and collapsing the two would leave a caller unable to tell an operator
+  // whether to fix an id or ask for a role.
+  await requireCapability(snapshot.organizationId, userId, "project:write", prisma);
+
   const diff = diffSyncPayload(payload, snapshot);
 
   const hooks = options.hooks ?? noopHookBus();
@@ -458,7 +482,7 @@ export async function syncProject(
       note: "The incoming data matches what this project already holds.",
     };
 
-    await announceSync(hooks, projectId, userId, unchanged);
+    await announceSync(hooks, projectId, userId, snapshot.organizationId, unchanged);
 
     return unchanged;
   }
@@ -575,7 +599,7 @@ export async function syncProject(
       note: "Applied, but no run was queued: this caller supplied no queue.",
     };
 
-    await announceSync(hooks, projectId, userId, applied);
+    await announceSync(hooks, projectId, userId, snapshot.organizationId, applied);
 
     return applied;
   }
@@ -594,7 +618,7 @@ export async function syncProject(
       note: `Applied, but no run was queued: ${plan.reason}`,
     };
 
-    await announceSync(hooks, projectId, userId, quiet);
+    await announceSync(hooks, projectId, userId, snapshot.organizationId, quiet);
 
     return quiet;
   }
@@ -602,7 +626,7 @@ export async function syncProject(
   const jobId = await options.enqueueJob(projectId, userId, plan.scope);
   const result: SyncResult = { changed: true, diff, jobId, scope: plan.scope };
 
-  await announceSync(hooks, projectId, userId, result);
+  await announceSync(hooks, projectId, userId, snapshot.organizationId, result);
 
   return result;
 }

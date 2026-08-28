@@ -6,6 +6,7 @@ import {
   WEBHOOK_SECRET_ENV_VAR,
 } from "@staticforge/core";
 import {
+  AccessDeniedError,
   LOCAL_OPERATOR_ID,
   describeSyncDiff,
   enqueueJob,
@@ -88,7 +89,10 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const result = await syncProject(
+  let result: Awaited<ReturnType<typeof syncProject>>;
+
+  try {
+    result = await syncProject(
     parsedProjectId.data,
     LOCAL_OPERATOR_ID,
     parsed.payload,
@@ -108,7 +112,23 @@ export async function POST(request: Request): Promise<Response> {
         return job?.id ?? null;
       },
     },
-  );
+    );
+  } catch (error: unknown) {
+    if (error instanceof AccessDeniedError) {
+      // A webhook holding a valid secret is still only as privileged as the
+      // user it acts as. A shared secret authenticates the *caller*; it does
+      // not decide what that caller may do, and conflating the two is how an
+      // integration token becomes an administrator.
+      //
+      // 403 for a member whose role is too weak; 404 for one with no
+      // membership, which reads the same as a project that is not there.
+      return error.heldRole === null
+        ? Response.json({ error: "Project not found." }, { status: 404 })
+        : Response.json({ error: error.message }, { status: 403 });
+    }
+
+    throw error;
+  }
 
   if (result === null) {
     // Deliberately indistinguishable from "no such project", so an

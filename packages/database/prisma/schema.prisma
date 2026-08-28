@@ -27,10 +27,26 @@ model Workspace {
   /// URL-safe tenant handle. Globally unique — it identifies the tenant.
   slug String @unique
 
+  /// The organization this workspace belongs to.
+  ///
+  /// The default exists so this column could be added to a populated table and
+  /// names the single local organization, exactly as `Project.userId` names the
+  /// single local operator. It is a migration affordance, not a fallback: a
+  /// workspace whose organization is "whatever the default was" is a workspace
+  /// nobody has decided the ownership of.
+  organizationId String       @default("org-local")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
   projects Project[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  /// Not redundant with the primary key. It is what lets `Project` carry a
+  /// composite foreign key to `(id, organizationId)`, which is what makes a
+  /// project's organization impossible to disagree with its workspace's.
+  @@unique([id, organizationId])
+  @@index([organizationId])
 }
 
 /// One generated site. Owns the input entities and the generated output.
@@ -69,8 +85,23 @@ model Project {
   /// separate decisions, and a tenant may pair them however it likes.
   contentProfileId String @default("default")
 
+  /// The organization this project belongs to, and what every authorisation
+  /// check is decided against.
+  ///
+  /// Denormalised from the workspace, for the reason `GenerationJob.userId` is
+  /// denormalised from the project: every read of this table is scoped, and a
+  /// scope that needs a join is a scope somebody eventually writes without.
+  ///
+  /// Unlike most denormalisation, this one cannot drift. The foreign key below
+  /// is composite — it points at `Workspace(id, organizationId)` — so Postgres
+  /// itself refuses a project whose organization differs from its workspace's.
+  /// The invariant is expressed in the schema rather than in a comment asking
+  /// people to remember it.
+  organizationId String       @default("org-local")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
   workspaceId String
-  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workspace   Workspace @relation(fields: [workspaceId, organizationId], references: [id, organizationId], onDelete: Cascade)
 
   business       Business?
   content        ContentTemplate?
@@ -85,6 +116,7 @@ model Project {
   @@unique([workspaceId, slug])
   @@index([workspaceId])
   @@index([userId])
+  @@index([organizationId])
 }
 
 /// What a job was asked to do.
@@ -481,4 +513,134 @@ model GeneratedPage {
   @@index([projectId])
   @@index([serviceId])
   @@index([locationId])
+}
+
+// ---------------------------------------------------------------------------
+// Enterprise layer: organizations, membership, and the audit trail
+// ---------------------------------------------------------------------------
+
+/// What a member may do inside an organization.
+///
+/// Ordered, and the order is the whole authorisation model: OWNER > EDITOR >
+/// VIEWER. A rank comparison rather than a permission matrix, because a matrix
+/// invites per-action exceptions and the first exception is the one nobody
+/// reviews. Where an action genuinely needs more than "can write" — deleting a
+/// project, changing who is a member — it is expressed as requiring OWNER, not
+/// as a special case bolted onto EDITOR.
+enum OrgRole {
+  /// Full control, including deleting projects and managing membership.
+  OWNER
+  /// May change content and run the engine. May not delete a project or add a
+  /// member — both are actions whose damage outlives the person doing them.
+  EDITOR
+  /// Read only. Explicitly cannot sync, generate, or edit.
+  VIEWER
+}
+
+/// The tenant root, and the thing that is billed.
+///
+/// `Workspace` held this position before this phase and still groups projects,
+/// but it had no concept of a person: every query scoped on a `userId` column
+/// that defaulted to a single local operator. An organization is where people
+/// and their roles live, so it becomes the root that authorisation is decided
+/// against.
+///
+/// The two are deliberately *not* merged here. Renaming a populated model is a
+/// destructive migration and deserves to be its own change, reviewed on its own
+/// terms, rather than a side effect of adding roles.
+model Organization {
+  id   String @id @default(cuid())
+  name String
+
+  /// URL-safe handle. Globally unique — it identifies the tenant.
+  slug String @unique
+
+  members    OrganizationMember[]
+  workspaces Workspace[]
+  projects   Project[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// One person's role in one organization.
+///
+/// The row *is* the membership: no row means no access, which is the same
+/// answer as an organization that does not exist. That equivalence is
+/// deliberate — an authorisation check that distinguished "you are not a
+/// member" from "no such organization" would be a way to enumerate tenants.
+model OrganizationMember {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  /// The user this membership is for. A plain column rather than a relation
+  /// because there is no user table yet — authentication is still unbuilt, and
+  /// inventing half of it here would produce a model the real one has to
+  /// undo. What matters now is that the *role* is stored and enforced.
+  userId String
+
+  role OrgRole @default(VIEWER)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One role per person per organization. Two rows would make the answer to
+  /// "what may this user do" depend on which one was read first, and the
+  /// generous reading is the one that would win in practice.
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+/// An append-only record of what happened, and who caused it.
+///
+/// Not a log file. A log is trimmed, rotated and read by whoever has shell
+/// access; this is a table a customer can be shown, scoped to their own
+/// organization, when they ask who changed a page or what a sync did.
+///
+/// ## Why nothing cascades into it
+///
+/// `resourceId` is a plain string and not a relation, so deleting a project
+/// does not delete the record of the project being deleted. A trail that
+/// disappears with the thing it describes cannot answer the question it exists
+/// for, and "who removed this" is the question an audit log is bought for.
+model AuditLog {
+  id String @id @default(cuid())
+
+  /// What happened, as a stable dotted name: `project.synced`, `job.completed`.
+  /// Stable because these are queried and alerted on; renaming one silently
+  /// breaks every saved filter built against it.
+  action String
+
+  /// The thing it happened to — a project id, a job id, a page slug. Untyped
+  /// on purpose: the trail must be able to record an action against something
+  /// that has since been deleted.
+  resourceId String
+
+  /// Who caused it. Denormalised for the same reason `GenerationJob.userId` is:
+  /// every read of this table is scoped, and a scope that needs a join is a
+  /// scope somebody eventually writes without.
+  userId String
+
+  /// The organization the event belongs to, for scoping and export.
+  ///
+  /// Nullable because a local run legitimately has no organization, and a
+  /// record with no home is still better than no record. Rows without one are
+  /// invisible to a tenant-scoped read, which is the correct outcome: they did
+  /// not happen to a tenant.
+  organizationId String?
+
+  /// Everything else, as a flat JSON object. Deliberately unconstrained: an
+  /// audit trail whose shape is pinned by a schema stops recording the fields
+  /// that were added after it, which are exactly the ones an investigation
+  /// needs.
+  details Json @default("{}")
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([userId, createdAt])
+  @@index([resourceId, createdAt])
+  @@index([action, createdAt])
 }

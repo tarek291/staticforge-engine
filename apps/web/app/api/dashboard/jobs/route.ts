@@ -1,5 +1,10 @@
 import { ProjectIdSchema } from "@staticforge/core";
-import { LOCAL_OPERATOR_ID, enqueueJob, prisma } from "@staticforge/database";
+import {
+  AccessDeniedError,
+  LOCAL_OPERATOR_ID,
+  enqueueJob,
+  prisma,
+} from "@staticforge/database";
 import { LocaleSchema } from "@staticforge/schemas";
 
 import {
@@ -95,13 +100,30 @@ export async function POST(request: Request): Promise<Response> {
 
   // Ownership is checked inside enqueueJob, in the same query that finds the
   // project — so a project belonging to another tenant is simply not found.
-  const job = await enqueueJob(
-    parsedProjectId.data,
-    LOCAL_OPERATOR_ID,
-    kind,
-    prisma,
-    target,
-  );
+  // The role check happens there too, before the row is written.
+  let job: Awaited<ReturnType<typeof enqueueJob>>;
+
+  try {
+    job = await enqueueJob(
+      parsedProjectId.data,
+      LOCAL_OPERATOR_ID,
+      kind,
+      prisma,
+      target,
+    );
+  } catch (error: unknown) {
+    if (error instanceof AccessDeniedError) {
+      // 403 for a member whose role is too weak, 404 for someone with no
+      // membership at all — the second is indistinguishable from a project that
+      // does not exist, which is the point. A single status for both would let
+      // a caller confirm an id by the error it produced.
+      return error.heldRole === null
+        ? Response.json({ error: "Project not found." }, { status: 404 })
+        : Response.json({ error: error.message }, { status: 403 });
+    }
+
+    throw error;
+  }
 
   if (job === null) {
     // Deliberately indistinguishable from "no such project": a caller must not

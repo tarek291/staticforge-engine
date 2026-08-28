@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import type { JobKind, JobStatus, PrismaClient } from "@prisma/client";
 
+import { requireCapability } from "./access.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -282,7 +283,12 @@ export async function getProjectForUser(
  * project either way, because the link graph and the sitemap are computed
  * across every page. Narrowing it further would publish a site missing most of
  * itself in order to save a few model calls.
- * @returns The queued job, or `null` when the user does not own the project.
+ * @returns The queued job, or `null` when the project does not exist.
+ * @throws {AccessDeniedError} If the caller may not write to the project. A
+ * queued job spends money on a paid AI run, so this is a write in every sense
+ * that matters and a VIEWER may not perform it. Distinct from `null`: "no such
+ * project" and "not allowed" are different problems, and an operator who cannot
+ * tell them apart does not know whether to fix an id or ask for a role.
  */
 export async function enqueueJob(
   projectId: string,
@@ -294,12 +300,18 @@ export async function enqueueJob(
 ): Promise<JobSummary | null> {
   const project = await prisma.project.findFirst({
     where: { id: projectId, userId },
-    select: { id: true },
+    select: { id: true, organizationId: true },
   });
 
   if (project === null) {
     return null;
   }
+
+  // The gate, before the row is written rather than after. Enqueuing is the
+  // cheapest-looking write in the system and the most expensive one to get
+  // wrong: the row itself costs nothing, and the run it causes is the only
+  // line in this product with a real marginal cost.
+  await requireCapability(project.organizationId, userId, "project:write", prisma);
 
   const job = await prisma.generationJob.create({
     data: {

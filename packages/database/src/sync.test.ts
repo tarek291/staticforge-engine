@@ -32,7 +32,20 @@ let prisma: DeepMockProxy<PrismaClient>;
 
 beforeEach(() => {
   prisma = mockDeep<PrismaClient>();
+  // Phase 23: a sync is gated on `project:write`. Unless a test says otherwise,
+  // the caller is an OWNER — these suites are about change detection, not about
+  // access, and an unarmed membership would make every one of them fail for the
+  // wrong reason.
+  armRole("OWNER");
 });
+
+/** Arm the membership lookup the authorisation gate reads. */
+function armRole(role: "OWNER" | "EDITOR" | "VIEWER" | null): void {
+  prisma.organizationMember.findUnique.mockResolvedValue(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (role === null ? null : { role }) as any,
+  );
+}
 
 const service: Service = {
   id: "svc-1",
@@ -55,6 +68,7 @@ function snapshotOf(
   locations: Location[] = [location],
 ): SyncSnapshot {
   return {
+    organizationId: "org-1",
     services: new Map(services.map((item) => [item.id, fingerprintService(item)])),
     locations: new Map(locations.map((item) => [item.id, fingerprintLocation(item)])),
   };
@@ -106,6 +120,7 @@ describe("nothing changed means nothing happens", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     prisma.project.findFirst.mockResolvedValue({
       id: "prj_1",
+      organizationId: "org-1",
       services: [
         {
           id: "svc-1",
@@ -157,6 +172,7 @@ describe("a real change is detected and queued", () => {
   function armSnapshot(): void {
     prisma.project.findFirst.mockResolvedValue({
       id: "prj_1",
+      organizationId: "org-1",
       services: [
         {
           id: "svc-1",
@@ -422,6 +438,7 @@ function armTwoServiceProject(): void {
 
   prisma.project.findFirst.mockResolvedValue({
     id: "prj_1",
+    organizationId: "org-1",
     services: [row(service), row(SERVICE_B)],
     locations: [
       {
@@ -533,6 +550,7 @@ describe("a changed service queues only its own pages", () => {
     const added = diffSyncPayload(
       { services: [service, SERVICE_B] },
       {
+        organizationId: "org-1",
         services: new Map([["svc-1", fingerprintService(service)]]),
         locations: new Map(),
       },
@@ -554,6 +572,7 @@ describe("a changed service queues only its own pages", () => {
     const removed = diffSyncPayload(
       { services: [] },
       {
+        organizationId: "org-1",
         services: new Map([["svc-1", fingerprintService(service)]]),
         locations: new Map(),
       },
@@ -734,5 +753,180 @@ describe("a hand-edited page is never queued", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]?.jobId).toBeNull();
     expect(seen[0]?.scopedPages).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 23: no write passes without a role check
+// ---------------------------------------------------------------------------
+
+/**
+ * A sync writes tenant data and enqueues paid work. It is a write in every
+ * sense, and a VIEWER may not perform one.
+ *
+ * The tests that matter here assert what did *not* happen. A gate that refuses
+ * after the transaction has already run is not a gate — it is an error message
+ * printed over a completed write.
+ */
+describe("a VIEWER is refused a sync", () => {
+  test("syncProject throws AccessDenied for a VIEWER", async () => {
+    armTwoServiceProject();
+    armRole("VIEWER");
+
+    await expect(
+      syncProject("prj_1", "viewer-user", editFirstService(), prisma, {
+        enqueueJob: vi.fn(),
+      }),
+    ).rejects.toMatchObject({ name: "AccessDeniedError", heldRole: "VIEWER" });
+  });
+
+  test("nothing is written and nothing is queued", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "AI",
+      },
+    ]);
+    armRole("VIEWER");
+
+    const enqueue = vi.fn();
+
+    await syncProject("prj_1", "viewer-user", editFirstService(), prisma, {
+      enqueueJob: enqueue,
+    }).catch(() => undefined);
+
+    // The refusal has to precede the effects, or it is decoration.
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(prisma.service.upsert).not.toHaveBeenCalled();
+    expect(prisma.location.upsert).not.toHaveBeenCalled();
+  });
+
+  test("the gate runs before the impact query, not after it", async () => {
+    armTwoServiceProject();
+    armRole("VIEWER");
+
+    await syncProject("prj_1", "viewer-user", editFirstService(), prisma, {
+      enqueueJob: vi.fn(),
+    }).catch(() => undefined);
+
+    // A refused caller must not learn which pages exist. An authorisation check
+    // that happens after the read it protects has already disclosed the thing
+    // it was protecting.
+    expect(prisma.generatedPage.findMany).not.toHaveBeenCalled();
+  });
+
+  test("a dry run is refused too", async () => {
+    armTwoServiceProject();
+    armRole("VIEWER");
+
+    // `--dry-run` writes nothing, which is exactly why it looks harmless. It
+    // still reports what a project holds and what a change would cost, and that
+    // is information a read-only member of *another* role level should get
+    // through a read endpoint rather than by asking a write endpoint nicely.
+    await expect(
+      syncProject("prj_1", "viewer-user", editFirstService(), prisma, {
+        enqueue: false,
+        enqueueJob: vi.fn(),
+      }),
+    ).rejects.toMatchObject({ name: "AccessDeniedError" });
+  });
+
+  test("someone with no membership at all is refused, and told nothing", async () => {
+    armTwoServiceProject();
+    armRole(null);
+
+    let error: { message: string; heldRole: string | null } | undefined;
+
+    try {
+      await syncProject("prj_1", "stranger", editFirstService(), prisma, {
+        enqueueJob: vi.fn(),
+      });
+    } catch (thrown: unknown) {
+      error = thrown as { message: string; heldRole: string | null };
+    }
+
+    // Asserted rather than assumed: a capture that quietly kept `undefined`
+    // would make this test pass against code that allowed the sync.
+    expect(error).toBeDefined();
+    expect(error?.heldRole).toBeNull();
+    // The same sentence an organization that does not exist would produce.
+    expect(error?.message).toMatch(/^No access to organization/);
+  });
+});
+
+describe("an EDITOR may sync", () => {
+  test("an EDITOR passes the gate and the sync proceeds", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "AI",
+      },
+    ]);
+    armRole("EDITOR");
+
+    const enqueue = vi.fn().mockResolvedValue("job_1");
+
+    const result = await syncProject(
+      "prj_1",
+      "editor-user",
+      editFirstService(),
+      prisma,
+      { enqueueJob: enqueue },
+    );
+
+    expect(result?.jobId).toBe("job_1");
+    expect(enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  test("the check is made against the project's own organization", async () => {
+    armTwoServiceProject();
+    armPageTable([]);
+    armRole("EDITOR");
+
+    await syncProject("prj_1", "editor-user", editFirstService(), prisma, {
+      enqueueJob: vi.fn(),
+    });
+
+    // Not against an organization the caller happened to name. The project
+    // decides which membership is consulted.
+    expect(prisma.organizationMember.findUnique).toHaveBeenCalledWith({
+      where: {
+        organizationId_userId: { organizationId: "org-1", userId: "editor-user" },
+      },
+      select: { role: true },
+    });
+  });
+
+  test("the sync event carries the organization, so the audit row can be scoped", async () => {
+    armTwoServiceProject();
+    armPageTable([]);
+    armRole("EDITOR");
+
+    const seen: Array<{ organizationId: string | null }> = [];
+
+    await syncProject("prj_1", "editor-user", editFirstService(), prisma, {
+      enqueueJob: vi.fn().mockResolvedValue("job_1"),
+      hooks: {
+        on: () => {},
+        count: () => 1,
+        emit: async (_hook, payload) => {
+          seen.push(payload as unknown as (typeof seen)[number]);
+          return { hook: "afterProjectSync" as const, delivered: 1, failures: [] };
+        },
+      },
+    });
+
+    // An audit row that cannot say which organization it belongs to is one that
+    // organization can never be shown.
+    expect(seen[0]?.organizationId).toBe("org-1");
   });
 });

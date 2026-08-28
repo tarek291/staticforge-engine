@@ -32,6 +32,14 @@ export interface ClaimedJob {
   id: string;
   projectId: string;
   userId: string;
+  /**
+   * The organization this job belongs to.
+   *
+   * Read on the claim, from the project, so the lifecycle event the worker
+   * emits can be scoped to a tenant. An audit row that cannot say which
+   * organization it belongs to is one that organization can never be shown.
+   */
+  organizationId: string;
   kind: JobKind;
   status: JobStatus;
   locale: string;
@@ -145,7 +153,7 @@ export async function claimNextJob(
         targetSlugs: true,
         completedCount: true,
         totalCount: true,
-        project: { select: { locale: true } },
+        project: { select: { locale: true, organizationId: true } },
       },
     }),
   );
@@ -160,6 +168,7 @@ export async function claimNextJob(
     id: job.id,
     projectId: job.projectId,
     userId: job.userId,
+    organizationId: job.project.organizationId,
     kind: job.kind,
     status: job.status,
     locale: job.project.locale,

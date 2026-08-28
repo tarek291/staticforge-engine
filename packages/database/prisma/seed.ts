@@ -26,6 +26,32 @@ import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient({ log: ["error"] });
 
+/**
+ * The organization every seeded row belongs to.
+ *
+ * Its id is the literal default on `Workspace.organizationId` and
+ * `Project.organizationId`, so a column added to a populated table lands on a
+ * row that exists. That coupling is deliberate and worth keeping: change one
+ * and the other stops resolving, which is a foreign-key error at seed time
+ * rather than a silently orphaned tenant.
+ */
+const ORGANIZATION = {
+  id: "org-local",
+  name: "Local Operator",
+  slug: "local",
+} as const;
+
+/**
+ * The single operator, as an OWNER.
+ *
+ * Matches `LOCAL_OPERATOR_ID`. Until there is authentication this is the only
+ * identity the system has, and seeding it as OWNER is what keeps the local
+ * workflow working now that every write passes an authorisation gate — a seed
+ * that produced a database its own CLI could not sync would be worse than no
+ * seed.
+ */
+const OWNER_USER_ID = "local-operator";
+
 const WORKSPACE = {
   id: "ws-glanzfix",
   name: "GlanzFix",
@@ -206,17 +232,34 @@ const LOCATIONS: SeedLocation[] = [
 ];
 
 async function seed(): Promise<void> {
+  const organization = await prisma.organization.upsert({
+    where: { slug: ORGANIZATION.slug },
+    create: { ...ORGANIZATION },
+    update: { name: ORGANIZATION.name },
+  });
+
+  await prisma.organizationMember.upsert({
+    where: {
+      organizationId_userId: {
+        organizationId: organization.id,
+        userId: OWNER_USER_ID,
+      },
+    },
+    create: { organizationId: organization.id, userId: OWNER_USER_ID, role: "OWNER" },
+    update: { role: "OWNER" },
+  });
+
   const workspace = await prisma.workspace.upsert({
     where: { slug: WORKSPACE.slug },
-    create: { ...WORKSPACE },
-    update: { name: WORKSPACE.name },
+    create: { ...WORKSPACE, organizationId: organization.id },
+    update: { name: WORKSPACE.name, organizationId: organization.id },
   });
 
   const project = await prisma.project.upsert({
     where: {
       workspaceId_slug: { workspaceId: workspace.id, slug: PROJECT.slug },
     },
-    create: { ...PROJECT, workspaceId: workspace.id },
+    create: { ...PROJECT, workspaceId: workspace.id, organizationId: organization.id },
     update: {
       name: PROJECT.name,
       description: PROJECT.description,

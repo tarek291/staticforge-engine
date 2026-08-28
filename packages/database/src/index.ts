@@ -43,12 +43,18 @@ export * from "./repository.js";
 export * from "./queue.js";
 export * from "./sync.js";
 export * from "./impact.js";
+export * from "./access.js";
+export * from "./audit.js";
 export * from "./registry.js";
 export * from "./registry-seed.js";
 export * from "./tenant.js";
 
 export { PrismaClient } from "@prisma/client";
 export type {
+  Organization,
+  OrganizationMember,
+  OrgRole,
+  AuditLog,
   Workspace,
   Project,
   Service,
