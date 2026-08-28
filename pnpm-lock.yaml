@@ -88,6 +88,9 @@ importers:
 
   packages/cli:
     dependencies:
+      '@staticforge/ai':
+        specifier: workspace:*
+        version: link:../ai
       '@staticforge/core':
         specifier: workspace:*
         version: link:../core

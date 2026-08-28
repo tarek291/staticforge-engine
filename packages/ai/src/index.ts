@@ -8,3 +8,5 @@ export * from "./service.js";
 export * from "./mock.js";
 export * from "./router.js";
 export * from "./generate.js";
+export * from "./agents/gap-analysis.schema.js";
+export * from "./agents/gap-analysis.js";

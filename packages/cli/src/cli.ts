@@ -27,6 +27,7 @@ Commands:
   build                 Generate, validate and build once, in this process.
   worker                Run the queue worker until stopped.
   sync                  Pull services and locations from a published sheet.
+  analyze               Ask the AI analyst which pages are worth building next.
 
 build options:
   --locale <de|en>      Content locale. Default: de
@@ -42,6 +43,13 @@ sync options:
   --project-id <id>     Project to sync into. Required.
   --url <url>           Published CSV to pull from. Required.
   --dry-run             Report what would change, and write nothing.
+
+analyze options:
+  --project-id <id>     Project to analyse. Required.
+  --gaps-only           List the missing combinations without asking the model.
+
+The analyze command is read-only: it queues nothing and writes nothing.
+Acting on the advice is a separate, deliberate step.
 
 Exits non-zero if any stage fails, and never reaches the build when an
 earlier stage did.`;
@@ -210,6 +218,144 @@ async function runSync(values: Record<string, unknown>): Promise<void> {
   console.log(`✓ queued job ${result.jobId} — a worker will pick it up.`);
 }
 
+/**
+ * Ask the analyst which pages are worth building next.
+ *
+ * Read-only, and structurally so: this function loads a project and calls an
+ * agent that imports nothing capable of writing. It cannot queue a run or
+ * change a row even by mistake.
+ *
+ * Acting on the advice stays a separate, deliberate step. An analyst that
+ * enqueued what it recommended would turn a suggestion into a purchase order,
+ * and the operator would find out what it decided by reading the bill.
+ */
+async function runAnalyze(values: Record<string, unknown>): Promise<void> {
+  const projectId = values["project-id"] as string | undefined;
+  const gapsOnly = values["gaps-only"] === true;
+
+  if (projectId === undefined) {
+    console.error("--project-id is required.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const { getProjectPayload, prisma, resolveOperatorId } = await import(
+    "@staticforge/database"
+  );
+  const userId = resolveOperatorId();
+
+  const payload = await getProjectPayload(projectId, userId, prisma).catch(
+    (error: unknown) => {
+      console.error(
+        `✗ ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return null;
+    },
+  );
+
+  if (payload === null) {
+    process.exitCode = 1;
+    return;
+  }
+
+  const business = payload.businesses[0];
+
+  if (business === undefined) {
+    console.error(`✗ Project "${projectId}" has no business record.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // Existing coverage, read straight from the pages table. Nothing is written.
+  const existing = await prisma.generatedPage.findMany({
+    where: { projectId, project: { userId } },
+    select: { serviceId: true, locationId: true },
+  });
+
+  const { analyzeContentGaps, findContentGaps } = await import("@staticforge/ai");
+
+  const input = {
+    business,
+    services: payload.services,
+    locations: payload.locations,
+    existingPages: existing,
+  };
+
+  const gaps = findContentGaps(input);
+  const grid = payload.services.length * payload.locations.length;
+
+  console.log(
+    `${payload.services.length} service(s) × ${payload.locations.length} location(s) = ${grid} possible pages`,
+  );
+  console.log(`${existing.length} exist, ${gaps.length} missing`);
+
+  if (gapsOnly || gaps.length === 0) {
+    if (gaps.length === 0) {
+      console.log("\n✓ Every combination already has a page.");
+    } else {
+      // The list is exact and free. An operator who only wants it should not
+      // have to buy an opinion about it.
+      console.log("");
+      for (const gap of gaps.slice(0, 50)) {
+        console.log(`  · ${gap.serviceName} in ${gap.cityName}  (${gap.serviceId} × ${gap.locationId})`);
+      }
+      if (gaps.length > 50) {
+        console.log(`  … and ${gaps.length - 50} more`);
+      }
+    }
+    await prisma.$disconnect();
+    return;
+  }
+
+  console.log(`\n… asking the analyst (this is one paid call)`);
+
+  try {
+    const result = await analyzeContentGaps(input);
+
+    console.log(`\n${result.analysis.summary}\n`);
+
+    if (result.analysis.recommendedPages.length > 0) {
+      console.log("Recommended pages:");
+      for (const page of result.analysis.recommendedPages) {
+        const service = payload.services.find((item) => item.id === page.serviceId);
+        const location = payload.locations.find((item) => item.id === page.locationId);
+        console.log(
+          `  [${page.priority}] ${service?.name ?? page.serviceId} in ${location?.city ?? page.locationId}`,
+        );
+        console.log(`      ${page.rationale}`);
+      }
+    }
+
+    if (result.analysis.suggestedNewServices.length > 0) {
+      console.log(`\nServices worth adding:`);
+      for (const service of result.analysis.suggestedNewServices) {
+        console.log(`  [${service.priority}] ${service.name}`);
+        console.log(`      ${service.rationale}`);
+      }
+    }
+
+    if (result.discarded.length > 0) {
+      // Surfaced, not swallowed. An analyst quietly dropping part of its own
+      // answer is one nobody should trust.
+      console.log(
+        `\n! ${result.discarded.length} recommendation(s) were discarded as ungrounded:`,
+      );
+      for (const item of result.discarded.slice(0, 10)) {
+        console.log(`  - ${item.serviceId} × ${item.locationId}: ${item.reason}`);
+      }
+    }
+
+    console.log(`\nNothing was queued and nothing was written.`);
+  } catch (error: unknown) {
+    console.error(
+      `\n✗ ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`,
+    );
+    process.exitCode = 1;
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
     options: {
@@ -221,6 +367,7 @@ async function main(): Promise<void> {
       "lease-ms": { type: "string" },
       url: { type: "string" },
       "dry-run": { type: "boolean", default: false },
+      "gaps-only": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: true,
@@ -240,6 +387,11 @@ async function main(): Promise<void> {
 
   if (command === "sync") {
     await runSync(values);
+    return;
+  }
+
+  if (command === "analyze") {
+    await runAnalyze(values);
     return;
   }
 
