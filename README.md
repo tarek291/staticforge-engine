@@ -2,18 +2,106 @@
 
 A schema-driven static site generation engine, organized as a pnpm monorepo.
 
-> **Status:** 🟢 Phases 01–26 delivered. End-to-end pipeline working against a
+> **Status:** 🟢 Phases 01–27 delivered. End-to-end pipeline working against a
 > live Supabase PostgreSQL instance, with a standalone queue worker, a data-sync
 > boundary, headless block editing, database-backed templates, a plugin runtime,
 > a read-only AI gap analyst, incremental publishing that re-authors only the
 > pages a change reached, an RBAC organization layer with a database audit
 > trail, a distributed token bucket that keeps several workers inside one
 > tenant's provider allowance, hashed per-organization API keys, and metered
-> usage behind hard quotas. **Not yet deployed, and there is no
-> authentication layer for people** (Phase 23 added authorization; Phase 25
-> added machine credentials, not human identity) — see
+> usage behind hard quotas, and a `User` table with a Supabase session guard.
+> **Not yet deployed, and nothing yet calls that guard** — Phase 23 added
+> authorization, Phase 25 machine credentials, Phase 27 the pieces of human
+> identity, but `userId` is still asserted by callers rather than proved — see
 > [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md)
 > for the full state and the outstanding technical debt.
+
+---
+
+## The map
+
+Twenty-seven phases, grouped into three eras by what each one was solving. The
+grouping is retrospective — the phases were not planned this way, and the
+boundaries fall where the problem changed.
+
+```txt
+                          S T A T I C F O R G E
+        programmatic SEO engine for multi-location service businesses
+
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  ERA I · CORE ENGINE                                     phases 01-13 │
+  │  "produce a page that is worth publishing"                            │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │                                                                       │
+  │   01 content contract ──▶ 02 AI authoring ──▶ 03 fact grounding       │
+  │            │                                        │                 │
+  │            │                                        ▼                 │
+  │            │                              04 versioning + cache       │
+  │            ▼                                                          │
+  │   05 internal link graph ──▶ 06 SEO publishing ──▶ 07 scale (500 pp)  │
+  │                                                          │            │
+  │   08 deploy pipeline ◀── 09 templates ÷ profiles ◀───────┘            │
+  │            │                                                          │
+  │            ▼                                                          │
+  │   10 dashboard ──▶ 11 SaaS foundation ──▶ 12 autonomous refresh       │
+  │                    (tenancy, async jobs)              │               │
+  │                                                       ▼               │
+  │                                    13 hardening · SF-01…SF-25 audit   │
+  └───────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  ERA II · DISTRIBUTED INFRASTRUCTURE                     phases 14-22 │
+  │  "survive a second worker, and stop paying for what did not change"   │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │                                                                       │
+  │   14 queue worker ────────────┐        the engine leaves the web tier │
+  │      lease · claim · resume   │                                       │
+  │                               ▼                                       │
+  │   15 sync layer ──▶ change detection ──▶ 16/17 headless block editing │
+  │      pull · webhooks              │                                   │
+  │                                   ▼                                   │
+  │   18 templates + profiles as rows ──▶ 19 plugin bus (observe-only)    │
+  │                                              │                        │
+  │                                              ▼                        │
+  │   20 AI gap analyst ──▶ 21 impact analysis ──▶ 22 build triggers      │
+  │      (read-only)          only affected pages      on queue drain     │
+  └───────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  ERA III · ENTERPRISE CONTROL PLANE                      phases 23-27 │
+  │  "decide who may do what, and what it costs"                          │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │                                                                       │
+  │   23 organizations · RBAC · audit trail                               │
+  │        OWNER > EDITOR > VIEWER          ──┐                           │
+  │                                           │                           │
+  │   24 distributed token bucket             │  every write passes       │
+  │        atomic, one SQL statement          ├─▶ requireCapability       │
+  │                                           │   then requireQuota       │
+  │   25 API keys (SHA-256, per org) ─────────┤                           │
+  │        a key IS a member ──────────────────┘                          │
+  │                                                                       │
+  │   26 metering + quotas          27 human identity                     │
+  │        checked before                User table · FK · session guard  │
+  │        metered after                 ⚠ guard not yet wired to a route │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  NOT BUILT — the honest half of this map
+  ────────────────────────────────────────────────────────────────────────
+  ✗ authentication as a working gate   nothing calls verifyUserSession;
+                                       userId is asserted, not proved
+  ✗ row-level security                 isolation is application-level only
+  ✗ deployment / CI                    verify is run by hand; worker unhosted
+  ✗ invoicing                          usage is metered, never priced
+  ✗ live AI verification               no ANTHROPIC_API_KEY; doubles only
+  ✗ packages/templates                 still a .gitkeep
+```
+
+> The phases below the map are the record of what was actually built and
+> merged. The eras are a reading of that record, added in Phase 28 — not a plan
+> anything was built against.
 
 ---
 
