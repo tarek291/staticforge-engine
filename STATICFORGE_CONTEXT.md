@@ -1,10 +1,11 @@
 # StaticForge — Architecture & Capability Briefing
 
 **Status:** Engine complete and running against a live Supabase PostgreSQL
-instance. Generation, persistence, queueing, sync and headless editing are all
-verified end to end. Not yet deployed, and there is still no authentication.
+instance. Generation, persistence, queueing, sync, headless editing and
+incremental publishing are all verified end to end. Not yet deployed, and there
+is still no authentication.
 **Audience:** Product and platform planning for the SaaS layer.
-**Last updated:** 2026-08-28 (reflects phases 01–20)
+**Last updated:** 2026-08-28 (reflects phases 01–22)
 
 ---
 
@@ -31,8 +32,10 @@ data contract before it is written, so invalid output cannot reach a build.
 
 The engine runs as a local CLI, as a database-backed multi-tenant service, and
 as a standalone queue worker. The multi-tenant data model, the tenant isolation
-boundary, the persistence layer, the job queue, the data-sync boundary and the
-headless editing API are built, tested, and exercised against the real database.
+boundary, the persistence layer, the job queue, the data-sync boundary, the
+headless editing API and the incremental publishing path are built, tested, and
+exercised against the real database. A change now re-authors only the pages it
+actually reached, and a drained queue triggers the static host's build.
 **What remains is the commercial surface: authentication and tenant scoping,
 deployment, and billing.**
 
@@ -341,14 +344,120 @@ This one asks what the operator should do next.
 Verified read-only against the live database: 3 × 3 = 9 possible pages, 9
 existing, 0 missing, with job and page counts unchanged afterwards.
 
-### 3.11 SEO publishing and internal linking *(Phases 05–06)*
+### 3.11 Impact analysis and incremental publishing *(Phases 21–22)*
+
+A run regenerated a project. That was fine while a project was a demo and wrong
+the moment one was a customer: editing the description of one service in a
+forty-city account re-authored two hundred pages, and paid for every one of
+them, to change five.
+
+**The question the engine could not answer.** The generator cannot know which
+pages a change reached — it never saw the change. The sync layer saw it and does
+not know which pages exist. `findAffectedPages` is where the two meet: given the
+services and locations that moved, it returns the *existing* pages they reach.
+
+- **A hand-edited page is never returned, under any argument.** The exclusion is
+  an allowlist — `source IN (TEMPLATE, AI)` — rather than a `NOT MANUAL`. A
+  `PageSource` added to the schema later would be *included* by a negative filter
+  the moment it existed, and the first anyone would know is a customer's page
+  being overwritten. An allowlist fails the other way: a new source is skipped
+  until someone decides it is safe, which is a conversation rather than an
+  incident.
+- The filter is expressed in the query rather than applied to the result, so a
+  MANUAL page is never in a list at all.
+- Two empty id lists return without querying. Not an optimisation: an `OR` over
+  two empty `IN` filters is exactly the shape a later refactor collapses into a
+  filter that is dropped, at which point every page in the project is "affected"
+  and an empty sync re-authors the account.
+- The read is scoped to the owner as well as the project. With no row-level
+  security behind it, the scope in this query *is* the tenant boundary.
+
+**The queuing rule.** `planSyncRun` produces one of three outcomes, and the
+middle one is the feature:
+
+| Change | Decision | Why |
+| --- | --- | --- |
+| Only **updates** | One job scoped to the reached pages | Existing pages are stale and can be listed |
+| **Added** or **removed** entities | Full run, empty scope | A scope cannot create a page; a removal leaves dangling links |
+| Nothing regenerable reached | **Nothing is queued** | Every reached page is hand-edited, or the project was never generated |
+
+The second row is not a performance nicety. A scoped run after a service was
+added would queue a job for pages that do not exist, do nothing, report success,
+and leave the new service unpublished with no error anywhere.
+
+The third is the one worth being careful about, because "queued nothing" and
+"queued everything" look identical from outside until the bill arrives. The
+reason is returned and reported, so an operator can tell them apart.
+
+**What a scope is allowed to narrow.** The AI authoring pass, and nothing else.
+The run still builds, links and persists the whole project — the link graph is
+computed across every page, the sitemap describes all of them, the file output is
+cleared and rewritten whole, and `saveGeneratedPages` keeps its delete-stale
+logic because the run still produces every slug. A run that wrote only its scope
+would publish a site missing everything else. Authoring is the only step with a
+marginal cost, so it is the only step worth narrowing.
+
+**Why an out-of-scope page keeps stale content.** A page outside the scope is
+restored from storage *without* the `sourceHash` check that governs resumption,
+and that inversion is what makes a scope safe to pass. Resumption asks "is this
+prose still current?", and for a stale page the honest answer is no. A scope
+asserts something different — "this page is not this run's business" — and
+applying the freshness test would answer that by overwriting a paid, authored
+page with template assembly.
+
+An empty scope authors nothing rather than being read as "the caller meant
+everything"; a scope that fails to arrive costs a full run, which is expensive
+and correct rather than cheap and silently wrong. The scope travels on
+`GenerationJob.targetSlugs` and reaches the engine through the environment, not
+`argv`, because a Windows spawn goes through a shell and a list of hundreds of
+slugs is the worst case for that.
+
+### 3.12 Static build triggers *(Phase 22)*
+
+The engine writes pages to a database and to disk; a static host builds a site
+from them at a moment of its own choosing. Between those two facts is a gap in
+which a customer's site shows yesterday's content and nothing anywhere is wrong.
+
+`afterQueueDrained` closes it. The event fires on the **transition** to idle,
+never on an already-idle tick: a worker polling an empty queue every three
+seconds would otherwise announce a drain twenty times a minute, and any listener
+acting on it would act just as often. One sync that queues ten jobs is one
+build, not ten.
+
+`createStaticBuildTriggerPlugin` posts to `DEPLOY_WEBHOOK_URL`. It is
+deliberately not named for a host — Vercel, Netlify, Cloudflare Pages and GitHub
+all expose the same primitive, a URL that starts a build when something POSTs to
+it.
+
+- **A drain following only failures publishes nothing.** The content on disk is
+  already what the host serves, so a build would spend money to change nothing
+  and would make a failing queue look like a working one. A *partial* success
+  still deploys: one page that built is one page worth publishing, and waiting
+  for a clean sweep would let a single poisoned job freeze the site.
+- **A cooperative shutdown after work is announced too**, with a distinct
+  `reason`, because staying silent would leave pages generated, never announced,
+  and therefore never published.
+- **The hook URL is a credential.** Anyone holding one can trigger a production
+  deploy, so only its origin is ever logged — never the path that carries the
+  secret.
+- **It is checked at construction**, so a typo is a line at boot rather than a
+  silent non-deploy discovered by a customer. A hook that is present and
+  unusable is reported and skipped: a worker refusing to boot over a deploy URL
+  would turn a stale site into an idle queue. Absence is silent, because a local
+  worker legitimately has none.
+
+The SSRF guard these share now lives in `@staticforge/core`. Two copies of a
+guard are two guards until the first time someone relaxes one, and the one that
+gets relaxed is always the one whose caller looked safe.
+
+### 3.13 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.12 Zero-JavaScript presentation layer
+### 3.14 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -367,22 +476,27 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.13 Test coverage
+### 3.15 Test coverage
 
-**830 tests across 42 files in six packages**, all under Vitest, all passing.
+**886 tests across 45 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
 | `ai` | 225 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis |
-| `core` | 203 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, tenant paths, job budget |
-| `database` | 161 | Repository read mapping, atomic write path, queue claim — entirely against a mocked Prisma client |
-| `generator` | 159 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, output persistence |
+| `core` | 221 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, tenant paths, job budget |
+| `database` | 181 | Repository read mapping, atomic write path, queue claim, impact analysis and the incremental queuing rule — entirely against a mocked Prisma client |
+| `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
-| `cli` | 41 | Pipeline stages and the standalone worker |
+| `cli` | 50 | Pipeline stages, the standalone worker, and queue-drain detection |
 
 The database suite never opens a connection — one test asserts that explicitly,
 so the guarantee cannot rot silently. AI suites run against injected stubs, so
 they cost nothing and need no API key.
+
+Some suites go further than mocking. The incremental-queuing tests run against a
+fake page table that *honours the query it is given* — an absent filter restricts
+nothing, exactly as Postgres behaves — so deleting the `MANUAL` exclusion makes
+the tests fail rather than pass quietly, which a fixed-list stub would not.
 
 Two properties are worth noting for anyone assessing risk. First, tests were
 repeatedly validated by *mutation* — deliberately breaking the code under test
@@ -404,7 +518,7 @@ Workspace  →  Project  →  Business
                        →  Service[]
                        →  Location[]
                        →  GeneratedPage[]
-                       →  GenerationJob[]
+                       →  GenerationJob[]   (carries targetSlugs: the pages one run may re-author)
 
 ContentProfile / Template  →  owned by a user, or global via a __global__ sentinel
 ```

@@ -2,10 +2,11 @@
 
 A schema-driven static site generation engine, organized as a pnpm monorepo.
 
-> **Status:** 🟢 Phases 01–20 delivered. End-to-end pipeline working against a
+> **Status:** 🟢 Phases 01–22 delivered. End-to-end pipeline working against a
 > live Supabase PostgreSQL instance, with a standalone queue worker, a data-sync
 > boundary, headless block editing, database-backed templates, a plugin runtime,
-> and a read-only AI gap analyst. **Not yet deployed, and there is no
+> a read-only AI gap analyst, and incremental publishing that re-authors only the
+> pages a change reached. **Not yet deployed, and there is no
 > authentication layer** — see [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md)
 > for the full state and the outstanding technical debt.
 
@@ -123,7 +124,8 @@ data/output/
 ## Delivered phases
 
 Phases 01–13 established the content contract and the AI engine; phases 14–20
-turned it into a service. Every phase below is merged into `main`.
+turned it into a service; phases 21–22 made publishing incremental. Every phase
+below is merged into `main`.
 
 ### 01–13 — engine and hardening (summary)
 
@@ -251,6 +253,87 @@ the operator do next".
   timestamp.
 
 Run it with `corepack pnpm staticforge analyze --project-id <id>`.
+
+### 21–22 — Smart continuous publishing, impact analysis, and build triggers
+
+A sync used to queue a run over the whole project. Editing one service in a
+forty-city account re-authored two hundred pages, and paid for every one, to
+change five.
+
+**Impact analysis.** `findAffectedPages(projectId, userId, serviceIds, locationIds, prisma)`
+asks which pages a change *reaches* — a different question from the gap
+analyst's, which computes a cross-product in memory. This one asks which pages
+*exist*, because a page that was never generated cannot be re-authored and a
+page an operator has since edited must not be.
+
+- Hand-edited pages are refused through an **allowlist** (`source IN (TEMPLATE, AI)`),
+  not a `NOT MANUAL`. A `PageSource` added to the schema later would be
+  *included* by a negative filter the moment it existed, and the first anyone
+  would know is a customer's page being overwritten.
+- The filter lives in the query, never in a `.filter()` afterwards.
+- Two empty id lists return without querying at all — an `OR` over two empty
+  `IN` filters is exactly the shape a later refactor drops entirely, at which
+  point every page in the project is "affected".
+- Scoped to `userId` as well as `projectId`: with no row-level security behind
+  it, the scope in this query *is* the tenant boundary.
+
+**Smart queuing.** `planSyncRun` produces one of three outcomes:
+
+| Change | Decision | Why |
+| --- | --- | --- |
+| Only **updates** | One job scoped to the reached pages | The feature |
+| **Added** or **removed** entities | Full run (empty scope) | A scope cannot create a page, and a removal breaks the link graph |
+| Nothing regenerable was reached | **Queue nothing at all** | Every reached page is hand-edited, or the project was never generated |
+
+Getting the second row backwards is not a performance bug: a scoped run after a
+service was added would queue a job for pages that do not exist, do nothing,
+report success, and leave the new service unpublished with no error anywhere.
+
+**What a scope narrows.** The AI authoring pass, and nothing else. The run still
+builds, links, and persists the whole project — the link graph is computed across
+every page, the sitemap describes all of them, and the file output is cleared and
+rewritten whole. Authoring is the only step with a marginal cost, so it is the
+only step worth narrowing.
+
+A page outside the scope keeps its stored content **without** the `sourceHash`
+freshness check that governs resumption. That inversion is what makes a scope
+safe to pass: applying the freshness test to a page the run was told not to touch
+would overwrite a paid, authored page with template assembly. An empty scope
+authors nothing; a scope that fails to arrive costs a full run, which is
+expensive and correct rather than cheap and silently wrong.
+
+The scope rides on `GenerationJob.targetSlugs` and reaches the engine through
+`STATICFORGE_ONLY_SLUGS` — the environment rather than `argv`, because on Windows
+a spawn goes through a shell and a list of hundreds of slugs is the worst case
+for that.
+
+**Static build triggers.** A new `afterQueueDrained` lifecycle event fires on the
+*transition* to idle, never on an already-idle tick — a worker polling an empty
+queue every three seconds would otherwise announce a drain twenty times a minute
+and a deploy trigger would act on it just as often. One sync that queues ten jobs
+is one build, not ten.
+
+`createStaticBuildTriggerPlugin` posts to `DEPLOY_WEBHOOK_URL` when the queue
+drains. It is host-agnostic — Vercel, Netlify, Cloudflare Pages and GitHub all
+expose the same primitive.
+
+- A drain following only failures publishes nothing: the content on disk is what
+  the host already serves, and deploying would make a failing queue look like a
+  working one.
+- A cooperative shutdown after work is announced too, with a distinct `reason`,
+  because silence would leave pages generated, never announced, and therefore
+  never published.
+- The hook URL is a **capability** — anyone holding one can trigger a production
+  deploy — so only its origin is ever logged.
+- It is checked at construction, so a typo is a line at boot rather than a silent
+  non-deploy discovered by a customer. A broken hook is skipped and reported: a
+  worker refusing to boot over a deploy URL turns a stale site into an idle queue.
+
+Configure it by presence:
+
+```bash
+DEPLOY_WEBHOOK_URL=https://api.vercel.com/v1/integrations/deploy/prj_x/xxxx
+```
 
 ---
 
