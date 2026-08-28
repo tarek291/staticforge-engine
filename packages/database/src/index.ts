@@ -60,6 +60,7 @@ export type {
   AuditLog,
   RateLimitState,
   ApiKey,
+  User,
   UsageRecord,
   UsageMetric,
   OrganizationQuota,

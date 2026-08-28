@@ -578,11 +578,14 @@ model OrganizationMember {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
-  /// The user this membership is for. A plain column rather than a relation
-  /// because there is no user table yet — authentication is still unbuilt, and
-  /// inventing half of it here would produce a model the real one has to
-  /// undo. What matters now is that the *role* is stored and enforced.
+  /// The principal this membership is for.
+  ///
+  /// A real foreign key as of Phase 27. Before it, this was a free string and
+  /// a membership could name a principal that had never existed — a typo in a
+  /// seed or a migration produced a row that granted access to nobody and
+  /// looked exactly like one that granted access to somebody.
   userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   role OrgRole @default(VIEWER)
 
@@ -842,4 +845,49 @@ model OrganizationQuota {
   /// One ceiling per metric per organization. Two rows would make the answer
   /// depend on which was read first, and the generous one would win.
   @@unique([organizationId, metric])
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+/// A principal that can hold a membership.
+///
+/// ## Why the id has no default
+///
+/// It is assigned by the identity provider, not by this database. Supabase
+/// mints a UUID when someone signs up, and that value is what a session token
+/// resolves to — so generating our own here would produce a second id for the
+/// same person and a join that silently matches nothing.
+///
+/// ## What is in here that is not a person
+///
+/// Machine principals. An API key from Phase 25 is a member of its organization
+/// so that it passes the same role gate a human does, and the foreign key added
+/// in this phase means every member must exist here — including `apikey:…`
+/// rows, and including the `local-operator` placeholder the engine has used
+/// since before there was any identity at all.
+///
+/// That is a wart and it is recorded as one. `User` now means "principal", not
+/// "human", and separating the two is a later change: it needs a second table,
+/// a discriminator on the membership, and a migration for rows that already
+/// exist. Doing it here would have meant shipping referential integrity and a
+/// model change together, and only one of those had to happen now.
+model User {
+  /// The identity provider's id, or a synthetic one for a machine principal.
+  id String @id
+
+  /// Unique, because it is what a person is looked up by when a session
+  /// resolves. Synthetic principals get an address under the reserved
+  /// `.invalid` TLD, which is guaranteed never to resolve — so a stray
+  /// notification cannot reach a real inbox by accident.
+  email String @unique
+
+  /// Display name. Optional because an identity provider may not have one, and
+  /// a required field with a placeholder is a field nobody can trust.
+  name String?
+
+  memberships OrganizationMember[]
+
+  createdAt DateTime @default(now())
 }

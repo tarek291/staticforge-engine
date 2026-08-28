@@ -171,8 +171,13 @@ describe("a refused spend", () => {
   });
 
   test("the wait matches the shared arithmetic", async () => {
-    const lastRefillAt = new Date("2026-08-28T12:00:00.000Z");
-    const now = new Date("2026-08-28T12:00:00.000Z");
+    // Relative to now, not pinned to an absolute instant. `consumeApiTokens`
+    // computes the wait against the real clock, so an absolute `lastRefillAt`
+    // makes this test pass or fail depending on the hour it runs in — which is
+    // exactly how it was first written, and it started failing the moment the
+    // session outlived the timestamp.
+    const lastRefillAt = new Date();
+    const now = lastRefillAt;
     armDenial({ availableTokens: 0, lastRefillAt });
 
     const grant = await consumeApiTokens("bucket", 50, 200, 10, prisma);

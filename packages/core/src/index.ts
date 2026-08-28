@@ -18,5 +18,6 @@ export * from "./plugins/database-audit-logger.js";
 export * from "./plugins/billing-meter.js";
 export * from "./access/roles.js";
 export * from "./access/api-key.js";
+export * from "./auth/session.js";
 export * from "./rate-limit/token-bucket.js";
 export * from "./net/outbound-url.js";
