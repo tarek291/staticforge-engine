@@ -119,6 +119,7 @@ describe("the plugin's records reach the table through the injected writer", () 
       ok: true,
       exitCode: 0,
       resumed: false,
+      pageCount: 9,
       durationMs: 1000,
       completedAt: "2026-08-28T00:00:00.000Z",
     });

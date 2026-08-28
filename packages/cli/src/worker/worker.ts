@@ -43,6 +43,16 @@ export interface WorkerDeps {
     userId: string,
   ) => Promise<boolean>;
   countExpectedPages: (projectId: string, userId: string) => Promise<number | null>;
+  /**
+   * How many pages a finished job actually recorded.
+   *
+   * Read after the run rather than estimated before it, because the estimate
+   * and the outcome differ for every run worth metering — a scoped run touches
+   * a fraction of the project, a cached one authors nothing, and a failed one
+   * may have written half. Optional so an existing caller keeps working; the
+   * meter simply has nothing to charge without it.
+   */
+  readCompletedPages?: (jobId: string, userId: string) => Promise<number>;
   runEngine: typeof runEngine;
 }
 
@@ -231,6 +241,14 @@ export async function runWorkerOnce(
     job.userId,
   );
 
+  // Read after `finishJob`, so the number is the one the row will keep. A
+  // failure here is not worth failing the run over: the pages are written and
+  // the verdict is recorded, so the worst case is an unmetered job, which
+  // under-bills rather than losing work.
+  const pagesWritten = await (
+    deps.readCompletedPages?.(job.id, job.userId) ?? Promise.resolve(0)
+  ).catch(() => 0);
+
   // Announced after the verdict is durable, not before. A plugin told a job
   // succeeded must be able to rely on that being true even if this worker dies
   // in the next instant — and every listener failure here is absorbed, because
@@ -244,6 +262,7 @@ export async function runWorkerOnce(
     ok: result.ok,
     exitCode: result.exitCode,
     resumed: job.resumed,
+    pageCount: pagesWritten,
     durationMs: result.durationMs,
     completedAt: new Date().toISOString(),
   });

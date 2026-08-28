@@ -49,6 +49,15 @@ export interface JobCompletedEvent {
   exitCode: number;
   /** Whether this run picked up an interrupted attempt. */
   resumed: boolean;
+  /**
+   * Pages this run finished, as the job row records them.
+   *
+   * Read back from the row rather than estimated from the grid, because the two
+   * differ for every run worth metering: a scoped run touches a fraction of the
+   * project, a cached one authors nothing, and a failed one may have written
+   * half. Billing on the estimate would charge for work that did not happen.
+   */
+  pageCount: number;
   durationMs: number;
   completedAt: string;
 }

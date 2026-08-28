@@ -930,3 +930,194 @@ describe("an EDITOR may sync", () => {
     expect(seen[0]?.organizationId).toBe("org-1");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 26: the quota gate, in front of the write
+// ---------------------------------------------------------------------------
+
+/**
+ * A sync is one metered operation, so an exhausted tenant cannot start one.
+ *
+ * The checks here assert the *ordering* as much as the outcome. A quota
+ * discovered when the work finishes is an invoice, not a ceiling — the pages
+ * are already written and already paid for.
+ */
+describe("an exhausted quota refuses a sync", () => {
+  /** Arm the quota row and the usage sum behind it. */
+  function armQuota(limit: number, used: number): void {
+    prisma.organizationQuota.findUnique.mockResolvedValue(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { limit, resetDate: new Date(Date.now() - 3600_000) } as any,
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    prisma.usageRecord.aggregate.mockResolvedValue({ _sum: { amount: used } } as any);
+  }
+
+  test("syncProject throws QuotaExceeded when there is no allowance left", async () => {
+    armTwoServiceProject();
+    armRole("EDITOR");
+    armQuota(5, 5);
+
+    await expect(
+      syncProject("prj_1", "editor-user", editFirstService(), prisma, {
+        enqueueJob: vi.fn(),
+      }),
+    ).rejects.toMatchObject({ name: "QuotaExceededError" });
+  });
+
+  test("nothing is written and nothing is queued", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "AI",
+      },
+    ]);
+    armRole("EDITOR");
+    armQuota(5, 5);
+
+    const enqueue = vi.fn();
+
+    await syncProject("prj_1", "editor-user", editFirstService(), prisma, {
+      enqueueJob: enqueue,
+    }).catch(() => undefined);
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  test("the refusal precedes the impact query", async () => {
+    armTwoServiceProject();
+    armRole("EDITOR");
+    armQuota(5, 5);
+
+    await syncProject("prj_1", "editor-user", editFirstService(), prisma, {
+      enqueueJob: vi.fn(),
+    }).catch(() => undefined);
+
+    // A tenant out of allowance should not be able to keep reading which of its
+    // pages would change. Refusing after the read would have already answered
+    // the question.
+    expect(prisma.generatedPage.findMany).not.toHaveBeenCalled();
+  });
+
+  test("permission is checked before quota, so a stranger learns nothing about billing", async () => {
+    armTwoServiceProject();
+    armRole(null);
+    armQuota(5, 5);
+
+    let error: Error | undefined;
+
+    try {
+      await syncProject("prj_1", "stranger", editFirstService(), prisma, {
+        enqueueJob: vi.fn(),
+      });
+    } catch (thrown: unknown) {
+      error = thrown as Error;
+    }
+
+    // A caller who may not touch this project at all should learn that, not
+    // learn how much quota the organization has left.
+    expect(error?.name).toBe("AccessDeniedError");
+    expect(prisma.organizationQuota.findUnique).not.toHaveBeenCalled();
+  });
+
+  test("a dry run is not refused, because it is not metered", async () => {
+    armTwoServiceProject();
+    armPageTable([]);
+    armRole("EDITOR");
+    armQuota(5, 5);
+
+    // Checking and charging have to cover the same paths. A dry run emits no
+    // lifecycle event and never becomes a usage row, so refusing one would cost
+    // a tenant the ability to plan and charge it nothing — and would leave the
+    // gate and the meter describing different systems.
+    const result = await syncProject(
+      "prj_1",
+      "editor-user",
+      editFirstService(),
+      prisma,
+      { enqueue: false, enqueueJob: vi.fn() },
+    );
+
+    expect(result?.changed).toBe(true);
+    expect(prisma.organizationQuota.findUnique).not.toHaveBeenCalled();
+  });
+
+  test("room left lets the sync through", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "AI",
+      },
+    ]);
+    armRole("EDITOR");
+    armQuota(100, 3);
+
+    const enqueue = vi.fn().mockResolvedValue("job_1");
+
+    const result = await syncProject(
+      "prj_1",
+      "editor-user",
+      editFirstService(),
+      prisma,
+      { enqueueJob: enqueue },
+    );
+
+    expect(result?.jobId).toBe("job_1");
+  });
+
+  test("no configured quota does not block anything", async () => {
+    armTwoServiceProject();
+    // A page the change reaches, so there is something to queue — otherwise
+    // this would assert the Phase 21 rule rather than the quota one.
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "AI",
+      },
+    ]);
+    armRole("EDITOR");
+    prisma.organizationQuota.findUnique.mockResolvedValue(null as never);
+
+    // Quotas are opt-in. Every tenant that existed before this table did must
+    // keep working.
+    const result = await syncProject(
+      "prj_1",
+      "editor-user",
+      editFirstService(),
+      prisma,
+      { enqueueJob: vi.fn().mockResolvedValue("job_1") },
+    );
+
+    expect(result?.jobId).toBe("job_1");
+  });
+
+  test("the sync is charged as one operation, not as one per page", async () => {
+    armTwoServiceProject();
+    armPageTable([]);
+    armRole("EDITOR");
+    armQuota(100, 0);
+
+    await syncProject("prj_1", "editor-user", editFirstService(), prisma, {
+      enqueueJob: vi.fn().mockResolvedValue("job_1"),
+    });
+
+    expect(prisma.organizationQuota.findUnique.mock.calls[0]?.[0]?.where).toEqual({
+      organizationId_metric: {
+        organizationId: "org-1",
+        metric: "SYNC_OPERATIONS",
+      },
+    });
+  });
+});

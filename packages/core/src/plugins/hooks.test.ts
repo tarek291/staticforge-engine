@@ -23,6 +23,7 @@ const JOB_EVENT = {
   ok: true,
   exitCode: 0,
   resumed: false,
+  pageCount: 9,
   durationMs: 1234,
   completedAt: "2026-08-27T12:00:00.000Z",
 } as const;

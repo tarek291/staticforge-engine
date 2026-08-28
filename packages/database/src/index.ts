@@ -45,6 +45,7 @@ export * from "./sync.js";
 export * from "./impact.js";
 export * from "./access.js";
 export * from "./api-key.js";
+export * from "./quota.js";
 export * from "./audit.js";
 export * from "./rate-limit.js";
 export * from "./registry.js";
@@ -59,6 +60,9 @@ export type {
   AuditLog,
   RateLimitState,
   ApiKey,
+  UsageRecord,
+  UsageMetric,
+  OrganizationQuota,
   Workspace,
   Project,
   Service,

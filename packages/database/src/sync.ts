@@ -9,6 +9,7 @@ import type { Location, Service } from "@staticforge/schemas";
 
 import { requireCapability } from "./access.js";
 import { affectedSlugs, findAffectedPages } from "./impact.js";
+import { requireQuota } from "./quota.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -466,6 +467,20 @@ export async function syncProject(
   // and collapsing the two would leave a caller unable to tell an operator
   // whether to fix an id or ask for a role.
   await requireCapability(snapshot.organizationId, userId, "project:write", prisma);
+
+  // The commercial ceiling, checked before the comparison and long before the
+  // write. A sync is one operation whether or not it changes anything — it is
+  // the lever an integration can pull in a loop — so it costs one unit.
+  //
+  // Gated only on the path that is *metered*. A dry run emits no lifecycle
+  // event and therefore never becomes a usage row, so refusing one would charge
+  // a tenant nothing and cost it the ability to find out what a sheet would do
+  // — which is exactly what somebody near their limit most needs to know.
+  // Keeping the check and the charge on the same paths is what stops the two
+  // drifting into a system that bills for what it did not gate, or the reverse.
+  if (options.enqueue ?? true) {
+    await requireQuota(snapshot.organizationId, "SYNC_OPERATIONS", 1, prisma);
+  }
 
   const diff = diffSyncPayload(payload, snapshot);
 

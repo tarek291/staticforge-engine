@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import type { JobKind, JobStatus, PrismaClient } from "@prisma/client";
 
 import { requireCapability } from "./access.js";
+import { requireQuota } from "./quota.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -284,6 +285,10 @@ export async function getProjectForUser(
  * across every page. Narrowing it further would publish a site missing most of
  * itself in order to save a few model calls.
  * @returns The queued job, or `null` when the project does not exist.
+ * @throws {QuotaExceededError} If the organization has no allowance left. The
+ * check happens *before* the row is written, because a quota discovered when
+ * the run finishes is an invoice rather than a ceiling — the work is already
+ * done and already paid for.
  * @throws {AccessDeniedError} If the caller may not write to the project. A
  * queued job spends money on a paid AI run, so this is a write in every sense
  * that matters and a VIEWER may not perform it. Distinct from `null`: "no such
@@ -312,6 +317,22 @@ export async function enqueueJob(
   // wrong: the row itself costs nothing, and the run it causes is the only
   // line in this product with a real marginal cost.
   await requireCapability(project.organizationId, userId, "project:write", prisma);
+
+  // The commercial ceiling, after the permission check and before the write.
+  // Ordered that way deliberately: a caller who may not touch this project at
+  // all should learn that, not learn how much quota it has left.
+  //
+  // The amount is what the run will *at least* consume. A scoped job names its
+  // pages, so that count is exact; an unscoped one cannot know its grid until
+  // it loads, so it asks for one — enough to stop an exhausted tenant queueing
+  // anything, and deliberately not a guess that would over-charge the gate.
+  // The precise figure is metered afterwards, from what the run actually wrote.
+  await requireQuota(
+    project.organizationId,
+    "AI_GENERATED_PAGES",
+    scope !== undefined && scope.length > 0 ? scope.length : 1,
+    prisma,
+  );
 
   const job = await prisma.generationJob.create({
     data: {

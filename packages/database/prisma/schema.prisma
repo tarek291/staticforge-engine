@@ -559,6 +559,8 @@ model Organization {
   workspaces Workspace[]
   projects   Project[]
   apiKeys    ApiKey[]
+  usage      UsageRecord[]
+  quotas     OrganizationQuota[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -748,4 +750,96 @@ model ApiKey {
   createdAt DateTime @default(now())
 
   @@index([organizationId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Metering and quotas
+// ---------------------------------------------------------------------------
+
+/// What is counted, and therefore what can be limited and billed.
+///
+/// Two entries, and both were chosen because they cost something real. An
+/// AI-authored page is the only line in this product with a marginal cost per
+/// unit; a sync operation is the thing that *causes* those pages and is the
+/// lever an integration can pull in a loop.
+///
+/// Deliberately not a metric per feature. A meter that counts everything is a
+/// meter nobody reconciles against an invoice, and each entry here has to be
+/// explicable on a bill.
+enum UsageMetric {
+  /// Pages an AI pass actually authored.
+  AI_GENERATED_PAGES
+  /// Calls that reached the sync layer, whether or not they changed anything.
+  SYNC_OPERATIONS
+}
+
+/// One thing that happened, after it happened.
+///
+/// Append-only, and recorded *retrospectively* — a row appears once an
+/// operation has finished, written by a lifecycle listener rather than by the
+/// operation itself. That is deliberate and it is the asymmetry this whole
+/// phase turns on: usage is metered after the fact, while quotas are checked
+/// before. See `checkQuota` for what that costs.
+///
+/// Rows are never updated. A correction is another row, because a usage table
+/// somebody can edit is a usage table a customer is right to distrust — and
+/// because two writers updating one running total is the race the token bucket
+/// needed raw SQL to avoid.
+model UsageRecord {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  metric UsageMetric
+
+  /// How many units. Always positive for consumption; a negative row is how a
+  /// credit or a correction is expressed without editing history.
+  amount Int
+
+  /// What it happened to — a job id, a project id. Untyped and not a relation,
+  /// for the reason the audit trail's is: a bill must still explain a charge
+  /// after the thing that caused it has been deleted.
+  resourceId String?
+
+  /// When the usage occurred, which is what a period is summed over.
+  recordedAt DateTime @default(now())
+
+  /// The metering query is always "this organization, this metric, since this
+  /// instant" — so that is the index.
+  @@index([organizationId, metric, recordedAt])
+}
+
+/// What an organization is allowed to consume in the current period.
+///
+/// Absent means unlimited. That is a deliberate fail-open and the only one in
+/// this phase: quotas are opt-in, and a default of zero would stop every
+/// existing tenant the moment this table shipped. A limit that has to be
+/// configured before it applies is a limit somebody chose.
+model OrganizationQuota {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  metric UsageMetric
+
+  /// The ceiling for the current period. Zero is a real limit — it blocks
+  /// everything — and is how a suspended account is expressed.
+  limit Int
+
+  /// The instant the counter was last zeroed.
+  ///
+  /// Usage is summed from here forward, so a row whose `resetDate` is a month
+  /// old counts a month of consumption. Named for the event it records rather
+  /// than for a future one: a date in the future would mean "nothing counts
+  /// yet", which is a quota that silently permits everything — so `checkQuota`
+  /// treats that as a misconfiguration and refuses rather than allowing.
+  ///
+  /// Advancing it monthly is not yet automated; see the gaps in the briefing.
+  resetDate DateTime @default(now())
+
+  /// One ceiling per metric per organization. Two rows would make the answer
+  /// depend on which was read first, and the generous one would win.
+  @@unique([organizationId, metric])
 }

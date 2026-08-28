@@ -659,3 +659,113 @@ describe("countExpectedPages", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 26: the quota gate in front of a paid run
+// ---------------------------------------------------------------------------
+
+describe("enqueueJob refuses an exhausted organization", () => {
+  /** A project the caller owns and may write to. */
+  function armOwnedProject(): void {
+    prisma.project.findFirst.mockResolvedValue({
+      id: "prj_1",
+      organizationId: "org-1",
+    } as never);
+    prisma.organizationMember.findUnique.mockResolvedValue({
+      role: "EDITOR",
+    } as never);
+  }
+
+  /** Arm the quota and the usage behind it. */
+  function armQuota(limit: number, used: number): void {
+    prisma.organizationQuota.findUnique.mockResolvedValue({
+      limit,
+      resetDate: new Date(Date.now() - 3600_000),
+    } as never);
+    prisma.usageRecord.aggregate.mockResolvedValue({
+      _sum: { amount: used },
+    } as never);
+  }
+
+  test("an exhausted quota refuses before the row is written", async () => {
+    armOwnedProject();
+    armQuota(10, 10);
+
+    await expect(
+      enqueueJob("prj_1", LOCAL_OPERATOR_ID, "GENERATE", prisma),
+    ).rejects.toMatchObject({ name: "QuotaExceededError" });
+
+    // A quota discovered when the run finishes is an invoice, not a ceiling:
+    // the pages are already written and already paid for.
+    expect(prisma.generationJob.create).not.toHaveBeenCalled();
+  });
+
+  test("permission is checked before quota", async () => {
+    prisma.project.findFirst.mockResolvedValue({
+      id: "prj_1",
+      organizationId: "org-1",
+    } as never);
+    prisma.organizationMember.findUnique.mockResolvedValue({
+      role: "VIEWER",
+    } as never);
+    armQuota(10, 10);
+
+    let error: Error | undefined;
+
+    try {
+      await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "GENERATE", prisma);
+    } catch (thrown: unknown) {
+      error = thrown as Error;
+    }
+
+    // A VIEWER should learn it may not write, not how much allowance the
+    // organization has left.
+    expect(error?.name).toBe("AccessDeniedError");
+    expect(prisma.organizationQuota.findUnique).not.toHaveBeenCalled();
+  });
+
+  test("a scoped job asks for exactly the pages it names", async () => {
+    armOwnedProject();
+    armQuota(100, 0);
+    prisma.generationJob.create.mockResolvedValue(jobRow() as never);
+
+    await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "GENERATE", prisma, undefined, [
+      "a",
+      "b",
+      "c",
+    ]);
+
+    // The scope is exact, so the gate can be exact. An unscoped run cannot know
+    // its grid until it loads, which is why it asks for one rather than
+    // guessing a number that would over-charge the gate.
+    expect(prisma.usageRecord.aggregate).toHaveBeenCalled();
+    const verdictInput = prisma.organizationQuota.findUnique.mock.calls[0]?.[0]?.where;
+    expect(verdictInput).toEqual({
+      organizationId_metric: {
+        organizationId: "org-1",
+        metric: "AI_GENERATED_PAGES",
+      },
+    });
+  });
+
+  test("room left lets the job through", async () => {
+    armOwnedProject();
+    armQuota(100, 10);
+    prisma.generationJob.create.mockResolvedValue(jobRow() as never);
+
+    const job = await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "BUILD", prisma);
+
+    expect(job).not.toBeNull();
+    expect(prisma.generationJob.create).toHaveBeenCalledTimes(1);
+  });
+
+  test("no configured quota does not block anything", async () => {
+    armOwnedProject();
+    prisma.organizationQuota.findUnique.mockResolvedValue(null as never);
+    prisma.generationJob.create.mockResolvedValue(jobRow() as never);
+
+    expect(
+      await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "BUILD", prisma),
+    ).not.toBeNull();
+  });
+});

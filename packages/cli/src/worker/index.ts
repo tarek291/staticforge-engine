@@ -1,15 +1,18 @@
 import { hostname } from "node:os";
 import {
   createAuditLoggerPlugin,
+  createBillingMeterPlugin,
   createBuildTriggerFromEnv,
   createDatabaseAuditLoggerPlugin,
   isAuditLogEnabled,
+  isBillingMeterEnabled,
   isDatabaseAuditEnabled,
   registerPlugins,
   sleep,
   type AuditRecordWriter,
   type HookBus,
   type StaticForgePlugin,
+  type UsageWriter,
 } from "@staticforge/core";
 
 import { runEngine } from "./run-engine.js";
@@ -57,6 +60,7 @@ export async function createWorkerDeps(): Promise<WorkerDeps> {
     claimNextJob,
     countExpectedPages,
     finishJob,
+    getJobForUser,
     prisma,
     renewJobLease,
     updateJobLogs,
@@ -74,6 +78,8 @@ export async function createWorkerDeps(): Promise<WorkerDeps> {
     finishJob: (jobId, outcome, userId) => finishJob(jobId, outcome, userId, prisma),
     countExpectedPages: (projectId, userId) =>
       countExpectedPages(projectId, userId, prisma),
+    readCompletedPages: async (jobId, userId) =>
+      (await getJobForUser(jobId, userId, prisma))?.completedCount ?? 0,
     runEngine,
   };
 }
@@ -93,6 +99,7 @@ export function defaultPlugins(
   env: NodeJS.ProcessEnv = process.env,
   log: (message: string) => void = () => {},
   auditWriter?: AuditRecordWriter,
+  usageWriter?: UsageWriter,
 ): StaticForgePlugin[] {
   const plugins: StaticForgePlugin[] = [];
 
@@ -105,6 +112,14 @@ export function defaultPlugins(
   // this is the one visible place that decides what it may reach.
   if (auditWriter !== undefined && isDatabaseAuditEnabled(env)) {
     plugins.push(createDatabaseAuditLoggerPlugin({ write: auditWriter }));
+  }
+
+  // The billing meter, given its writer for the same reason the audit logger is.
+  // Opt-in: a worker that started writing usage rows into a customer's database
+  // because a variable was almost set is a worker that produced an invoice
+  // nobody can explain.
+  if (usageWriter !== undefined && isBillingMeterEnabled(env)) {
+    plugins.push(createBillingMeterPlugin({ write: usageWriter }));
   }
 
   // Configured by presence: a worker with no deploy hook is the ordinary local
@@ -179,8 +194,13 @@ export async function startDatabaseWorker(
 
   // Built here, in the composition root, and handed to the plugin rather than
   // reached for by it.
-  const { createAuditWriter, prisma } = await import("@staticforge/database");
+  const { createAuditWriter, prisma, recordUsage } = await import(
+    "@staticforge/database"
+  );
   const auditWriter = createAuditWriter(prisma);
+  const usageWriter: UsageWriter = async (event) => {
+    await recordUsage(event, prisma);
+  };
 
   return startWorker(
     deps,
@@ -188,7 +208,7 @@ export async function startDatabaseWorker(
       ...options,
       instanceId: options.instanceId ?? workerInstanceId(),
       hooks: buildHookBus(
-        options.plugins ?? defaultPlugins(process.env, log, auditWriter),
+        options.plugins ?? defaultPlugins(process.env, log, auditWriter, usageWriter),
         log,
       ),
     },

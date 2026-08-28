@@ -50,6 +50,7 @@ function jobEvent(over: Partial<JobCompletedEvent> = {}): JobCompletedEvent {
     ok: true,
     exitCode: 0,
     resumed: false,
+    pageCount: 9,
     durationMs: 4321,
     completedAt: "2026-08-28T00:01:00.000Z",
     ...over,
