@@ -42,6 +42,7 @@ export * from "./retry.js";
 export * from "./repository.js";
 export * from "./queue.js";
 export * from "./sync.js";
+export * from "./impact.js";
 export * from "./registry.js";
 export * from "./registry-seed.js";
 export * from "./tenant.js";

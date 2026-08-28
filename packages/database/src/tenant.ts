@@ -108,6 +108,14 @@ export interface JobSummary {
   totalCount: number | null;
   completedCount: number;
   failedCount: number;
+  /**
+   * Pages this run may re-author, or empty for a full run.
+   *
+   * Surfaced rather than kept internal: an operator looking at a job that
+   * touched three pages out of two hundred needs to see that it was scoped,
+   * or the run reads as one that silently skipped most of the site.
+   */
+  targetSlugs: string[];
 }
 
 /** Shape a Prisma job row for transport. */
@@ -124,6 +132,7 @@ function toJobSummary(job: {
   totalCount: number | null;
   completedCount: number;
   failedCount: number;
+  targetSlugs: string[];
 }): JobSummary {
   return {
     id: job.id,
@@ -139,6 +148,7 @@ function toJobSummary(job: {
     totalCount: job.totalCount,
     completedCount: job.completedCount,
     failedCount: job.failedCount,
+    targetSlugs: job.targetSlugs,
   };
 }
 
@@ -266,6 +276,12 @@ export async function getProjectForUser(
  * has a window in which the project could change hands, and more practically it
  * is a second place the scope could be forgotten.
  *
+ * @param scope - For a GENERATE job, the only pages this run may re-author.
+ * Omit — or pass an empty list — for a full run. A scope is a promise about
+ * cost, not about correctness: the run still builds and persists the whole
+ * project either way, because the link graph and the sitemap are computed
+ * across every page. Narrowing it further would publish a site missing most of
+ * itself in order to save a few model calls.
  * @returns The queued job, or `null` when the user does not own the project.
  */
 export async function enqueueJob(
@@ -274,6 +290,7 @@ export async function enqueueJob(
   kind: JobKind,
   prisma: PrismaClient,
   target?: { slug: string; feedback: string },
+  scope?: readonly string[],
 ): Promise<JobSummary | null> {
   const project = await prisma.project.findFirst({
     where: { id: projectId, userId },
@@ -293,6 +310,11 @@ export async function enqueueJob(
       ...(target !== undefined
         ? { targetSlug: target.slug, feedback: target.feedback }
         : {}),
+      // Written only when there is one. An explicit empty array and an absent
+      // scope mean the same thing to the column default, but sending one would
+      // make a full run look like a scoped run that found nothing — which is
+      // the opposite reading and the more alarming one.
+      ...(scope !== undefined && scope.length > 0 ? { targetSlugs: [...scope] } : {}),
     },
   });
 

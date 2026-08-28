@@ -94,8 +94,17 @@ export async function POST(request: Request): Promise<Response> {
     parsed.payload,
     prisma,
     {
-      enqueueJob: async (project, owner) => {
-        const job = await enqueueJob(project, owner, "GENERATE", prisma);
+      enqueueJob: async (project, owner, scope) => {
+        // The scope travels with the job so the run re-authors only the pages
+        // the change reached. Empty means a full run.
+        const job = await enqueueJob(
+          project,
+          owner,
+          "GENERATE",
+          prisma,
+          undefined,
+          scope,
+        );
         return job?.id ?? null;
       },
     },

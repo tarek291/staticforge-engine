@@ -1,6 +1,7 @@
 import { hostname } from "node:os";
 import {
   createAuditLoggerPlugin,
+  createBuildTriggerFromEnv,
   isAuditLogEnabled,
   registerPlugins,
   sleep,
@@ -87,8 +88,35 @@ export async function createWorkerDeps(): Promise<WorkerDeps> {
  */
 export function defaultPlugins(
   env: NodeJS.ProcessEnv = process.env,
+  log: (message: string) => void = () => {},
 ): StaticForgePlugin[] {
-  return isAuditLogEnabled(env) ? [createAuditLoggerPlugin()] : [];
+  const plugins: StaticForgePlugin[] = [];
+
+  if (isAuditLogEnabled(env)) {
+    plugins.push(createAuditLoggerPlugin());
+  }
+
+  // Configured by presence: a worker with no deploy hook is the ordinary local
+  // case and gets no plugin and no warning. A hook that is present and unusable
+  // is the opposite — somebody configured a deployment and got it wrong — so it
+  // is reported here rather than thrown, because the jobs still need doing and
+  // a worker that refuses to boot over a bad URL turns a stale site into an
+  // idle queue.
+  try {
+    const trigger = createBuildTriggerFromEnv(env, { log });
+
+    if (trigger !== undefined) {
+      plugins.push(trigger);
+    }
+  } catch (error: unknown) {
+    log(
+      `  ! deploy hook is configured but unusable, so nothing will be ` +
+        `published automatically: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  return plugins;
 }
 
 /**
@@ -143,7 +171,7 @@ export async function startDatabaseWorker(
     {
       ...options,
       instanceId: options.instanceId ?? workerInstanceId(),
-      hooks: buildHookBus(options.plugins ?? defaultPlugins(), log),
+      hooks: buildHookBus(options.plugins ?? defaultPlugins(process.env, log), log),
     },
     sleep,
   );

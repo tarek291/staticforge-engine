@@ -1,6 +1,11 @@
 import { describe, expect, test, vi } from "vitest";
 
-import { createHookBus, registerPlugins } from "@staticforge/core";
+import {
+  createHookBus,
+  registerPlugins,
+  type HookBus,
+  type QueueDrainedEvent,
+} from "@staticforge/core";
 
 import {
   runWorkerOnce,
@@ -39,6 +44,7 @@ function job(over: Partial<ClaimedJobLike> = {}): ClaimedJobLike {
     locale: "de",
     targetSlug: null,
     feedback: null,
+    targetSlugs: [],
     completedCount: 0,
     resumed: false,
     ...over,
@@ -77,7 +83,12 @@ describe("runWorkerOnce", () => {
 
     const tick = await runWorkerOnce(d, OPTIONS);
 
-    expect(tick).toEqual({ jobId: "job_1", ok: true, resumed: false });
+    expect(tick).toEqual({
+      jobId: "job_1",
+      ok: true,
+      resumed: false,
+      projectId: "prj_1",
+    });
     expect(d.finishJob).toHaveBeenCalledWith(
       "job_1",
       { ok: true, exitCode: 0, logs: "done" },
@@ -327,7 +338,12 @@ describe("a plugin cannot break the run it is observing", () => {
 
     const tick = await runWorkerOnce(d, { ...OPTIONS, hooks });
 
-    expect(tick).toEqual({ jobId: "job_1", ok: true, resumed: false });
+    expect(tick).toEqual({
+      jobId: "job_1",
+      ok: true,
+      resumed: false,
+      projectId: "prj_1",
+    });
     expect(d.finishJob).toHaveBeenCalledTimes(1);
   });
 
@@ -409,5 +425,229 @@ describe("a plugin cannot break the run it is observing", () => {
 
     expect(failed[0]?.plugin).toBe("broken");
     expect(tick.ok).toBe(true);
+  });
+});
+
+describe("the queue draining is announced once, not on every idle tick", () => {
+  /** Collect every drain the worker emits. */
+  function drainCollector(): {
+    hooks: HookBus;
+    drains: QueueDrainedEvent[];
+  } {
+    const drains: QueueDrainedEvent[] = [];
+    const hooks = createHookBus();
+
+    hooks.on("afterQueueDrained", (payload) => {
+      drains.push(payload as QueueDrainedEvent);
+    });
+
+    return { hooks, drains };
+  }
+
+  test("work followed by an empty queue drains exactly once", async () => {
+    const { hooks, drains } = drainCollector();
+    const claim = vi
+      .fn()
+      .mockResolvedValueOnce(job({ id: "job_1" }))
+      .mockResolvedValueOnce(job({ id: "job_2" }))
+      .mockResolvedValue(null);
+
+    const d = deps({ claimNextJob: claim });
+    let slept = 0;
+
+    const handle = startWorker(d, { ...OPTIONS, hooks }, () => {
+      slept += 1;
+      // Sit idle for several ticks after the work is done. This is the case
+      // that matters: a worker polling an empty queue every few seconds must
+      // not announce a drain every time, or a deploy trigger listening to it
+      // starts a build every few seconds, forever.
+      if (slept >= 4) handle.stop();
+      return Promise.resolve();
+    });
+
+    await handle.done;
+
+    expect(slept).toBe(4);
+    expect(drains).toHaveLength(1);
+    expect(drains[0]).toMatchObject({
+      instanceId: "w1",
+      succeeded: 2,
+      failed: 0,
+      projectIds: ["prj_1"],
+      reason: "queue-empty",
+    });
+  });
+
+  test("a worker that never had work never announces a drain", async () => {
+    const { hooks, drains } = drainCollector();
+    const d = deps();
+    let slept = 0;
+
+    const handle = startWorker(d, { ...OPTIONS, hooks }, () => {
+      slept += 1;
+      if (slept >= 3) handle.stop();
+      return Promise.resolve();
+    });
+
+    await handle.done;
+
+    // Nothing was published, so there is nothing to publish. An idle worker
+    // that announced a drain on boot would deploy on every restart.
+    expect(drains).toEqual([]);
+  });
+
+  test("a second stretch of work drains again", async () => {
+    const { hooks, drains } = drainCollector();
+    const claim = vi
+      .fn()
+      .mockResolvedValueOnce(job({ id: "job_1" }))
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(job({ id: "job_2" }))
+      .mockResolvedValue(null);
+
+    const d = deps({ claimNextJob: claim });
+    let slept = 0;
+
+    const handle = startWorker(d, { ...OPTIONS, hooks }, () => {
+      slept += 1;
+      if (slept >= 3) handle.stop();
+      return Promise.resolve();
+    });
+
+    await handle.done;
+
+    // The counters reset at each drain, so the second announcement describes
+    // the second stretch rather than everything since boot.
+    expect(drains).toHaveLength(2);
+    expect(drains[0]?.succeeded).toBe(1);
+    expect(drains[1]?.succeeded).toBe(1);
+  });
+
+  test("failures are counted apart from successes", async () => {
+    const { hooks, drains } = drainCollector();
+    const claim = vi
+      .fn()
+      .mockResolvedValueOnce(job({ id: "job_1" }))
+      .mockResolvedValueOnce(job({ id: "job_2" }))
+      .mockResolvedValue(null);
+
+    const d = deps({
+      claimNextJob: claim,
+      runEngine: vi
+        .fn()
+        .mockResolvedValueOnce(engineResult())
+        .mockResolvedValue(engineResult({ ok: false, exitCode: 1 })),
+    });
+
+    const handle = startWorker(d, { ...OPTIONS, hooks }, () => {
+      handle.stop();
+      return Promise.resolve();
+    });
+
+    await handle.done;
+
+    // A listener deciding whether to publish needs to tell "two jobs ran" from
+    // "one job worked": deploying after a stretch that only failed would
+    // present a failure as a release.
+    expect(drains[0]).toMatchObject({ succeeded: 1, failed: 1 });
+  });
+
+  test("projects are deduplicated across the stretch", async () => {
+    const { hooks, drains } = drainCollector();
+    const claim = vi
+      .fn()
+      .mockResolvedValueOnce(job({ id: "job_1", projectId: "prj_1" }))
+      .mockResolvedValueOnce(job({ id: "job_2", projectId: "prj_1" }))
+      .mockResolvedValueOnce(job({ id: "job_3", projectId: "prj_2" }))
+      .mockResolvedValue(null);
+
+    const d = deps({ claimNextJob: claim });
+
+    const handle = startWorker(d, { ...OPTIONS, hooks }, () => {
+      handle.stop();
+      return Promise.resolve();
+    });
+
+    await handle.done;
+
+    expect(drains[0]?.projectIds).toEqual(["prj_1", "prj_2"]);
+  });
+
+  test("a worker stopped after work announces it rather than leaving it unpublished", async () => {
+    const { hooks, drains } = drainCollector();
+
+    // The claim never runs dry, so the queue is never observed empty. Stopping
+    // is driven from inside the run rather than from a timer: with every
+    // dependency resolving immediately the loop never yields to the macrotask
+    // queue, so a `setTimeout` here would simply never fire.
+    let stop: (() => void) | undefined;
+
+    const d = deps({
+      claimNextJob: vi.fn().mockResolvedValue(job()),
+      runEngine: vi.fn().mockImplementation(() => {
+        stop?.();
+        return Promise.resolve(engineResult());
+      }),
+    });
+
+    const handle = startWorker(d, { ...OPTIONS, hooks }, () => Promise.resolve());
+    stop = handle.stop;
+
+    await handle.done;
+
+    // The queue may well not be empty, so the reason says so — but silence
+    // would leave pages that were generated, never announced, and therefore
+    // never published, with the site stale and nothing reporting why.
+    expect(drains).toHaveLength(1);
+    expect(drains[0]?.reason).toBe("worker-stopping");
+  });
+
+  test("a failing drain listener does not stop the worker", async () => {
+    const hooks = createHookBus();
+    hooks.on("afterQueueDrained", () => {
+      throw new Error("deploy hook exploded");
+    });
+
+    const claim = vi.fn().mockResolvedValueOnce(job()).mockResolvedValue(null);
+    const d = deps({ claimNextJob: claim });
+
+    const handle = startWorker(d, { ...OPTIONS, hooks }, () => {
+      handle.stop();
+      return Promise.resolve();
+    });
+
+    // The jobs are done and the rows are written. A deploy trigger throwing
+    // must not become the failure that kills the loop.
+    await expect(handle.done).resolves.toBeUndefined();
+    expect(d.finishJob).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a scoped job runs scoped", () => {
+  test("the scope reaches the engine", async () => {
+    const d = deps({
+      claimNextJob: vi
+        .fn()
+        .mockResolvedValue(job({ targetSlugs: ["bueroreinigung-duisburg"] })),
+    });
+
+    await runWorkerOnce(d, OPTIONS);
+
+    expect(d.runEngine).toHaveBeenCalledWith(
+      expect.objectContaining({ onlySlugs: ["bueroreinigung-duisburg"] }),
+    );
+  });
+
+  test("an unscoped job passes an empty scope, which is a full run", async () => {
+    const d = deps({ claimNextJob: vi.fn().mockResolvedValue(job()) });
+
+    await runWorkerOnce(d, OPTIONS);
+
+    // Empty rather than absent, and empty means unscoped all the way down. A
+    // scope that failed to arrive costs a full run, which is expensive and
+    // correct; the opposite reading would be cheap and silently wrong.
+    expect(d.runEngine).toHaveBeenCalledWith(
+      expect.objectContaining({ onlySlugs: [] }),
+    );
   });
 });

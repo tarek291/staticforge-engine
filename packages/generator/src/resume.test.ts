@@ -363,3 +363,175 @@ describe("applyAiContent reports progress as it goes", () => {
     ]);
   });
 });
+
+describe("a scoped run authors only what it was told to", () => {
+  test("only the scoped page is bought", async () => {
+    const { fn, asked } = countingStub();
+
+    const pages = await applyAiContent(baseline(), input, fn, {
+      ...noDelay,
+      onlySlugs: ["bueroreinigung-duisburg"],
+    });
+
+    // The whole feature. Two of the three pages were never put to the model.
+    assert.deepEqual(asked, ["Duisburg"]);
+    assert.equal(pages.length, 3);
+  });
+
+  test("an empty scope authors nothing at all", async () => {
+    const { fn, asked } = countingStub();
+
+    const pages = await applyAiContent(baseline(), input, fn, {
+      ...noDelay,
+      onlySlugs: [],
+    });
+
+    // Deliberately not read as "the caller meant everything". A run told to
+    // author nothing should do exactly that; the generous reading would turn a
+    // bug in the scope computation into a full re-author of the account.
+    assert.deepEqual(asked, []);
+    assert.equal(pages.length, 3);
+  });
+
+  test("an absent scope is unscoped, which is every page", async () => {
+    const { fn, asked } = countingStub();
+
+    await applyAiContent(baseline(), input, fn, { ...noDelay });
+
+    assert.equal(asked.length, 3);
+  });
+
+  test("an out-of-scope page keeps its stored content rather than reverting", async () => {
+    const { fn } = countingStub();
+
+    // Essen's stored content was written from inputs that have since moved, so
+    // its fingerprint no longer matches. Resumption would refuse it.
+    const resumeFrom = new Map<string, ResumableContent>([
+      ["bueroreinigung-essen", stored("Essen", "a-hash-from-another-lifetime")],
+    ]);
+
+    const pages = await applyAiContent(baseline(), input, fn, {
+      ...noDelay,
+      resumeFrom,
+      onlySlugs: ["bueroreinigung-duisburg"],
+    });
+
+    const essen = pages.find((page) => page.slug === "bueroreinigung-essen");
+
+    // This is the property that makes a scope safe to pass. Applying the
+    // freshness test to a page the run was told not to touch would answer the
+    // question by overwriting a paid, authored page with template assembly —
+    // the one outcome nobody could want from a run that was asked to leave it
+    // alone.
+    assert.equal(essen?.title, "Stored title for Essen");
+    assert.equal(essen?.h1, "Stored heading for Essen");
+  });
+
+  test("an out-of-scope page with nothing stored keeps its template assembly", async () => {
+    const { fn } = countingStub();
+    const before = baseline();
+
+    const pages = await applyAiContent(before, input, fn, {
+      ...noDelay,
+      onlySlugs: ["bueroreinigung-duisburg"],
+    });
+
+    const essenBefore = before.find((page) => page.slug === "bueroreinigung-essen");
+    const essenAfter = pages.find((page) => page.slug === "bueroreinigung-essen");
+
+    // Nothing to restore and nothing bought: the page is exactly what the
+    // deterministic pass produced.
+    assert.equal(essenAfter?.title, essenBefore?.title);
+    assert.equal(essenAfter?.h1, essenBefore?.h1);
+  });
+
+  test("an out-of-scope page still gets structured data matching its content", async () => {
+    const { fn } = countingStub();
+    const resumeFrom = new Map<string, ResumableContent>([
+      ["bueroreinigung-essen", stored("Essen", "stale")],
+    ]);
+
+    const pages = await applyAiContent(baseline(), input, fn, {
+      ...noDelay,
+      resumeFrom,
+      onlySlugs: ["bueroreinigung-duisburg"],
+    });
+
+    const essen = pages.find((page) => page.slug === "bueroreinigung-essen");
+
+    // Restoring content without realigning its structured data would
+    // reintroduce exactly the drift the realignment exists to fix.
+    assert.equal(essen?.schemaOrg.name, essen?.h1);
+    assert.equal(essen?.schemaOrg.description, essen?.metaDescription);
+  });
+
+  test("unusable stored content does not fail an out-of-scope page", async () => {
+    const { fn } = countingStub();
+    const broken = {
+      ...stored("Essen", "stale"),
+      // No longer satisfies the page contract.
+      title: "",
+    } as ResumableContent;
+
+    const pages = await applyAiContent(baseline(), input, fn, {
+      ...noDelay,
+      resumeFrom: new Map([["bueroreinigung-essen", broken]]),
+      onlySlugs: ["bueroreinigung-duisburg"],
+    });
+
+    // Falls back to the template assembly rather than throwing. A page nobody
+    // asked this run to touch must not be the thing that fails it.
+    assert.equal(pages.length, 3);
+    assert.ok(
+      (pages.find((page) => page.slug === "bueroreinigung-essen")?.title.length ?? 0) >
+        0,
+    );
+  });
+
+  test("the scope reports skipped pages apart from resumed ones", async () => {
+    const { fn } = countingStub();
+    const marks: Array<{ slug: string; skipped: boolean; resumed: boolean }> = [];
+
+    await applyAiContent(baseline(), input, fn, {
+      ...noDelay,
+      resumeFrom: new Map<string, ResumableContent>([
+        ["bueroreinigung-bochum", stored("Bochum", sourceHashFor("Bochum"))],
+      ]),
+      onlySlugs: ["bueroreinigung-duisburg", "bueroreinigung-bochum"],
+      onProgress: ({ slug, skipped, resumed }) => {
+        marks.push({ slug, skipped, resumed });
+      },
+    });
+
+    const bySlug = (slug: string) => marks.find((mark) => mark.slug === slug);
+
+    // "Resumed" means this run would have authored it and did not need to.
+    // "Skipped" means it was never allowed to. Collapsing the two would leave
+    // an operator unable to tell an incremental run from a suspiciously cheap
+    // full one.
+    assert.deepEqual(bySlug("bueroreinigung-bochum"), {
+      slug: "bueroreinigung-bochum",
+      skipped: false,
+      resumed: true,
+    });
+    assert.deepEqual(bySlug("bueroreinigung-essen"), {
+      slug: "bueroreinigung-essen",
+      skipped: true,
+      resumed: false,
+    });
+  });
+
+  test("a scope naming a page that does not exist authors nothing extra", async () => {
+    const { fn, asked } = countingStub();
+
+    await applyAiContent(baseline(), input, fn, {
+      ...noDelay,
+      onlySlugs: ["bueroreinigung-duisburg", "a-page-that-was-deleted"],
+    });
+
+    // A scope is a filter over the pages this run built, not a list of pages to
+    // go and find. A slug that no longer resolves is simply not matched — a
+    // job queued before a service was deleted must not fail on arrival.
+    assert.deepEqual(asked, ["Duisburg"]);
+  });
+});

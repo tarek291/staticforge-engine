@@ -185,8 +185,17 @@ async function runSync(values: Record<string, unknown>): Promise<void> {
 
   const result = await syncProject(projectId, userId, parsed.payload, prisma, {
     enqueue: !dryRun,
-    enqueueJob: async (project, owner) => {
-      const job = await enqueueJob(project, owner, "GENERATE", prisma);
+    enqueueJob: async (project, owner, scope) => {
+      // The scope travels with the job so the run re-authors only the pages the
+      // change reached. Empty means a full run.
+      const job = await enqueueJob(
+        project,
+        owner,
+        "GENERATE",
+        prisma,
+        undefined,
+        scope,
+      );
       return job?.id ?? null;
     },
   });

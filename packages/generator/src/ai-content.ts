@@ -59,6 +59,15 @@ export interface AiProgress {
    * project rather than from this run at all.
    */
   resumed: boolean;
+  /**
+   * Whether the page was outside this run's scope and left alone.
+   *
+   * Distinct from `resumed`, which means "this run would have authored it and
+   * did not need to". `skipped` means "this run was never allowed to touch it",
+   * and the difference is what an operator needs to tell an incremental run
+   * from a suspiciously cheap full one.
+   */
+  skipped: boolean;
 }
 
 /**
@@ -151,6 +160,60 @@ export interface ApplyAiContentOptions {
    * the next page is a progress bar that jumps backwards.
    */
   onCount?: (counts: { completed: number; total: number }) => Promise<void>;
+  /**
+   * The only pages this run may author, by slug. Omit for an unscoped run.
+   *
+   * Set by an incremental run, whose scope was computed from the pages a change
+   * actually reached. Every other page keeps the content it already has: the
+   * stored version when there is one, and the template assembly when there is
+   * not.
+   *
+   * Note that a page outside the scope is restored from storage *without* the
+   * `sourceHash` check that governs resumption. That is deliberate and is what
+   * makes a scope safe to pass. Resumption asks "is the stored prose still
+   * current?", and the honest answer for a stale page is no. A scope asserts
+   * something stronger and different — "this page is not this run's business" —
+   * and applying the freshness test to it would answer that question by
+   * overwriting the page with template content, which is the one outcome
+   * nobody could want: a paid, authored page silently downgraded by a run that
+   * was told not to touch it.
+   */
+  onlySlugs?: readonly string[];
+}
+
+/**
+ * Rebuild a page from content that was already written for it.
+ *
+ * Shared by the two paths that decline to author: resumption, which has checked
+ * that the stored prose is current, and the scope skip, which has decided the
+ * page is not this run's to touch. The re-validation is what makes either safe
+ * — stored content that no longer satisfies the contract is refused rather than
+ * published, and both callers fall back to what they would have done anyway.
+ *
+ * `schemaOrg` is realigned rather than restored: it is derived from the heading
+ * and description, and structured data describing copy other than the copy on
+ * the page is the drift this engine has already fixed once.
+ *
+ * @returns The restored page, or `undefined` if the stored content is unusable.
+ */
+function restoreStoredPage(
+  page: GeneratedPage,
+  stored: ResumableContent,
+): GeneratedPage | undefined {
+  const restored = GeneratedPageSchema.safeParse({
+    ...page,
+    title: stored.title,
+    metaDescription: stored.metaDescription,
+    h1: stored.h1,
+    content: stored.content,
+    schemaOrg: realignSchemaOrg(page.schemaOrg, {
+      h1: stored.h1,
+      metaDescription: stored.metaDescription,
+    }),
+    generation: stored.generation,
+  });
+
+  return restored.success ? restored.data : undefined;
 }
 
 /** Index a list of identified entities by id. */
@@ -264,7 +327,15 @@ export async function applyAiContent(
     sleepFn = sleep,
     resumeFrom,
     onCount,
+    onlySlugs,
   } = options;
+
+  // A set, not a list: the membership test runs once per page, and a scope on a
+  // large account holds hundreds of slugs. `undefined` means unscoped, which is
+  // deliberately not the same as an empty scope — an empty one authors nothing,
+  // and a run told to author nothing should do exactly that rather than
+  // quietly deciding the caller meant everything.
+  const scope = onlySlugs === undefined ? undefined : new Set(onlySlugs);
 
   const businesses = indexById(input.businesses);
   const services = indexById(input.services);
@@ -296,31 +367,44 @@ export async function applyAiContent(
     // already hold this exact page, written from these exact inputs, and paid
     // for once.
     const stored = resumeFrom?.get(page.slug);
+
+    if (scope !== undefined && !scope.has(page.slug)) {
+      // Outside the scope. Not authored, and — the part that matters — not
+      // reverted either: the stored content stands whether or not its
+      // fingerprint still matches, because this run was told the page is not
+      // its business. Restoring it only when "fresh" would mean a run that was
+      // asked to leave a page alone instead overwrote a paid, authored page
+      // with template assembly.
+      const kept = stored === undefined ? undefined : restoreStoredPage(page, stored);
+
+      authored.push(kept ?? page);
+      onProgress?.({
+        done: index + 1,
+        total: pages.length,
+        slug: page.slug,
+        cacheHit: false,
+        resumed: false,
+        skipped: true,
+      });
+      await onCount?.({ completed: index + 1, total: pages.length });
+      continue;
+    }
+
     const reusable =
       stored !== undefined && isReusable(stored, sourceHash) ? stored : undefined;
 
     if (reusable !== undefined) {
-      const restored = GeneratedPageSchema.safeParse({
-        ...page,
-        title: reusable.title,
-        metaDescription: reusable.metaDescription,
-        h1: reusable.h1,
-        content: reusable.content,
-        schemaOrg: realignSchemaOrg(page.schemaOrg, {
-          h1: reusable.h1,
-          metaDescription: reusable.metaDescription,
-        }),
-        generation: reusable.generation,
-      });
+      const restored = restoreStoredPage(page, reusable);
 
-      if (restored.success) {
-        authored.push(restored.data);
+      if (restored !== undefined) {
+        authored.push(restored);
         onProgress?.({
           done: index + 1,
           total: pages.length,
           slug: page.slug,
           cacheHit: false,
           resumed: true,
+          skipped: false,
         });
         await onCount?.({ completed: index + 1, total: pages.length });
         // No provider call was made, so there is no rate limit to respect and
@@ -401,6 +485,7 @@ export async function applyAiContent(
       slug: page.slug,
       cacheHit: provenance.cacheHit,
       resumed: false,
+      skipped: false,
     });
     await onCount?.({ completed: index + 1, total: pages.length });
 

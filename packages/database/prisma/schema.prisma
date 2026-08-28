@@ -132,6 +132,22 @@ model GenerationJob {
   targetSlug String?
   feedback   String?
 
+  /// For a scoped GENERATE job: the exact pages this run may re-author.
+  ///
+  /// Empty means unscoped, which is a full run — the behaviour every job had
+  /// before this column existed, and the behaviour a job degrades to if the
+  /// scope is ever lost. That direction matters: an unscoped run costs more
+  /// than it needed to, while a scope arriving from nowhere would silently
+  /// stop authoring pages nobody excluded.
+  ///
+  /// The scope gates the AI authoring pass and nothing else. The run still
+  /// builds, links, and persists the whole project, because the link graph is
+  /// computed across every page and the sitemap describes all of them — a run
+  /// that wrote only its scope would publish a site missing everything else.
+  /// Authoring is the only step with a marginal cost, so it is the only step
+  /// worth narrowing.
+  targetSlugs String[] @default([])
+
   /// How far along the run is, as a whole percentage of 0-100.
   ///
   /// Derived from the counts below rather than reported independently, so a

@@ -14,3 +14,5 @@ export * from "./patch/block-path.js";
 export * from "./plugins/hooks.js";
 export * from "./plugins/plugin.js";
 export * from "./plugins/audit-logger.js";
+export * from "./plugins/build-trigger.js";
+export * from "./net/outbound-url.js";

@@ -58,7 +58,48 @@ export interface ProjectSyncEvent {
   locationsAdded: number;
   locationsUpdated: number;
   locationsRemoved: number;
+  /**
+   * Pages the queued run was scoped to, or `0` for a full run.
+   *
+   * A count rather than the list: a listener deciding whether to care does not
+   * need two hundred slugs, and a payload that grows with the project is one
+   * that eventually gets truncated by whatever is logging it.
+   */
+  scopedPages: number;
   syncedAt: string;
+}
+
+/**
+ * Summary of a worker whose queue has just gone empty.
+ *
+ * Emitted on the *transition* from working to idle, once, and never on an
+ * already-idle tick. That distinction is the whole event: a worker polling an
+ * empty queue every three seconds would otherwise announce a drain twenty times
+ * a minute, forever, and any listener that acts on it — a deploy trigger above
+ * all — would act on it just as often.
+ */
+export interface QueueDrainedEvent {
+  /** The worker that drained it. */
+  instanceId: string;
+  /** Jobs that finished successfully since this worker was last idle. */
+  succeeded: number;
+  /** Jobs that failed in the same stretch. */
+  failed: number;
+  /** Projects those jobs belonged to, deduplicated. */
+  projectIds: string[];
+  /**
+   * Why the stretch ended.
+   *
+   * `queue-empty` is the ordinary case: the worker asked for another job and
+   * there was none. `worker-stopping` is a cooperative shutdown that happened
+   * to follow work — announced rather than dropped, because the alternative is
+   * a batch of pages that were generated, never announced, and therefore never
+   * published, with a site left stale and nothing anywhere reporting it. The
+   * two are distinguished rather than merged, because only the first is
+   * evidence that the queue is actually empty.
+   */
+  reason: "queue-empty" | "worker-stopping";
+  drainedAt: string;
 }
 
 /** Summary of a page set about to be written to disk. */
@@ -90,6 +131,14 @@ export interface HookEvents {
   beforePagesWritten: PagesWritingEvent;
   /** Pages have been written and are on disk. */
   afterPagesWritten: PagesWrittenEvent;
+  /**
+   * A worker finished its work and found nothing left to do.
+   *
+   * The moment the content is settled, and therefore the moment it is worth
+   * publishing. Fires once per stretch of work, not once per job: a sync that
+   * queues ten jobs should cause one deploy, not ten.
+   */
+  afterQueueDrained: QueueDrainedEvent;
 }
 
 /** A name the engine emits. */

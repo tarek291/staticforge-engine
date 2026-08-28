@@ -25,6 +25,17 @@ export interface EngineResult {
   durationMs: number;
 }
 
+/**
+ * Environment variable carrying a run's page scope, comma-separated.
+ *
+ * The environment rather than `argv`, for the reason the refresh feedback
+ * already travels this way: on Windows the spawn goes through a shell, so an
+ * argv entry is a fragment of a command line rather than an argument. A list is
+ * the worst case for that — one bad element ends the command and starts another
+ * — and a scope can hold hundreds of them.
+ */
+export const ONLY_SLUGS_ENV_VAR = "STATICFORGE_ONLY_SLUGS";
+
 /** How long a signalled tree has to exit before it is killed outright. */
 const KILL_GRACE_MS = 5_000;
 
@@ -99,6 +110,14 @@ export interface EngineInvocation {
   pageCount: number;
   /** For a REFRESH: which page, and what the operator asked to change. */
   target?: { slug: string; feedback: string } | undefined;
+  /**
+   * For a scoped GENERATE: the only pages this run may re-author.
+   *
+   * Empty or absent means a full run. The scope narrows the AI pass alone — the
+   * run still builds, links and persists the whole project — so losing it costs
+   * money rather than correctness, which is the direction a scope should fail.
+   */
+  onlySlugs?: readonly string[] | undefined;
   /** Called as output arrives, so a long run can report progress. */
   onOutput?: ((output: string) => void) | undefined;
 }
@@ -173,6 +192,27 @@ function buildArgs(
       ],
       env: { ...env, STATICFORGE_FEEDBACK: invocation.target.feedback },
     };
+  }
+
+  // Every slug is parsed before it travels, exactly as the refresh target is.
+  // These come from a column this engine wrote, which is a reason to expect
+  // them to be valid and not a reason to skip checking: the row is reachable by
+  // anything holding a database credential, and a scope is a list of names this
+  // process is about to hand to a child.
+  const scope = invocation.onlySlugs ?? [];
+  const invalid = scope.filter((slug) => !PageSlugSchema.safeParse(slug).success);
+
+  if (invalid.length > 0) {
+    return {
+      ok: false,
+      reason:
+        `Refusing to run: the job's page scope contains ${invalid.length} ` +
+        `invalid slug(s), starting with "${invalid[0] ?? ""}".`,
+    };
+  }
+
+  if (scope.length > 0) {
+    env[ONLY_SLUGS_ENV_VAR] = scope.join(",");
   }
 
   const args =

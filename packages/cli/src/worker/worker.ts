@@ -55,6 +55,8 @@ export interface ClaimedJobLike {
   locale: string;
   targetSlug: string | null;
   feedback: string | null;
+  /** Pages this run may re-author. Empty means a full run. */
+  targetSlugs: string[];
   completedCount: number;
   resumed: boolean;
 }
@@ -101,6 +103,8 @@ export interface WorkerTick {
   ok?: boolean;
   /** Whether this claim picked up an interrupted attempt. */
   resumed?: boolean;
+  /** The project the claimed job belonged to. Undefined when none was. */
+  projectId?: string;
 }
 
 /**
@@ -129,6 +133,9 @@ export async function runWorkerOnce(
 
   log(
     `▸ ${job.kind} ${job.id} (project ${job.projectId})` +
+      (job.targetSlugs.length > 0
+        ? ` — scoped to ${job.targetSlugs.length} page(s)`
+        : "") +
       (job.resumed ? ` — resuming from ${job.completedCount} page(s)` : ""),
   );
 
@@ -179,6 +186,7 @@ export async function runWorkerOnce(
       locale: job.locale,
       jobId: job.id,
       pageCount,
+      onlySlugs: job.targetSlugs,
       target:
         job.targetSlug !== null && job.feedback !== null
           ? { slug: job.targetSlug, feedback: job.feedback }
@@ -207,7 +215,12 @@ export async function runWorkerOnce(
     // The job belongs to someone else now. Writing a verdict would overwrite
     // whatever they are doing with a run they did not perform.
     log(`  · ${job.id} finished, but the claim was lost; leaving the row alone`);
-    return { jobId: job.id, ok: result.ok, resumed: job.resumed };
+    return {
+      jobId: job.id,
+      ok: result.ok,
+      resumed: job.resumed,
+      projectId: job.projectId,
+    };
   }
 
   await deps.finishJob(
@@ -237,7 +250,12 @@ export async function runWorkerOnce(
       `${Math.round(result.durationMs / 1000)}s`,
   );
 
-  return { jobId: job.id, ok: result.ok, resumed: job.resumed };
+  return {
+    jobId: job.id,
+    ok: result.ok,
+    resumed: job.resumed,
+    projectId: job.projectId,
+  };
 }
 
 /** Stops a running worker loop. */
@@ -263,17 +281,77 @@ export function startWorker(
 ): WorkerHandle {
   let running = true;
   const idleMs = options.idleMs ?? DEFAULT_IDLE_MS;
+  const hooks = options.hooks ?? noopHookBus();
+
+  // Work done since this worker was last idle. The drain event is emitted from
+  // these on the *transition* to empty, and they reset immediately after: a
+  // worker polling an empty queue every few seconds must announce a drain once,
+  // not twenty times a minute, or every listener acting on it — a deploy
+  // trigger above all — acts on it just as often.
+  let succeeded = 0;
+  let failed = 0;
+  let projects = new Set<string>();
+
+  const announceDrain = async (
+    reason: "queue-empty" | "worker-stopping",
+  ): Promise<void> => {
+    if (succeeded + failed === 0) {
+      return;
+    }
+
+    const payload = {
+      instanceId: options.instanceId,
+      succeeded,
+      failed,
+      projectIds: [...projects],
+      reason,
+      drainedAt: new Date().toISOString(),
+    };
+
+    // Reset before emitting, not after. A listener that takes seconds must not
+    // leave a window in which a second drain reports the same work again, and
+    // emit never rejects, so there is no failure path that would want the
+    // counters back.
+    succeeded = 0;
+    failed = 0;
+    projects = new Set<string>();
+
+    await hooks.emit("afterQueueDrained", payload);
+  };
 
   const done = (async () => {
     while (running) {
       const tick = await runWorkerOnce(deps, options);
 
-      // Only wait when there was nothing to do. A busy queue drains without
-      // pausing between jobs.
-      if (tick.jobId === null && running) {
+      if (tick.jobId !== null) {
+        if (tick.ok === true) {
+          succeeded += 1;
+        } else {
+          failed += 1;
+        }
+
+        if (tick.projectId !== undefined) {
+          projects.add(tick.projectId);
+        }
+
+        // A busy queue drains without pausing between jobs.
+        continue;
+      }
+
+      // The queue was observed empty, which is the only evidence this worker
+      // ever gets that the content is settled.
+      await announceDrain("queue-empty");
+
+      if (running) {
         await sleepFn(idleMs);
       }
     }
+
+    // Stopped part-way through a stretch. The queue may well not be empty, so
+    // this is not the same claim as above and says so — but staying silent
+    // would leave pages that were generated, never announced, and therefore
+    // never published, with the site stale and nothing reporting why.
+    await announceDrain("worker-stopping");
   })();
 
   return {

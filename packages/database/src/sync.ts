@@ -7,6 +7,7 @@ import {
 } from "@staticforge/core";
 import type { Location, Service } from "@staticforge/schemas";
 
+import { affectedSlugs, findAffectedPages } from "./impact.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -245,6 +246,49 @@ export interface SyncResult {
   jobId: string | null;
   /** Why no job was queued, when none was. */
   note?: string;
+  /**
+   * What the queued run was allowed to re-author.
+   *
+   * Empty means a full run — either because the change altered which pages
+   * should exist, or because nothing was queued at all. The two are told apart
+   * by `jobId`.
+   */
+  scope: string[];
+}
+
+/**
+ * Whether a change altered *which* pages should exist, rather than only their
+ * content.
+ *
+ * The distinction decides whether an incremental run is even possible. An
+ * updated service makes its existing pages stale, and those pages can be listed
+ * and re-authored. An *added* service has no pages to list — they have to be
+ * created, and only a full run creates pages. A *removed* one is the same
+ * problem seen from the other side: its pages cascade away, and every surviving
+ * page that linked to them now carries a link to nothing, so the link graph has
+ * to be recomputed across the project.
+ *
+ * Getting this backwards is not a performance bug. A scoped run after a service
+ * was added would queue a job for pages that do not exist, do nothing, report
+ * success, and leave the new service unpublished with no error anywhere.
+ */
+export function changesPageSet(diff: SyncDiff): boolean {
+  return (
+    diff.services.added.length > 0 ||
+    diff.services.removed.length > 0 ||
+    diff.locations.added.length > 0 ||
+    diff.locations.removed.length > 0
+  );
+}
+
+/** What a sync decided to queue, and why. */
+export interface QueuePlan {
+  /** Whether to queue a run at all. */
+  queue: boolean;
+  /** Pages the run may re-author. Empty means unscoped — a full run. */
+  scope: string[];
+  /** One line, for the operator and the result note. */
+  reason: string;
 }
 
 /** How a sync should behave once it knows what changed. */
@@ -257,8 +301,19 @@ export interface SyncOptions {
    * is still returned, because that is the whole question being asked.
    */
   enqueue?: boolean;
-  /** Injected so the orchestration is testable without a queue. */
-  enqueueJob?: (projectId: string, userId: string) => Promise<string | null>;
+  /**
+   * Injected so the orchestration is testable without a queue.
+   *
+   * `scope` is the list of page slugs the run may re-author, and an empty list
+   * means a full run. A caller that ignores the third argument still compiles
+   * and still works — it simply buys the whole project every time, which is
+   * what every caller did before this parameter existed.
+   */
+  enqueueJob?: (
+    projectId: string,
+    userId: string,
+    scope: readonly string[],
+  ) => Promise<string | null>;
   /**
    * Lifecycle bus. Defaults to one with nothing installed.
    *
@@ -288,8 +343,79 @@ async function announceSync(
     locationsAdded: result.diff.locations.added.length,
     locationsUpdated: result.diff.locations.updated.length,
     locationsRemoved: result.diff.locations.removed.length,
+    scopedPages: result.scope.length,
     syncedAt: new Date().toISOString(),
   });
+}
+
+/**
+ * Decide what run, if any, a change deserves.
+ *
+ * Three outcomes, and the middle one is the feature:
+ *
+ * 1. **The page set moved** — something was added or removed. Only a full run
+ *    can create a page or repair a link graph, so the scope is empty.
+ * 2. **Content moved on pages that exist** — the changed services and locations
+ *    are looked up against the pages actually stored, and the run is scoped to
+ *    exactly those slugs. This is the whole point: a description edited on one
+ *    service in a forty-city account re-authors forty pages, not two hundred.
+ * 3. **Nothing was reached** — every page the change touched is hand-edited, or
+ *    the project has never been generated. No run is queued at all.
+ *
+ * The third outcome is the one worth being careful about, because "queue
+ * nothing" and "queue everything" look identical from the outside until the
+ * bill arrives. The reason is returned so the caller can say which happened.
+ *
+ * Read-only, and safe to call before the sync's write: it asks which pages
+ * exist, and applying a payload of updates does not create or destroy any.
+ *
+ * @returns The plan. Never throws for an unknown project — an unowned project
+ * simply reaches no pages, which is already an outcome this handles.
+ */
+export async function planSyncRun(
+  projectId: string,
+  userId: string,
+  diff: SyncDiff,
+  prisma: PrismaClient,
+): Promise<QueuePlan> {
+  if (changesPageSet(diff)) {
+    return {
+      queue: true,
+      scope: [],
+      reason:
+        "services or locations were added or removed, so the page set itself " +
+        "changed: a full run is the only kind that can create a page or " +
+        "recompute the link graph.",
+    };
+  }
+
+  const affected = await findAffectedPages(
+    projectId,
+    userId,
+    diff.services.updated,
+    diff.locations.updated,
+    prisma,
+  );
+
+  if (affected.length === 0) {
+    // Deliberately not a full run. The change reached nothing that an
+    // automated run may rewrite — every page it touched is hand-edited, or
+    // there are no pages yet — and queueing "just in case" is how an
+    // incremental system quietly becomes the thing it replaced.
+    return {
+      queue: false,
+      scope: [],
+      reason:
+        "the change reached no page this engine may rewrite: every page it " +
+        "touches is hand-edited, or the project has not been generated yet.",
+    };
+  }
+
+  return {
+    queue: true,
+    scope: affectedSlugs(affected),
+    reason: `${affected.length} existing page(s) are stale and will be re-authored.`,
+  };
 }
 
 /**
@@ -328,6 +454,7 @@ export async function syncProject(
       changed: false,
       diff,
       jobId: null,
+      scope: [],
       note: "The incoming data matches what this project already holds.",
     };
 
@@ -337,6 +464,11 @@ export async function syncProject(
   }
 
   const enqueue = options.enqueue ?? true;
+
+  // Computed before the write, which is both safe and necessary: it reads which
+  // pages exist, and a payload of updates neither creates nor destroys one — so
+  // a dry run can report the plan without having caused it.
+  const plan = await planSyncRun(projectId, userId, diff, prisma);
 
   if (!enqueue) {
     // Before the write, not after it. A dry run exists so an operator can see
@@ -350,7 +482,14 @@ export async function syncProject(
       changed: true,
       diff,
       jobId: null,
-      note: "Dry run: nothing was written and no run was queued.",
+      scope: plan.scope,
+      note:
+        `Dry run: nothing was written and no run was queued. ` +
+        (plan.queue
+          ? plan.scope.length === 0
+            ? `A real sync would queue a full run — ${plan.reason}`
+            : `A real sync would queue a run scoped to ${plan.scope.length} page(s) — ${plan.reason}`
+          : `A real sync would queue nothing — ${plan.reason}`),
     };
   }
 
@@ -432,6 +571,7 @@ export async function syncProject(
       changed: true,
       diff,
       jobId: null,
+      scope: plan.scope,
       note: "Applied, but no run was queued: this caller supplied no queue.",
     };
 
@@ -440,8 +580,27 @@ export async function syncProject(
     return applied;
   }
 
-  const jobId = await options.enqueueJob(projectId, userId);
-  const result: SyncResult = { changed: true, diff, jobId };
+  if (!plan.queue) {
+    // The data was applied — it is the project's data and the source is
+    // authoritative about it — but nothing was queued, because nothing this
+    // engine may rewrite went stale. Announced like any other sync: a plugin
+    // that only heard about runs could not tell a project holding steady from
+    // an integration that stopped calling.
+    const quiet: SyncResult = {
+      changed: true,
+      diff,
+      jobId: null,
+      scope: [],
+      note: `Applied, but no run was queued: ${plan.reason}`,
+    };
+
+    await announceSync(hooks, projectId, userId, quiet);
+
+    return quiet;
+  }
+
+  const jobId = await options.enqueueJob(projectId, userId, plan.scope);
+  const result: SyncResult = { changed: true, diff, jobId, scope: plan.scope };
 
   await announceSync(hooks, projectId, userId, result);
 

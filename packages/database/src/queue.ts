@@ -37,6 +37,14 @@ export interface ClaimedJob {
   locale: string;
   targetSlug: string | null;
   feedback: string | null;
+  /**
+   * Pages this run may re-author, or empty for a full run.
+   *
+   * Carried on the claim rather than re-read later: the worker spawns the
+   * engine from what it claimed, and a scope fetched separately is a scope that
+   * can disagree with the row the lease is held on.
+   */
+  targetSlugs: string[];
   /** Pages already finished by an earlier attempt at this job. */
   completedCount: number;
   totalCount: number | null;
@@ -134,6 +142,7 @@ export async function claimNextJob(
         status: true,
         targetSlug: true,
         feedback: true,
+        targetSlugs: true,
         completedCount: true,
         totalCount: true,
         project: { select: { locale: true } },
@@ -156,6 +165,7 @@ export async function claimNextJob(
     locale: job.project.locale,
     targetSlug: job.targetSlug,
     feedback: job.feedback,
+    targetSlugs: job.targetSlugs,
     completedCount: job.completedCount,
     totalCount: job.totalCount,
     resumed: candidate.status === "RUNNING",

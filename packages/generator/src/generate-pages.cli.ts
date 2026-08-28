@@ -137,6 +137,38 @@ function resolveJobId(): string | undefined {
 }
 
 /**
+ * Environment variable carrying this run's page scope, comma-separated.
+ *
+ * Set by the worker from the job row. Absent for a run started by hand, which
+ * is a full run — the behaviour every run had before scopes existed.
+ */
+const ONLY_SLUGS_ENV_VAR = "STATICFORGE_ONLY_SLUGS";
+
+/**
+ * The pages this run may author, if it is scoped.
+ *
+ * An unset or blank variable means unscoped, and that fallback is the important
+ * one: a scope that fails to arrive costs a full run, which is expensive and
+ * correct. The opposite reading — treating an unreadable scope as "author
+ * nothing" — would be cheap and silently wrong, publishing a project whose
+ * pages nobody had ever authored.
+ */
+function resolveOnlySlugs(): string[] | undefined {
+  const raw = process.env[ONLY_SLUGS_ENV_VAR]?.trim();
+
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+
+  const slugs = raw
+    .split(",")
+    .map((slug) => slug.trim())
+    .filter((slug) => slug !== "");
+
+  return slugs.length === 0 ? undefined : slugs;
+}
+
+/**
  * Persist a run's pages for one project.
  *
  * Runs only in database mode, after validation and the optional AI pass have
@@ -225,8 +257,15 @@ async function main(): Promise<void> {
 
   // Opt-in only. Without USE_AI_GENERATION=true the deterministic pages built
   // above are saved unchanged, exactly as before.
+  const onlySlugs = resolveOnlySlugs();
+
   if (isAiGenerationEnabled()) {
-    console.log(`… authoring content with AI (${pages.length} pages)`);
+    console.log(
+      onlySlugs === undefined
+        ? `… authoring content with AI (${pages.length} pages)`
+        : `… authoring content with AI (${onlySlugs.length} of ${pages.length} pages; ` +
+            `the rest are outside this run's scope and are left as they are)`,
+    );
 
     // AI_MOCK swaps in a no-cost authoring service. Every downstream gate still
     // runs — the mock builds its content from the real content profile — so a
@@ -256,6 +295,7 @@ async function main(): Promise<void> {
 
     let hits = 0;
     let resumedCount = 0;
+    let skippedCount = 0;
 
     // Pages a previous attempt at this project already authored. Only available
     // in database mode: a local file run has no earlier attempt to resume from.
@@ -307,17 +347,25 @@ async function main(): Promise<void> {
       {
         ...(resumeFrom !== undefined ? { resumeFrom } : {}),
         ...(reportCount !== undefined ? { onCount: reportCount } : {}),
+        ...(onlySlugs !== undefined ? { onlySlugs } : {}),
         // Rate-limit pacing is meaningless against a mock, and at scale it
         // would dominate the run: 500 pages three seconds apart is 25 minutes
         // of sleeping.
         ...(mocked ? { delayMs: 0 } : {}),
-        onProgress: ({ done, total, slug, cacheHit, resumed }) => {
+        onProgress: ({ done, total, slug, cacheHit, resumed, skipped }) => {
           if (cacheHit) hits += 1;
           if (resumed) resumedCount += 1;
+          if (skipped) skippedCount += 1;
           // One line per page buries the result at scale, so report in batches
           // once a run is large.
           if (total <= 20 || done % 50 === 0 || done === total) {
-            const mark = resumed ? " (resumed)" : cacheHit ? " (cached)" : "";
+            const mark = skipped
+              ? " (out of scope)"
+              : resumed
+                ? " (resumed)"
+                : cacheHit
+                  ? " (cached)"
+                  : "";
             console.log(`  · ${done}/${total} ${slug}${mark}`);
           }
         },
@@ -325,8 +373,10 @@ async function main(): Promise<void> {
     );
 
     console.log(
-      `✓ AI content applied (${pages.length - hits - resumedCount} generated, ` +
+      `✓ AI content applied ` +
+        `(${pages.length - hits - resumedCount - skippedCount} generated, ` +
         `${hits} from cache, ${resumedCount} resumed` +
+        (skippedCount > 0 ? `, ${skippedCount} out of scope` : "") +
         `, profiles: ${router.profilesUsed.join(", ")})`,
     );
   }

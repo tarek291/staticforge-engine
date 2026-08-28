@@ -4,11 +4,13 @@ import { mockDeep, type DeepMockProxy } from "vitest-mock-extended";
 import type { Location, Service } from "@staticforge/schemas";
 
 import {
+  changesPageSet,
   describeSyncDiff,
   diffSyncPayload,
   fingerprintLocation,
   fingerprintService,
   loadSyncSnapshot,
+  planSyncRun,
   syncProject,
   type SyncSnapshot,
 } from "./sync.js";
@@ -175,6 +177,19 @@ describe("a real change is detected and queued", () => {
     prisma.$transaction.mockImplementation(((
       run: (tx: typeof prisma) => Promise<unknown>,
     ) => run(prisma)) as unknown as typeof prisma.$transaction);
+    // The project has one generated page, for the service these tests edit.
+    // Armed here because a sync now asks which pages a change reached before it
+    // decides what to queue.
+    prisma.generatedPage.findMany.mockResolvedValue([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "AI",
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ] as any);
   }
 
   test("an edited description is a change", () => {
@@ -231,7 +246,12 @@ describe("a real change is detected and queued", () => {
     expect(result?.changed).toBe(true);
     expect(result?.jobId).toBe("job_1");
     expect(enqueue).toHaveBeenCalledTimes(1);
-    expect(enqueue).toHaveBeenCalledWith("prj_1", "local-operator");
+    // Scoped to the one page the edited service actually reaches, rather than
+    // to the project.
+    expect(enqueue).toHaveBeenCalledWith("prj_1", "local-operator", [
+      "bueroreinigung-duisburg",
+    ]);
+    expect(result?.scope).toEqual(["bueroreinigung-duisburg"]);
   });
 
   test("a dry run reports the change and queues nothing", async () => {
@@ -312,5 +332,407 @@ describe("describeSyncDiff", () => {
 
   test("says so plainly when nothing moved", () => {
     expect(describeSyncDiff(diffSyncPayload({}, snapshotOf()))).toBe("no changes");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Smart queuing: which pages a change actually buys
+// ---------------------------------------------------------------------------
+
+/**
+ * A sync used to queue a run over the whole project, which was fine while a
+ * project was a demo and wrong the moment one was a customer. Editing one
+ * service in a forty-city account re-authored two hundred pages to change five.
+ *
+ * These tests hold the two properties that replace it, and both are asserted
+ * against a page table that actually honours the query rather than against a
+ * stub returning a fixed answer. That matters: a stub would pass just as
+ * happily if the `source` filter were deleted, which is precisely the mutation
+ * these tests exist to catch.
+ */
+
+/** A row in the fake page table. */
+interface StoredPageRow {
+  id: string;
+  slug: string;
+  serviceId: string;
+  locationId: string;
+  source: "TEMPLATE" | "AI" | "MANUAL";
+}
+
+/**
+ * Stand a page table up behind `findMany`, honouring the filters it is given.
+ *
+ * Faithful to Postgres in the one way that matters here: an *absent* filter
+ * restricts nothing. So a run that stops filtering by source sees every row,
+ * including the hand-edited ones, and the tests below fail — which is the whole
+ * point of writing the fake this way rather than returning a fixed list.
+ */
+function armPageTable(rows: StoredPageRow[]): void {
+  prisma.generatedPage.findMany.mockImplementation((async (args: {
+    where: {
+      projectId?: string;
+      source?: { in?: string[] };
+      OR?: Array<{ serviceId?: { in: string[] }; locationId?: { in: string[] } }>;
+    };
+  }) => {
+    const { where } = args;
+    const allowed = where.source?.in;
+    const clauses = where.OR;
+
+    return rows
+      .filter(() => where.projectId === undefined || where.projectId === "prj_1")
+      .filter((row) => allowed === undefined || allowed.includes(row.source))
+      .filter(
+        (row) =>
+          clauses === undefined ||
+          clauses.some(
+            (clause) =>
+              (clause.serviceId?.in.includes(row.serviceId) ?? false) ||
+              (clause.locationId?.in.includes(row.locationId) ?? false),
+          ),
+      )
+      .sort((a, b) => a.slug.localeCompare(b.slug));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  }) as any);
+}
+
+/** A second service, so a change can be shown not to reach it. */
+const SERVICE_B: Service = {
+  ...service,
+  id: "svc-2",
+  name: "Grundreinigung",
+  slug: "grundreinigung",
+};
+
+/** Arm a project holding both services and one location. */
+function armTwoServiceProject(): void {
+  const row = (item: Service) => ({
+    id: item.id,
+    name: item.name,
+    slug: item.slug,
+    description: item.description,
+    benefits: item.benefits,
+    priceFrom: null,
+    priceTo: null,
+    priceCurrency: null,
+    templateId: null,
+    contentProfileId: null,
+  });
+
+  prisma.project.findFirst.mockResolvedValue({
+    id: "prj_1",
+    services: [row(service), row(SERVICE_B)],
+    locations: [
+      {
+        id: "loc-1",
+        city: "Duisburg",
+        state: "NRW",
+        country: "DE",
+        postalCode: null,
+        latitude: null,
+        longitude: null,
+      },
+    ],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any);
+
+  prisma.$transaction.mockImplementation(((
+    run: (tx: typeof prisma) => Promise<unknown>,
+  ) => run(prisma)) as unknown as typeof prisma.$transaction);
+}
+
+/** The payload that edits the first service and leaves the second alone. */
+function editFirstService(): { services: Service[] } {
+  return {
+    services: [{ ...service, description: "D".repeat(140) }, SERVICE_B],
+  };
+}
+
+describe("a changed service queues only its own pages", () => {
+  test("the job is scoped to the edited service's page, not the project's", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "AI",
+      },
+      {
+        id: "pg_2",
+        slug: "grundreinigung-duisburg",
+        serviceId: "svc-2",
+        locationId: "loc-1",
+        source: "AI",
+      },
+    ]);
+
+    const enqueue = vi.fn().mockResolvedValue("job_1");
+
+    const result = await syncProject(
+      "prj_1",
+      "local-operator",
+      editFirstService(),
+      prisma,
+      { enqueueJob: enqueue },
+    );
+
+    // The feature, in one assertion: the untouched service's page is not bought.
+    expect(result?.scope).toEqual(["bueroreinigung-duisburg"]);
+    expect(enqueue).toHaveBeenCalledWith("prj_1", "local-operator", [
+      "bueroreinigung-duisburg",
+    ]);
+  });
+
+  test("a changed city reaches every service in it", async () => {
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "AI",
+      },
+      {
+        id: "pg_2",
+        slug: "grundreinigung-duisburg",
+        serviceId: "svc-2",
+        locationId: "loc-1",
+        source: "AI",
+      },
+      {
+        id: "pg_3",
+        slug: "bueroreinigung-essen",
+        serviceId: "svc-1",
+        locationId: "loc-2",
+        source: "AI",
+      },
+    ]);
+
+    const plan = await planSyncRun(
+      "prj_1",
+      "local-operator",
+      {
+        services: { added: [], updated: [], removed: [] },
+        locations: { added: [], updated: ["loc-1"], removed: [] },
+        changed: true,
+      },
+      prisma,
+    );
+
+    // Both services in Duisburg, and nothing in Essen.
+    expect(plan.scope).toEqual([
+      "bueroreinigung-duisburg",
+      "grundreinigung-duisburg",
+    ]);
+  });
+
+  test("an added service forces a full run, because a scope cannot create a page", async () => {
+    const added = diffSyncPayload(
+      { services: [service, SERVICE_B] },
+      {
+        services: new Map([["svc-1", fingerprintService(service)]]),
+        locations: new Map(),
+      },
+    );
+
+    expect(changesPageSet(added)).toBe(true);
+
+    const plan = await planSyncRun("prj_1", "local-operator", added, prisma);
+
+    // Scoping this would queue a job for pages that do not exist, do nothing,
+    // report success, and leave the new service unpublished with no error
+    // anywhere.
+    expect(plan.queue).toBe(true);
+    expect(plan.scope).toEqual([]);
+    expect(prisma.generatedPage.findMany).not.toHaveBeenCalled();
+  });
+
+  test("a removed service forces a full run, because the link graph moved", async () => {
+    const removed = diffSyncPayload(
+      { services: [] },
+      {
+        services: new Map([["svc-1", fingerprintService(service)]]),
+        locations: new Map(),
+      },
+    );
+
+    expect(changesPageSet(removed)).toBe(true);
+
+    const plan = await planSyncRun("prj_1", "local-operator", removed, prisma);
+
+    expect(plan.scope).toEqual([]);
+    expect(prisma.generatedPage.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("a hand-edited page is never queued", () => {
+  test("a MANUAL page is left out of the scope", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      // The operator has edited this one by hand.
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "MANUAL",
+      },
+      {
+        id: "pg_2",
+        slug: "grundreinigung-duisburg",
+        serviceId: "svc-2",
+        locationId: "loc-1",
+        source: "AI",
+      },
+    ]);
+
+    const enqueue = vi.fn().mockResolvedValue("job_1");
+
+    await syncProject("prj_1", "local-operator", editFirstService(), prisma, {
+      enqueueJob: enqueue,
+    });
+
+    // Nothing was queued, because the only page the change reached is one no
+    // automated run may rewrite.
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  test("when only some reached pages are MANUAL, the rest are still queued", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "MANUAL",
+      },
+      {
+        id: "pg_2",
+        slug: "bueroreinigung-essen",
+        serviceId: "svc-1",
+        locationId: "loc-2",
+        source: "AI",
+      },
+    ]);
+
+    const enqueue = vi.fn().mockResolvedValue("job_1");
+
+    const result = await syncProject(
+      "prj_1",
+      "local-operator",
+      editFirstService(),
+      prisma,
+      { enqueueJob: enqueue },
+    );
+
+    // The protection is per page, not per sync: one hand-edited page must not
+    // stop the others being refreshed, or an operator editing a single page
+    // would silently freeze the rest of the service.
+    expect(result?.scope).toEqual(["bueroreinigung-essen"]);
+    expect(result?.scope).not.toContain("bueroreinigung-duisburg");
+  });
+
+  test("a MANUAL page is excluded even when both its service and its city changed", async () => {
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "MANUAL",
+      },
+    ]);
+
+    const plan = await planSyncRun(
+      "prj_1",
+      "local-operator",
+      {
+        services: { added: [], updated: ["svc-1"], removed: [] },
+        locations: { added: [], updated: ["loc-1"], removed: [] },
+        changed: true,
+      },
+      prisma,
+    );
+
+    // Matching twice is not a way in. The `OR` finds the row through either
+    // side, and the source filter refuses it through both.
+    expect(plan.queue).toBe(false);
+    expect(plan.scope).toEqual([]);
+  });
+
+  test("a project of nothing but hand-edited pages queues nothing, ever", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "MANUAL",
+      },
+      {
+        id: "pg_2",
+        slug: "grundreinigung-duisburg",
+        serviceId: "svc-2",
+        locationId: "loc-1",
+        source: "MANUAL",
+      },
+    ]);
+
+    const enqueue = vi.fn().mockResolvedValue("job_1");
+
+    const result = await syncProject(
+      "prj_1",
+      "local-operator",
+      editFirstService(),
+      prisma,
+      { enqueueJob: enqueue },
+    );
+
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(result?.jobId).toBeNull();
+    // The data was still applied — the source is authoritative about it — and
+    // the sync says why it stopped there rather than reporting a plain success
+    // an operator would read as "the pages were rebuilt".
+    expect(result?.changed).toBe(true);
+    expect(result?.note).toMatch(/no run was queued/i);
+  });
+
+  test("the sync still announces itself when it queues nothing", async () => {
+    armTwoServiceProject();
+    armPageTable([
+      {
+        id: "pg_1",
+        slug: "bueroreinigung-duisburg",
+        serviceId: "svc-1",
+        locationId: "loc-1",
+        source: "MANUAL",
+      },
+    ]);
+
+    const seen: Array<{ jobId: string | null; scopedPages: number }> = [];
+
+    await syncProject("prj_1", "local-operator", editFirstService(), prisma, {
+      enqueueJob: vi.fn().mockResolvedValue("job_1"),
+      hooks: {
+        on: () => {},
+        count: () => 1,
+        emit: async (_hook, payload) => {
+          seen.push(payload as unknown as (typeof seen)[number]);
+          return { hook: "afterProjectSync" as const, delivered: 1, failures: [] };
+        },
+      },
+    });
+
+    // "We checked and there was nothing to do" is the answer an audit trail
+    // needs most often. A plugin that only heard about runs could not tell a
+    // steady project from an integration that stopped calling.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.jobId).toBeNull();
+    expect(seen[0]?.scopedPages).toBe(0);
   });
 });

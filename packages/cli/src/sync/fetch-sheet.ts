@@ -1,3 +1,5 @@
+import { checkOutboundUrl } from "@staticforge/core";
+
 /**
  * Fetching a sheet from a URL.
  *
@@ -24,67 +26,13 @@ export type FetchSheetResult = { ok: true; body: string } | FetchFailure;
 /**
  * Whether this address is one we will fetch.
  *
- * ## Why this check exists
- *
- * A URL supplied by an operator is fetched *by the server*, from wherever the
- * server sits. That is the shape of a server-side request forgery: an address
- * pointing at `localhost`, at a private range, or at a cloud metadata endpoint
- * asks this process to read something the caller could not reach themselves and
- * hand back the contents.
- *
- * Today this command is operator-run from a terminal, so the caller and the
- * process are the same person and the check buys little. It is here because
- * that stops being true the moment a "sync from a URL" field appears on the
- * dashboard, and a guard added before the field exists is a guard nobody has to
- * remember to add.
- *
- * The check is hostname-based and therefore not complete: a hostname that
- * resolves to a private address passes it, and closing that needs resolution
- * before connection. This refuses the direct cases and does not pretend to be
- * more.
+ * The check itself lives in `@staticforge/core` because the build trigger asks
+ * the same question about a deploy hook, and an SSRF guard that exists twice is
+ * one relaxation away from existing once. Kept exported here under its original
+ * name so the sync command reads as it always did.
  */
 export function isFetchableUrl(raw: string): FetchFailure | { ok: true; url: URL } {
-  let url: URL;
-
-  try {
-    url = new URL(raw);
-  } catch {
-    return { ok: false, message: `"${raw}" is not a URL.` };
-  }
-
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    return {
-      ok: false,
-      message: `Refusing ${url.protocol} — only http and https are fetched.`,
-    };
-  }
-
-  const host = url.hostname.toLowerCase();
-
-  const private_ =
-    host === "localhost" ||
-    host === "0.0.0.0" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".internal") ||
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-    host === "[::1]" ||
-    host === "::1";
-
-  if (private_) {
-    return {
-      ok: false,
-      message:
-        `Refusing to fetch "${host}": it is a loopback or private address. ` +
-        `A sync URL is fetched by the server, so pointing one inward is how an ` +
-        `internal service gets read out through this command.`,
-    };
-  }
-
-  return { ok: true, url };
+  return checkOutboundUrl(raw, "a sync URL");
 }
 
 /**
