@@ -2,13 +2,14 @@
 
 A schema-driven static site generation engine, organized as a pnpm monorepo.
 
-> **Status:** 🟢 Phases 01–25 delivered. End-to-end pipeline working against a
+> **Status:** 🟢 Phases 01–26 delivered. End-to-end pipeline working against a
 > live Supabase PostgreSQL instance, with a standalone queue worker, a data-sync
 > boundary, headless block editing, database-backed templates, a plugin runtime,
 > a read-only AI gap analyst, incremental publishing that re-authors only the
 > pages a change reached, an RBAC organization layer with a database audit
 > trail, a distributed token bucket that keeps several workers inside one
-> tenant's provider allowance, and hashed per-organization API keys. **Not yet deployed, and there is no
+> tenant's provider allowance, hashed per-organization API keys, and metered
+> usage behind hard quotas. **Not yet deployed, and there is no
 > authentication layer for people** (Phase 23 added authorization; Phase 25
 > added machine credentials, not human identity) — see
 > [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md)
@@ -94,7 +95,7 @@ corepack pnpm generate    # run the generator pipeline → data/output/
 corepack pnpm dev:web     # start the Next.js dev server
 corepack pnpm build:web   # build the static site
 corepack pnpm typecheck   # typecheck every workspace package
-corepack pnpm test        # run every package's test suite (1065 tests)
+corepack pnpm test        # run every package's test suite (1114 tests)
 corepack pnpm verify      # generate + typecheck (all) + test (all) + web build
 ```
 
@@ -132,7 +133,8 @@ Phases 01–13 established the content contract and the AI engine; phases 14–2
 turned it into a service; phases 21–22 made publishing incremental; phase 23
 added the enterprise layer; phase 24 made rate limiting survive a second
 worker; phase 25 gave organizations a credential they can prove they hold.
-Every phase below is merged into `main`.
+Phase 26 put a ceiling in front of the paid paths. Every phase below is merged
+into `main`.
 
 ### 01–13 — engine and hardening (summary)
 
@@ -581,6 +583,80 @@ instead of twelve.
 > can now prove it holds a credential. There is still no user table, no session
 > and no login, so on every path other than this webhook a human `userId` is
 > asserted by the caller rather than proved.
+
+
+### 26 — Metering and quotas
+
+Usage is counted **after** the fact; quotas are checked **before**. Those are
+opposite guarantees, and both directions are deliberate.
+
+**Why metering is retrospective.** A run's real page count is not knowable when
+it is queued: the grid is computed after the input loads, the AI pass skips
+cached and out-of-scope pages, and a run can fail half way. Charging at enqueue
+time would bill for work that was never done — the one billing error a customer
+never forgives. So consumption is recorded from lifecycle events once a verdict
+is durable, and the job row's own `completedCount` is read back rather than the
+grid estimated.
+
+**Why the quota is prospective.** A quota discovered when the work finishes is
+an invoice, not a ceiling: the pages are already written and already paid for.
+So `requireQuota` throws, in front of `enqueueJob` and `syncProject`, before
+either writes anything.
+
+| Metric | Counted | Gated at |
+| --- | --- | --- |
+| `AI_GENERATED_PAGES` | Pages an AI pass actually authored | `enqueueJob` |
+| `SYNC_OPERATIONS` | Calls that reached the sync layer | `syncProject` |
+
+**What the asymmetry costs, stated plainly.** The number the gate reads is a
+lower bound — work already queued has not been metered yet, and a meter write
+lost to an unreachable database is never metered at all. A tenant can exceed its
+limit by roughly the volume of work in flight when it crossed the line.
+
+The gate is also **not atomic**: two callers arriving together both read the
+same total and both pass. That was refused in Phase 24 and is accepted here, and
+the difference is what is being protected. The rate limiter guards someone
+else's hard ceiling, where overshooting produces 429s mid-run; a quota guards a
+commercial agreement, where overshooting produces a conversation.
+
+**Ordering inside each gate is load-bearing.** Permission is checked before
+quota, so a caller who may not touch a project learns that rather than learning
+how much allowance the organization has left. The quota is checked before the
+impact query, so a tenant out of allowance cannot keep reading which of its
+pages would change.
+
+**The sync gate covers exactly the path the meter covers.** A dry run emits no
+lifecycle event and never becomes a usage row, so it is not gated — refusing one
+would charge a tenant nothing and cost it the ability to plan.
+
+Three fail-open shapes were closed and one was kept:
+
+- An empty `SUM` is `NULL` in SQL, and `null > limit` allows everything —
+  coerced to zero.
+- A `resetDate` in the future counts no usage at all, which is a quota that
+  silently permits everything — **refused**, with a message saying it will not
+  clear on its own.
+- A negative limit is refused the same way.
+- **Kept:** no quota row means unlimited. Quotas are opt-in, and a default of
+  zero would have stopped every existing tenant the moment the table shipped.
+
+Usage is **append-only**. Nothing updates a row; a correction is another row,
+possibly negative. A usage table somebody can edit is one a customer is right to
+distrust, and a running total is the same race the token bucket needed raw SQL
+to avoid.
+
+```bash
+STATICFORGE_METER_USAGE=true   # write usage rows from the worker
+```
+
+The meter charges only for work that happened: a failed job meters nothing, a
+run that authored no pages meters nothing, and a run with no tenant meters
+nothing rather than putting the charge on somebody else's invoice.
+
+> **Not automated: advancing `resetDate` when a period rolls.** A quota counts
+> from whenever it was last set, so a monthly plan needs its reset date moved by
+> hand or by a scheduled job that does not exist yet. Until then a quota is a
+> lifetime allowance rather than a recurring one — see the gaps list.
 
 ---
 

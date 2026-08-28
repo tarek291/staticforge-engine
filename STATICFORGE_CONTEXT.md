@@ -6,9 +6,9 @@ incremental publishing are all verified end to end, and an RBAC organization
 layer now gates every write and a shared token bucket keeps several workers
 inside one tenant's provider allowance. Not yet deployed. Machine callers now
 authenticate with hashed per-organization API keys (Phase 25); people still do
-not authenticate at all.
+not authenticate at all. Paid paths now sit behind metered quotas (Phase 26).
 **Audience:** Product and platform planning for the SaaS layer.
-**Last updated:** 2026-08-28 (reflects phases 01–25)
+**Last updated:** 2026-08-28 (reflects phases 01–26)
 
 ---
 
@@ -742,14 +742,79 @@ and no login, so on every path other than this webhook a human `userId` is
 asserted by the caller rather than proved — and the two must not be confused
 when reading the gaps below.
 
-### 3.17 SEO publishing and internal linking *(Phases 05–06)*
+### 3.17 Metering and quotas *(Phase 26)*
+
+Usage is counted **after** an operation finishes; quotas are checked **before**
+one starts. Those are opposite guarantees on purpose.
+
+**Metering has to be retrospective.** A run's real page count is not knowable
+when it is queued — the grid is computed after the input loads, the AI pass
+skips cached and out-of-scope pages, and a run can fail half way. Charging at
+enqueue time would bill for work that was never done, which is the one billing
+error a customer never forgives. So consumption is recorded from lifecycle
+events once a verdict is durable, and the job row's own `completedCount` is read
+back rather than the grid estimated: the two differ for every run worth metering.
+
+**The quota has to be prospective.** A quota discovered when the work finishes
+is an invoice, not a ceiling — the pages are already written and already paid
+for. `requireQuota` therefore throws, in front of `enqueueJob` and
+`syncProject`, before either writes anything.
+
+**What the asymmetry costs.** The number the gate reads is a lower bound. Work
+already queued has not been metered yet, and a meter write lost to an
+unreachable database is never metered at all, so a tenant can exceed its limit
+by roughly the volume of work in flight when it crossed the line.
+
+The gate is also not atomic: two callers arriving together both read the same
+total and both pass, exactly as a read-then-write token bucket would. That was
+refused in Phase 24 and is accepted here, and the difference is what is being
+protected. The rate limiter guards someone else's hard ceiling, where
+overshooting produces 429s in the middle of a paid run, so it is a single atomic
+statement. A quota guards a commercial agreement, where overshooting produces a
+conversation. Paying for atomicity twice would be paying for the wrong thing.
+
+**Ordering inside each gate is load-bearing.** Permission is checked before
+quota, so a caller who may not touch a project learns that rather than learning
+how much allowance the organization has left. The quota is checked before the
+impact query, so a tenant out of allowance cannot keep reading which of its
+pages would change.
+
+**The sync gate covers exactly the path the meter covers.** A dry run emits no
+lifecycle event and never becomes a usage row, so it is not gated — refusing one
+would charge a tenant nothing and cost it the ability to plan, which is what
+somebody near their limit most needs to do. Keeping check and charge on the same
+paths is what stops the two drifting into a system that bills for what it did
+not gate, or the reverse.
+
+**Three fail-open shapes closed, one kept.** An empty `SUM` is `NULL` in SQL and
+`null > limit` allows everything — coerced to zero. A `resetDate` in the future
+counts no usage at all, which is a quota that silently permits everything —
+refused, with a message saying it will not clear on its own. A negative limit is
+refused the same way. The one kept is deliberate: no quota row means unlimited,
+because quotas are opt-in and a default of zero would have stopped every
+existing tenant the moment the table shipped.
+
+**Usage is append-only.** Nothing updates a row; a correction is another row,
+possibly negative. A usage table somebody can edit is one a customer is right to
+distrust, and a running total is the same race the token bucket needed raw SQL
+to avoid — where a `SUM` over an append-only table needs no lock and can be
+recomputed from the records when it is doubted.
+
+The meter charges only for work that happened: a failed job meters nothing, a
+run that authored no pages meters nothing, and a run with no tenant meters
+nothing rather than putting the charge on somebody else's invoice. Like the
+audit logger it cannot promise delivery, and it points the safe way for the same
+reason — an unmetered operation under-bills, while a meter able to fail a run
+could abort an hour-long build.
+
+### 3.18 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.18 Zero-JavaScript presentation layer
+### 3.19 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -768,15 +833,15 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.19 Test coverage
+### 3.20 Test coverage
 
-**1065 tests across 53 files in six packages**, all under Vitest, all passing.
+**1114 tests across 55 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
 | `ai` | 243 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop |
-| `core` | 290 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, tenant paths, job budget |
-| `database` | 273 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle — entirely against a mocked Prisma client |
+| `core` | 304 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, tenant paths, job budget |
+| `database` | 308 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle and the quota gate — entirely against a mocked Prisma client |
 | `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
 | `cli` | 50 | Pipeline stages, the standalone worker, and queue-drain detection |
@@ -807,6 +872,8 @@ migration.
 ```
 Organization  →  OrganizationMember[]   (OWNER | EDITOR | VIEWER)
               →  ApiKey[]                (SHA-256 hashed; each is also a member)
+              →  OrganizationQuota[]     (one ceiling per metric)
+              →  UsageRecord[]           (append-only; summed per period)
               →  Workspace  →  Project  →  Business
                        →  ContentTemplate
                        →  Service[]
@@ -955,7 +1022,13 @@ mean something.
   the DB path treats every service and location on a project as eligible.
 - **No CI pipeline and no deployment**; `verify` is run by hand, and the worker
   has no host.
-- **Billing is not started.**
+- **Nothing turns usage into an invoice.** Phase 26 meters consumption and
+  enforces quotas; no code prices a `UsageRecord` or charges anyone.
+- **`resetDate` is never advanced automatically.** A quota counts from whenever
+  it was last set, so a monthly plan is a lifetime allowance until an operator
+  or a scheduled job moves the date. There is no such job.
+- **The quota gate is not atomic**, deliberately — see 3.17. Concurrent callers
+  can each pass, so a limit is a soft bound rather than a hard one.
 - Businesses and content templates cannot be imported from CSV, only services
   and locations.
 - `refresh-page` does not yet pass the realigned `schemaOrg` through
