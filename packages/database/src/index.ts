@@ -44,6 +44,7 @@ export * from "./queue.js";
 export * from "./sync.js";
 export * from "./impact.js";
 export * from "./access.js";
+export * from "./api-key.js";
 export * from "./audit.js";
 export * from "./rate-limit.js";
 export * from "./registry.js";
@@ -57,6 +58,7 @@ export type {
   OrgRole,
   AuditLog,
   RateLimitState,
+  ApiKey,
   Workspace,
   Project,
   Service,

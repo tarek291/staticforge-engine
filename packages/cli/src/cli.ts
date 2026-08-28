@@ -28,6 +28,7 @@ Commands:
   worker                Run the queue worker until stopped.
   sync                  Pull services and locations from a published sheet.
   analyze               Ask the AI analyst which pages are worth building next.
+  api-keys              Mint, list and revoke organization API keys.
 
 build options:
   --locale <de|en>      Content locale. Default: de
@@ -47,6 +48,15 @@ sync options:
 analyze options:
   --project-id <id>     Project to analyse. Required.
   --gaps-only           List the missing combinations without asking the model.
+
+api-keys <create|list|revoke> options:
+  --org-id <id>         Organization the key belongs to. Required.
+  --name <name>         What the key is for. Required for create.
+  --role <role>         OWNER | EDITOR | VIEWER. Default: EDITOR
+  --key-id <id>         Key to revoke. Required for revoke.
+
+A created key is printed once and stored only as a SHA-256 hash. It cannot be
+shown again; a lost key is replaced rather than recovered.
 
 The analyze command is read-only: it queues nothing and writes nothing.
 Acting on the advice is a separate, deliberate step.
@@ -381,6 +391,138 @@ async function runAnalyze(values: Record<string, unknown>): Promise<void> {
   }
 }
 
+/**
+ * Mint, list and revoke organization API keys.
+ *
+ * A terminal command because there is no dashboard for this yet, and because
+ * the alternative — a route that issues credentials — would need to be
+ * authenticated by a credential, which is the problem this command exists to
+ * bootstrap out of.
+ *
+ * `create` prints the plaintext once. There is deliberately no way to print it
+ * again: it is hashed on the way into the database and the original is never
+ * stored, so a lost key is replaced rather than recovered. The output says so
+ * at the moment it matters rather than in documentation nobody reads twice.
+ *
+ * `revoke` exists for the same reason `create` does. A system that can issue
+ * credentials and not withdraw them is one where a key pasted into a public
+ * repository can never be turned off, and that is a worse gap than having no
+ * keys at all.
+ */
+async function runApiKeys(values: {
+  "org-id"?: string | undefined;
+  name?: string | undefined;
+  "key-id"?: string | undefined;
+  role?: string | undefined;
+}, action: string | undefined): Promise<void> {
+  const { generateApiKey, listApiKeys, prisma, revokeApiKey } = await import(
+    "@staticforge/database"
+  );
+
+  const organizationId = values["org-id"]?.trim();
+
+  if (organizationId === undefined || organizationId === "") {
+    console.error("api-keys needs --org-id <id>.\n\n" + USAGE);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    if (action === "create") {
+      const name = values.name?.trim();
+
+      if (name === undefined || name === "") {
+        console.error("api-keys create needs --name <name>.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const role = values.role?.trim().toUpperCase();
+
+      if (role !== undefined && role !== "OWNER" && role !== "EDITOR" && role !== "VIEWER") {
+        console.error(`Unknown role "${role}". Use OWNER, EDITOR or VIEWER.`);
+        process.exitCode = 1;
+        return;
+      }
+
+      const minted = await generateApiKey(
+        organizationId,
+        name,
+        prisma,
+        role === undefined ? {} : { role },
+      );
+
+      console.log(`\n✓ API key created for organization ${organizationId}`);
+      console.log(`  id:   ${minted.key.id}`);
+      console.log(`  name: ${minted.key.name}`);
+      console.log(`\n  ${minted.plaintext}\n`);
+      // Said plainly and once. An operator who closes this terminal without
+      // copying it has to mint a replacement, and finding that out later — from
+      // a 401 in an integration — is a worse way to learn it.
+      console.log("  Copy it now. It is stored only as a hash and cannot be shown again.");
+      console.log("  Send it as: Authorization: Bearer <key>\n");
+      return;
+    }
+
+    if (action === "list") {
+      const keys = await listApiKeys(organizationId, prisma);
+
+      if (keys.length === 0) {
+        console.log(`No API keys for organization ${organizationId}.`);
+        return;
+      }
+
+      console.log(`\nAPI keys for organization ${organizationId}:\n`);
+      for (const key of keys) {
+        const state = key.active
+          ? "active"
+          : `revoked ${key.revokedAt?.slice(0, 10) ?? ""}`;
+        console.log(`  ${key.id}  ${state.padEnd(20)} ${key.name}`);
+      }
+      // The secret is absent from this listing and from the table it reads, so
+      // there is nothing here to redact.
+      console.log("");
+      return;
+    }
+
+    if (action === "revoke") {
+      const keyId = values["key-id"]?.trim();
+
+      if (keyId === undefined || keyId === "") {
+        console.error("api-keys revoke needs --key-id <id>.");
+        process.exitCode = 1;
+        return;
+      }
+
+      const revoked = await revokeApiKey(keyId, organizationId, prisma);
+
+      if (revoked === null) {
+        // Scoped to the organization, so this is also the answer for a key that
+        // exists but belongs to someone else. Holding a key id must not be
+        // enough to turn off another tenant's credential, or to learn that it
+        // is real.
+        console.error(`✗ No API key "${keyId}" in organization ${organizationId}.`);
+        process.exitCode = 1;
+        return;
+      }
+
+      console.log(`✓ Key ${revoked.id} ("${revoked.name}") revoked at ${revoked.revokedAt}.`);
+      console.log("  Any integration still using it will now get 401.");
+      return;
+    }
+
+    console.error(`Unknown api-keys action "${action ?? ""}".\n\n${USAGE}`);
+    process.exitCode = 1;
+  } catch (error: unknown) {
+    console.error(
+      `\n✗ ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`,
+    );
+    process.exitCode = 1;
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
     options: {
@@ -393,6 +535,10 @@ async function main(): Promise<void> {
       url: { type: "string" },
       "dry-run": { type: "boolean", default: false },
       "gaps-only": { type: "boolean", default: false },
+      "org-id": { type: "string" },
+      name: { type: "string" },
+      "key-id": { type: "string" },
+      role: { type: "string" },
       help: { type: "boolean", default: false },
     },
     allowPositionals: true,
@@ -417,6 +563,11 @@ async function main(): Promise<void> {
 
   if (command === "analyze") {
     await runAnalyze(values);
+    return;
+  }
+
+  if (command === "api-keys") {
+    await runApiKeys(values, positionals[1]);
     return;
   }
 

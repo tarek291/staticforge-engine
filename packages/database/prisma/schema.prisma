@@ -558,6 +558,7 @@ model Organization {
   members    OrganizationMember[]
   workspaces Workspace[]
   projects   Project[]
+  apiKeys    ApiKey[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -692,4 +693,59 @@ model RateLimitState {
   /// this point, so a denied request must leave it alone — the time it waited
   /// is time the bucket was still filling.
   lastRefillAt DateTime
+}
+
+/// A credential that authenticates an organization to the API.
+///
+/// ## The plaintext key exists exactly once, in one response
+///
+/// Only a hash is stored. That is not a nicety: a table of usable credentials
+/// is a breach waiting for one backup, one log line, one over-broad `SELECT`,
+/// or one support engineer with read access. Storing the hash means the worst a
+/// leaked dump gives an attacker is a list of values that cannot be replayed.
+///
+/// The corollary is that a lost key cannot be recovered, only replaced — which
+/// is the correct trade and the reason the creating command says so loudly.
+///
+/// ## Why SHA-256 and not bcrypt
+///
+/// bcrypt and argon2 exist to make *low-entropy* secrets expensive to guess. A
+/// key generated here is 256 bits of cryptographic randomness, so there is
+/// nothing to guess: an attacker who cannot find the key cannot brute-force it
+/// at any work factor, and one who has it does not need to.
+///
+/// What a slow hash would cost is real. It would run on every authenticated
+/// request, and — the part that actually decides it — a salted hash cannot be
+/// looked up. Verification would become a scan of every key row with a
+/// comparison each, which is O(n) per request and gets slower as a customer
+/// adds keys. A fast hash over a high-entropy secret is indexable, constant
+/// time in the database, and gives up nothing that matters here.
+model ApiKey {
+  id String @id @default(cuid())
+
+  /// SHA-256 of the plaintext key, hex encoded.
+  ///
+  /// Unique, which is what turns verification into a single indexed lookup
+  /// rather than a scan. A collision would mean two keys authenticating as one
+  /// organization; at 256 bits that is not a risk anyone needs to plan for, and
+  /// the constraint makes it impossible rather than improbable.
+  keyHash String @unique
+
+  /// What this key is for, in an operator's own words. The only way to tell two
+  /// keys apart once neither can be displayed again.
+  name String
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  /// When it stopped being valid, or null while it still is.
+  ///
+  /// Revocation is a timestamp rather than a deletion, so the audit trail can
+  /// still say which key did something last month and when it was turned off.
+  /// A row that vanished would take that answer with it.
+  revokedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, createdAt])
 }

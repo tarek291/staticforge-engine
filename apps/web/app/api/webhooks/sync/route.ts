@@ -1,13 +1,7 @@
-import {
-  ProjectIdSchema,
-  jsonSyncAdapter,
-  verifyWebhookToken,
-  webhookAuthStatus,
-  WEBHOOK_SECRET_ENV_VAR,
-} from "@staticforge/core";
+import { ProjectIdSchema, jsonSyncAdapter } from "@staticforge/core";
 import {
   AccessDeniedError,
-  LOCAL_OPERATOR_ID,
+  authorizeProjectAccess,
   describeSyncDiff,
   enqueueJob,
   prisma,
@@ -23,37 +17,33 @@ import {
  * because a webhook that accepted data the CLI would reject, or that skipped
  * the change check, would be a second definition of what a sync is.
  *
- * ## What this endpoint is not gated by
+ * ## Authentication, as of Phase 25
  *
- * Not by `STATICFORGE_DASHBOARD`. That guard exists because the dashboard's
- * control routes ship no authentication at all; this one does, and gating a
- * webhook behind a local-only flag would make it useless for the thing it is
- * for. It fails closed instead: with no secret configured it refuses every
- * call, including the first.
+ * `Authorization: Bearer sf_org_…`. The key resolves to *one organization*, and
+ * that is what replaced the single `STATICFORGE_WEBHOOK_SECRET` this route used
+ * to trust. The old design had one value that authenticated the caller and said
+ * nothing about which tenant they were — so anyone holding it could sync any
+ * project the operator owned, which is exactly why it could never be handed to
+ * a customer.
  *
- * ## The limit worth stating plainly
+ * Three checks, in this order, and the order is the point:
  *
- * One shared secret authenticates the *caller*, not a tenant. Until per-project
- * secrets exist, anyone holding this value can sync any project the operator
- * owns — so it is one trust domain, and it is not ready to be handed to a
- * customer. Writes are scoped to the operator all the same, so the blast radius
- * stops at that boundary rather than at the whole table.
+ * 1. **Who is this?** The key resolves to an organization, or the request stops.
+ * 2. **Is the project theirs?** The project's organization must be the key's.
+ *    Answered before anything else touches the project, so a key cannot be used
+ *    to discover which project ids exist outside its own tenant.
+ * 3. **May they do this?** The key acts as a member of its organization, so the
+ *    same `requireCapability` gate every other write passes runs unchanged. A
+ *    key issued as a VIEWER is refused here exactly as a person would be.
+ *
+ * Not gated by `STATICFORGE_DASHBOARD`. That guard exists because the
+ * dashboard's control routes ship no authentication at all; this one does, and
+ * hiding a webhook behind a local-only flag would make it useless for the thing
+ * it is for.
  */
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<Response> {
-  const auth = verifyWebhookToken(
-    request.headers.get("authorization"),
-    process.env[WEBHOOK_SECRET_ENV_VAR],
-  );
-
-  if (!auth.ok) {
-    return Response.json(
-      { error: auth.message },
-      { status: webhookAuthStatus(auth.reason) },
-    );
-  }
-
   const body: unknown = await request.json().catch(() => undefined);
 
   if (body === undefined || typeof body !== "object" || body === null) {
@@ -78,6 +68,28 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
+  // Authentication and the tenant boundary, before the payload is even parsed
+  // and long before anything is written. The rule itself lives in
+  // `@staticforge/database` so it can be tested without standing up a server;
+  // this route only turns its verdict into a status code.
+  const auth = await authorizeProjectAccess(
+    request.headers.get("authorization"),
+    parsedProjectId.data,
+    prisma,
+  );
+
+  if (!auth.ok) {
+    // `WWW-Authenticate` on a 401 because RFC 7235 requires it, and because it
+    // tells an integrator which scheme to use without telling an attacker
+    // anything they did not already know.
+    return Response.json(
+      { error: auth.error },
+      auth.status === 401
+        ? { status: 401, headers: { "WWW-Authenticate": "Bearer" } }
+        : { status: auth.status },
+    );
+  }
+
   const parsed = jsonSyncAdapter.parse(data);
 
   if (!parsed.ok) {
@@ -94,7 +106,10 @@ export async function POST(request: Request): Promise<Response> {
   try {
     result = await syncProject(
     parsedProjectId.data,
-    LOCAL_OPERATOR_ID,
+    // The key acts as itself, not as the operator. Every write it causes is
+    // attributable to this credential in the audit trail, and revoking the key
+    // removes the membership that let it through.
+    auth.principal.userId,
     parsed.payload,
     prisma,
     {
@@ -115,13 +130,12 @@ export async function POST(request: Request): Promise<Response> {
     );
   } catch (error: unknown) {
     if (error instanceof AccessDeniedError) {
-      // A webhook holding a valid secret is still only as privileged as the
-      // user it acts as. A shared secret authenticates the *caller*; it does
-      // not decide what that caller may do, and conflating the two is how an
-      // integration token becomes an administrator.
+      // Authenticating is not the same as being allowed. A key issued as a
+      // VIEWER reaches this line and is refused, which is the whole reason keys
+      // are members rather than a parallel permission path.
       //
-      // 403 for a member whose role is too weak; 404 for one with no
-      // membership, which reads the same as a project that is not there.
+      // 403 for a key whose role is too weak; 404 for one with no membership at
+      // all, which reads the same as a project that is not there.
       return error.heldRole === null
         ? Response.json({ error: "Project not found." }, { status: 404 })
         : Response.json({ error: error.message }, { status: 403 });
