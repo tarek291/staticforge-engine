@@ -138,6 +138,16 @@ export async function refreshPage(
     metaDescription: content.metaDescription,
     h1: content.h1,
     content: content.content,
+    // Realigned, like the authoring pass and the block patch already do. This
+    // path was the last one still leaving structured data describing the copy
+    // it had just replaced — a crawler told one thing while the reader saw
+    // another, which is a documented negative signal on a product that exists
+    // to rank.
+    schemaOrg: {
+      ...page.schemaOrg,
+      name: content.h1,
+      description: content.metaDescription,
+    },
     generation: {
       promptVersion: provenance.promptVersion,
       modelVersion: provenance.modelVersion,

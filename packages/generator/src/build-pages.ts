@@ -271,6 +271,11 @@ export function buildPages(
   input: ValidatedInputData,
   options: BuildPagesOptions,
 ): GeneratedPage[] {
+  // Resolved once, from the caller or from the shipped constants. `buildPages`
+  // never learns to fetch this: a database query here would end its purity and
+  // break local file mode, which has no database to query.
+  const profiles = options.profiles ?? CONTENT_PROFILES;
+
   const pages: GeneratedPage[] = [];
   const issues: ValidationIssue[] = [];
   const seenSlugs = new Set<string>();
@@ -315,10 +320,10 @@ export function buildPages(
         // Own property only: the registry inherits `Object.prototype`, so a
         // tenant-supplied "constructor" would satisfy a bare index lookup and
         // pass the very check meant to reject it.
-        if (!Object.hasOwn(CONTENT_PROFILES, page.contentProfileId)) {
+        if (!Object.hasOwn(profiles, page.contentProfileId)) {
           issues.push({
             path: `pages[${page.slug}].contentProfileId`,
-            message: `Unknown contentProfileId "${page.contentProfileId}". Registered profiles: ${Object.keys(CONTENT_PROFILES).join(", ")}.`,
+            message: `Unknown contentProfileId "${page.contentProfileId}". Registered profiles: ${Object.keys(profiles).join(", ")}.`,
           });
         }
 

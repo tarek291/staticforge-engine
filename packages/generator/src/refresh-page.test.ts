@@ -362,3 +362,24 @@ test("a refreshed page still validates as part of the whole graph", async () => 
   // which is only true because slug and links survived.
   assert.deepEqual(validateInternalLinks(rebuilt), []);
 });
+
+test("refreshPage realigns schemaOrg with the copy it just wrote", async () => {
+  const before = await livePage();
+  const result = await refreshPage(before, input, "Make it clearer.", refresher().fn);
+
+  // This path was the last one still leaving structured data describing the
+  // copy it had replaced — a crawler told one thing while the reader saw
+  // another, on a product that exists to rank.
+  assert.equal(result.page.schemaOrg.name, result.page.h1);
+  assert.equal(result.page.schemaOrg.description, result.page.metaDescription);
+});
+
+test("refreshPage leaves the schemaOrg fields it does not derive alone", async () => {
+  const before = await livePage();
+  const result = await refreshPage(before, input, "Make it clearer.", refresher().fn);
+
+  // serviceType, provider and areaServed come from the business record, not
+  // from prose, so a revision has no say in them.
+  assert.deepEqual(result.page.schemaOrg["@type"], before.schemaOrg["@type"]);
+  assert.deepEqual(result.page.schemaOrg.provider, before.schemaOrg.provider);
+});

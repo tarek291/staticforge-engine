@@ -182,7 +182,28 @@ async function main(): Promise<void> {
   const validated = validateInputData(raw);
   console.log("✓ input validated");
 
-  let pages = buildPages(validated, { locale });
+  // Profiles are data now. Resolved here, at the composition root, and handed
+  // to a `buildPages` that stays pure and synchronous — a local file run has no
+  // database to ask and must keep working exactly as it did.
+  const profiles =
+    projectId === undefined
+      ? undefined
+      : await (async () => {
+          const { loadProfileRegistry, prisma, resolveOperatorId } = await import(
+            "@staticforge/database"
+          );
+          const loaded = await loadProfileRegistry(resolveOperatorId(), prisma);
+          console.log(
+            `✓ ${Object.keys(loaded).length} content profile(s) loaded: ` +
+              `${Object.keys(loaded).join(", ")}`,
+          );
+          return loaded;
+        })();
+
+  let pages = buildPages(validated, {
+    locale,
+    ...(profiles !== undefined ? { profiles } : {}),
+  });
   console.log(`✓ pages built (${pages.length})`);
 
   const jobId = resolveJobId();
@@ -216,12 +237,17 @@ async function main(): Promise<void> {
     // run may be held to different profiles, and a service is built around one.
     const cache = new FileContentCache(join(repoRoot, "data", "cache", "content"));
 
-    const router = createAuthoringRouter((profile) =>
-      mocked
-        ? createMockService({ profile })
-        : // Cached content survives between runs, so an unrelated rebuild does
-          // not re-buy pages whose source has not moved.
-          createAnthropicService({ profile, cache }),
+    const router = createAuthoringRouter(
+      (profile) =>
+        mocked
+          ? createMockService({ profile })
+          : // Cached content survives between runs, so an unrelated rebuild does
+            // not re-buy pages whose source has not moved.
+            createAnthropicService({ profile, cache }),
+      // The same registry the page assembly was checked against. Two registries
+      // would let a page pass validation under one policy and be authored under
+      // another.
+      profiles,
     );
 
     if (mocked) {

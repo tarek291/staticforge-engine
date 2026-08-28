@@ -4,3 +4,4 @@ export * from "./location.schema.js";
 export * from "./page.schema.js";
 export * from "./manifest.schema.js";
 export * from "./content-profile.js";
+export * from "./template-definition.js";

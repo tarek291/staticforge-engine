@@ -2,6 +2,8 @@ import { test } from "vitest";
 import assert from "node:assert/strict";
 import type { Business, Location, Service } from "@staticforge/schemas";
 
+import { DEFAULT_CONTENT_PROFILE, type ContentProfile } from "@staticforge/schemas";
+
 import { buildPages } from "./build-pages.js";
 import { ValidationError } from "./errors.js";
 import type { StaticContentTemplate, ValidatedInputData } from "./types.js";
@@ -99,6 +101,52 @@ test("buildPages still accepts a registered profile", () => {
 test("buildPages still rejects an ordinary unknown profile", () => {
   assert.throws(
     () => buildPages(inputWithProfile("invented"), { locale: "de" }),
+    ValidationError,
+  );
+});
+
+test("buildPages accepts a profile the injected registry defines", () => {
+  // The registry is data now: a tenant's own profile lives in a database row
+  // and is handed in, rather than being compiled into the engine.
+  const housePolicy: ContentProfile = { ...DEFAULT_CONTENT_PROFILE, id: "housePolicy" };
+
+  const pages = buildPages(inputWithProfile("housePolicy"), {
+    locale: "de",
+    profiles: { housePolicy },
+  });
+
+  assert.equal(pages.length, 1);
+  assert.equal(pages[0]?.contentProfileId, "housePolicy");
+});
+
+test("buildPages rejects a profile the injected registry does not define", () => {
+  // Injection must not become a way around the check. A registry that omits a
+  // profile is a registry that does not have it.
+  assert.throws(
+    () =>
+      buildPages(inputWithProfile("strictSeo"), {
+        locale: "de",
+        profiles: { onlyThis: DEFAULT_CONTENT_PROFILE },
+      }),
+    ValidationError,
+  );
+});
+
+test("buildPages falls back to the shipped profiles when none are injected", () => {
+  // Local file mode has no database to ask, and must keep working exactly as
+  // it did before profiles became rows.
+  const pages = buildPages(inputWithProfile("strictSeo"), { locale: "de" });
+
+  assert.equal(pages[0]?.contentProfileId, "strictSeo");
+});
+
+test("an injected registry with a null prototype still rejects inherited names", () => {
+  const registry = Object.create(null) as Record<string, ContentProfile>;
+  registry.housePolicy = { ...DEFAULT_CONTENT_PROFILE, id: "housePolicy" };
+
+  assert.throws(
+    () =>
+      buildPages(inputWithProfile("constructor"), { locale: "de", profiles: registry }),
     ValidationError,
   );
 });

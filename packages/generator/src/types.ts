@@ -1,4 +1,5 @@
-import type { Business, Service, Location, Locale } from "@staticforge/schemas";
+import type {
+  ContentProfile, Business, Service, Location, Locale } from "@staticforge/schemas";
 
 /**
  * Raw, unvalidated input data loaded from disk.
@@ -55,4 +56,16 @@ export interface ValidatedInputData {
 export interface BuildPagesOptions {
   /** Locale assigned to every generated page (`"de" | "en"`). */
   locale: Locale;
+  /**
+   * Content profiles a page may name.
+   *
+   * Injected rather than imported, which is what lets profiles live in the
+   * database without `buildPages` learning to query one. The caller resolves
+   * the registry — from rows in cloud mode, from the shipped constants in local
+   * file mode — and hands it over as data, so this function stays pure,
+   * synchronous and runnable on a machine with no database at all.
+   *
+   * Defaults to the shipped profiles, so an existing caller is unchanged.
+   */
+  profiles?: Record<string, ContentProfile>;
 }

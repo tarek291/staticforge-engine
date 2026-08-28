@@ -176,6 +176,98 @@ model GenerationJob {
   @@index([status, leaseExpiresAt])
 }
 
+/// A content profile a tenant may hold, stored rather than compiled in.
+///
+/// The quality policy — how long a title should be, how many sections carry an
+/// argument, which section kinds belong — was a constant in `@staticforge/schemas`.
+/// That made every new policy a code change and a deploy, which is the wrong
+/// shape for something a tenant is meant to choose and, eventually, buy.
+///
+/// The *definition* is data. What it is checked against is not: the JSON is
+/// parsed with `ContentProfileSchema` before anything uses it, so a row that
+/// does not describe a real profile is refused rather than half-applied.
+model ContentProfile {
+  id String @id @default(cuid())
+
+  /// The identifier a page stores in `contentProfileId`, e.g. "strictSeo".
+  ///
+  /// Distinct from `id` on purpose. Pages reference a profile by a readable
+  /// key, and two tenants must both be able to have a "premium" profile — which
+  /// a shared primary key would forbid.
+  key String
+
+  /// Human label, for a picker. Never used to resolve anything.
+  name String
+
+  /// The `ContentProfileSchema` payload. Stored as JSON because it is read
+  /// whole and never queried field by field.
+  definition Json
+
+  /// Available to every tenant. The shipped profiles are global; a tenant's own
+  /// are not.
+  isGlobal Boolean @default(false)
+
+  /// Owning user, or the shared sentinel `__global__` for a shipped row.
+  ///
+  /// Not nullable, and that is deliberate rather than incidental. Postgres
+  /// treats NULL as distinct from every other NULL, so a UNIQUE(key, userId)
+  /// with a nullable owner would happily accept two rows both claiming to be
+  /// the global "default" — the exact duplicate the constraint exists to
+  /// prevent, silently permitted in the one case that matters most. A sentinel
+  /// makes the constraint mean what it reads as.
+  userId String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One meaning per key per owner. Globals share a namespace of their own,
+  /// which is why the owner is part of the constraint rather than the key alone.
+  @@unique([key, userId])
+  @@index([userId])
+  @@index([isGlobal])
+}
+
+/// A template a tenant may hold.
+///
+/// ## What is data here, and what deliberately is not
+///
+/// A template's *definition* is data: which view renders it and how that view
+/// is configured. The view itself stays code, and that is not a limitation to
+/// be lifted later — it is the security boundary. A "template" that carried
+/// renderable code from a database into a React tree would be remote code
+/// execution wearing a marketplace's clothes, and no amount of validating the
+/// JSON around it would change that.
+///
+/// So a row names a registered view and configures it. Selling a template means
+/// selling a configuration, and adding a genuinely new *look* stays a code
+/// change — which is the honest trade.
+model Template {
+  id String @id @default(cuid())
+
+  /// The identifier a page stores in `templateId`, e.g. "luxuryLanding".
+  key String
+
+  /// Human label, for a picker.
+  name String
+
+  /// The `TemplateDefinitionSchema` payload: the view to render through, and
+  /// its configuration.
+  definition Json
+
+  isGlobal Boolean @default(false)
+
+  /// Owning user, or `__global__`. Non-nullable for the reason given on
+  /// `ContentProfile.userId`: a nullable owner defeats the unique constraint.
+  userId String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([key, userId])
+  @@index([userId])
+  @@index([isGlobal])
+}
+
 /// Business verticals. Values match `NicheSchema` exactly, so the mapping into
 /// the engine is a pass-through rather than a translation table.
 enum Niche {
