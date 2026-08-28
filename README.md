@@ -2,12 +2,14 @@
 
 A schema-driven static site generation engine, organized as a pnpm monorepo.
 
-> **Status:** 🟢 Phases 01–22 delivered. End-to-end pipeline working against a
+> **Status:** 🟢 Phases 01–23 delivered. End-to-end pipeline working against a
 > live Supabase PostgreSQL instance, with a standalone queue worker, a data-sync
 > boundary, headless block editing, database-backed templates, a plugin runtime,
-> a read-only AI gap analyst, and incremental publishing that re-authors only the
-> pages a change reached. **Not yet deployed, and there is no
-> authentication layer** — see [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md)
+> a read-only AI gap analyst, incremental publishing that re-authors only the
+> pages a change reached, and an RBAC organization layer with a database audit
+> trail. **Not yet deployed, and there is no
+> authentication layer** (Phase 23 added authorization, not identity) — see
+> [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md)
 > for the full state and the outstanding technical debt.
 
 ---
@@ -124,8 +126,8 @@ data/output/
 ## Delivered phases
 
 Phases 01–13 established the content contract and the AI engine; phases 14–20
-turned it into a service; phases 21–22 made publishing incremental. Every phase
-below is merged into `main`.
+turned it into a service; phases 21–22 made publishing incremental; phase 23
+added the enterprise layer. Every phase below is merged into `main`.
 
 ### 01–13 — engine and hardening (summary)
 
@@ -334,6 +336,97 @@ Configure it by presence:
 ```bash
 DEPLOY_WEBHOOK_URL=https://api.vercel.com/v1/integrations/deploy/prj_x/xxxx
 ```
+
+
+### 23 — Enterprise layer: organizations, RBAC, and the audit trail
+
+Every query used to scope on a `userId` column that defaulted to the string
+`"local-operator"`. That was honest while there was one operator; it is not a
+tenancy model, and nothing decided whether a caller was *allowed* to do what it
+had just done.
+
+**Organizations.** `Organization` is the tenant root that carries people and
+roles; `OrganizationMember` is one person's role in one organization, unique per
+pair. `Workspace` keeps grouping projects but is no longer the authorisation
+root — the two are deliberately not merged, because renaming a populated model
+is a destructive migration that deserves its own change.
+
+`Project.organizationId` is denormalised so a scope never needs a join, but
+**it cannot drift**: the foreign key is composite, pointing at
+`Workspace(id, organizationId)`, so Postgres itself refuses a project whose
+organization disagrees with its workspace's.
+
+**Roles are a rank, not a matrix.** `OWNER > EDITOR > VIEWER`. A matrix invites
+per-action exceptions and the first exception is the one nobody reviews.
+
+| Capability | Minimum role | Why |
+| --- | --- | --- |
+| `project:read` | VIEWER | |
+| `project:write` — edit, sync, generate | EDITOR | A viewer able to trigger a paid AI run makes "read only" meaningless in the one dimension with a bill |
+| `project:delete` | OWNER | The damage outlives the person doing it |
+| `member:manage` | OWNER | An EDITOR who can grant EDITOR has OWNER in every way that matters |
+
+**The gate.** `requireRole(organizationId, userId, requiredRole, prisma)` and
+`requireCapability(...)` throw rather than returning a boolean — `await
+canWrite(...)` compiles, does the query, discards the answer and writes anyway,
+whereas forgetting to handle a throw fails loudly.
+
+Its two refusals are worded differently on purpose:
+
+- **A non-member** is told only `No access to organization "X"` — identical to
+  what a non-existent organization produces. A message that differed would turn
+  the gate into a tenant enumeration API with a 403 in front of it.
+- **A member whose role is too weak** is told their role and what the action
+  needs. Not a leak — they know both already — and the difference between a
+  self-service fix and a support thread.
+
+`heldRole` is carried on `AccessDeniedError`, so a route answers `404` for the
+first case and `403` for the second without parsing prose.
+
+Everything unrecognised is a denial: `undefined` means "not a member" and is
+handled inside the helper rather than pushed out to every caller, and a stored
+role this build does not know resolves to no access rather than being compared
+numerically.
+
+**Enforcement, not just a helper.** `syncProject` and `enqueueJob` both gate
+before doing anything. The placement in `syncProject` is load-bearing: the check
+runs *before* the impact query, so a refused caller never learns which pages
+exist. A dry run is refused too — writing nothing is not the same as revealing
+nothing.
+
+**The audit trail is a table, not a log.** A log is trimmed, rotated, and
+readable by whoever has shell access; `AuditLog` is something a customer can be
+shown, scoped to their own organization.
+
+- **Nothing cascades into it.** `resourceId` is a plain string, so deleting a
+  project does not delete the record of the project being deleted — which is the
+  question an audit log is bought for.
+- **There is no unscoped read in the module at all.** The first convenience
+  function returning "all recent activity" is the one that ends up behind a
+  dashboard route.
+- Failures are recorded, not only successes. Syncs that changed nothing are
+  recorded by default: a sync that found nothing to do is still someone's
+  credential reaching this system.
+
+`createDatabaseAuditLoggerPlugin` is handed its writer at construction — the
+plugin contract gives a plugin no database client, so what it may reach is
+decided in one visible place.
+
+```bash
+STATICFORGE_AUDIT_DB=true   # write the trail to the AuditLog table
+STATICFORGE_AUDIT_LOG=true  # write it to stdout as well
+```
+
+> **The trail is best-effort, deliberately.** It is written after the action, by
+> a listener the bus may abandon, so an unreachable database in the seconds
+> after a job finishes loses that entry. Making it guaranteed would mean writing
+> it inside the action's own transaction — which the plugin architecture cannot
+> do and should not, since a plugin able to fail a run is a plugin able to abort
+> a paid, hour-long build. What *is* guaranteed is that a failed write is loud.
+
+> **This is authorization, not authentication.** There is still no user table, no
+> session, and no login: `userId` is supplied by the caller rather than proved.
+> The gate decides what a user may do; it does not establish who they are.
 
 ---
 

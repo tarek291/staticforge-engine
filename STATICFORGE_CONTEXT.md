@@ -2,10 +2,11 @@
 
 **Status:** Engine complete and running against a live Supabase PostgreSQL
 instance. Generation, persistence, queueing, sync, headless editing and
-incremental publishing are all verified end to end. Not yet deployed, and there
-is still no authentication.
+incremental publishing are all verified end to end, and an RBAC organization
+layer now gates every write. Not yet deployed, and there is still no
+authentication — Phase 23 decides what a user may do, not who they are.
 **Audience:** Product and platform planning for the SaaS layer.
-**Last updated:** 2026-08-28 (reflects phases 01–22)
+**Last updated:** 2026-08-28 (reflects phases 01–23)
 
 ---
 
@@ -36,8 +37,9 @@ boundary, the persistence layer, the job queue, the data-sync boundary, the
 headless editing API and the incremental publishing path are built, tested, and
 exercised against the real database. A change now re-authors only the pages it
 actually reached, and a drained queue triggers the static host's build.
-**What remains is the commercial surface: authentication and tenant scoping,
-deployment, and billing.**
+**What remains is the commercial surface: authentication, deployment, and
+billing.** Authorization and tenant scoping are built as of Phase 23; proving
+*who* a caller is, rather than taking their word for it, is not.
 
 ---
 
@@ -450,14 +452,128 @@ The SSRF guard these share now lives in `@staticforge/core`. Two copies of a
 guard are two guards until the first time someone relaxes one, and the one that
 gets relaxed is always the one whose caller looked safe.
 
-### 3.13 SEO publishing and internal linking *(Phases 05–06)*
+### 3.13 Organizations and role-based access *(Phase 23)*
+
+Until this phase every query scoped on a `userId` column that defaulted to the
+string `"local-operator"`. That was honest while there was one operator; it is
+not a tenancy model, and **nothing decided whether a caller was allowed to do
+what it had just done**.
+
+**Why `Organization` sits beside `Workspace` rather than replacing it.**
+`Workspace` was the tenant root and had no concept of a person. An organization
+is where people and their roles live, so it becomes the root authorisation is
+decided against, and `Workspace` stays the grouping level it always was. The two
+are deliberately not merged: renaming a populated model is a destructive
+migration and deserves its own change, reviewed on its own terms, rather than
+arriving as a side effect of adding roles.
+
+**Denormalisation that cannot drift.** `Project.organizationId` is denormalised
+from the workspace, for the reason `GenerationJob.userId` already is: every read
+of the table is scoped, and a scope that needs a join is a scope somebody
+eventually writes without. Unlike most denormalisation, this one is enforced —
+the foreign key is *composite*, pointing at `Workspace(id, organizationId)`, so
+Postgres refuses a project whose organization disagrees with its workspace's.
+The invariant is in the schema rather than in a comment asking people to
+remember it.
+
+**Roles are a rank, not a permission matrix.** `OWNER > EDITOR > VIEWER`. A
+matrix invites per-action exceptions and the first exception is the one nobody
+reviews. Where an action needs more than "may write" it *requires OWNER* rather
+than growing a flag bolted onto EDITOR.
+
+| Capability | Minimum role | Why that level |
+| --- | --- | --- |
+| `project:read` | VIEWER | |
+| `project:write` (edit, sync, generate) | EDITOR | A viewer who could trigger a paid AI run makes "read only" meaningless in the one dimension with a bill attached |
+| `project:delete` | OWNER | The damage outlives the person doing it |
+| `member:manage` | OWNER | An EDITOR who can grant EDITOR has OWNER in every way that matters |
+
+**Why the gate throws.** A boolean return makes the safe and unsafe paths look
+identical at the call site: `await canWrite(...)` compiles, runs the query,
+discards the answer and writes anyway. Throwing means forgetting to handle the
+refusal fails loudly — the failure mode points the right way.
+
+**Why the two refusals are worded differently.** A *non-member* is told only
+`No access to organization "X"`, in language identical to what a non-existent
+organization produces. Distinguishing the two would turn the gate into a way to
+enumerate tenants: try an id, and a different message means it is real. A
+*member with too weak a role* is told their role and what the action needs —
+which is not a leak, since they already know both, and is the difference between
+a self-service fix and a support thread. `AccessDeniedError` carries `heldRole`,
+so a route answers `404` for the first case and `403` for the second without
+parsing prose.
+
+**Everything unrecognised is a denial.** `undefined` means "not a member" and is
+handled inside the helper rather than pushed out to every caller — the caller
+that forgets is the one that fails open. A stored role this build does not know
+resolves to no access rather than being compared numerically. Writing that
+recogniser surfaced a real hole: `"constructor" in ORG_ROLE_RANK` is `true`,
+because `in` walks the prototype chain, so every inherited key was accepted as a
+role name. Nothing downstream compared successfully, so it happened to fail
+closed — but a recogniser that is only accidentally right is one the next
+refactor breaks.
+
+**Enforcement, not merely a helper.** `syncProject` and `enqueueJob` both gate
+before doing anything, and the placement is load-bearing: the sync check runs
+*before* the impact query, so a refused caller never learns which pages exist —
+an authorisation check that happens after the read it protects has already
+disclosed the thing it was protecting. A dry run is refused too, because writing
+nothing is not the same as revealing nothing. All three callers map the refusal
+to 403 or 404, and the webhook route now treats its shared secret as
+authenticating a *caller* rather than as deciding what that caller may do, which
+is how an integration token otherwise becomes an administrator.
+
+### 3.14 The audit trail *(Phase 23)*
+
+A log is trimmed, rotated, and readable by whoever has shell access on the box
+that produced it. `AuditLog` is a table a customer can be shown, scoped to their
+own organization, when they ask who changed a page or what a sync did.
+
+- **Nothing cascades into it.** `resourceId` is a plain string rather than a
+  relation, so deleting a project does not delete the record of the project
+  being deleted. A trail that disappears with the thing it describes cannot
+  answer the question it exists for.
+- **There is no unscoped read in the module.** The first convenience function
+  returning "all recent activity" is the one that ends up behind a dashboard
+  route, and an audit trail that leaks across tenants is worse than none — it is
+  a breach recorded in the product sold as the safeguard.
+- **Failures are recorded, not only successes.** "Nothing ran" and "it ran and
+  failed" are different answers, and only one means somebody should read a log.
+- **Syncs that changed nothing are recorded by default.** A sync that found
+  nothing to do is still someone's credential reaching this system; volume is a
+  retention-policy problem rather than a reason to record less.
+- `details` is the one column in this schema with no shape contract, on purpose:
+  a trail whose fields are pinned stops recording the ones added after it, which
+  are exactly the ones an investigation needs.
+
+`createDatabaseAuditLoggerPlugin` is handed its writer at construction. The
+plugin contract gives a plugin no database client, so what it may reach is
+decided by the composition root in one place a reviewer can see.
+
+**Stated plainly: the trail is best-effort.** It is written after the action, by
+a listener the bus is free to abandon, so a database unreachable for the seconds
+after a job finishes loses that entry. Making it guaranteed would mean writing
+it inside the same transaction as the action, which the plugin architecture
+cannot do and should not — a plugin able to fail a run is a plugin able to abort
+a paid, hour-long build, and installing one would then be a risk nobody should
+take. What *is* guaranteed is that a failed write is loud: it throws, and the
+bus records it against the plugin by name in the log an operator is already
+reading.
+
+**This is authorization, not authentication.** There is no user table, no
+session and no login, so `userId` is supplied by the caller rather than proved.
+Anyone able to set it is any user. This phase decides what a user *may* do; it
+does not establish who they are, and the two must not be confused when reading
+the gaps below.
+
+### 3.15 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.14 Zero-JavaScript presentation layer
+### 3.16 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -476,15 +592,15 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.15 Test coverage
+### 3.17 Test coverage
 
-**886 tests across 45 files in six packages**, all under Vitest, all passing.
+**962 tests across 49 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
 | `ai` | 225 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis |
-| `core` | 221 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, tenant paths, job budget |
-| `database` | 181 | Repository read mapping, atomic write path, queue claim, impact analysis and the incremental queuing rule — entirely against a mocked Prisma client |
+| `core` | 256 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, tenant paths, job budget |
+| `database` | 222 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate and the audit trail — entirely against a mocked Prisma client |
 | `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
 | `cli` | 50 | Pipeline stages, the standalone worker, and queue-drain detection |
@@ -513,7 +629,8 @@ migration.
 ### 4.1 Tenancy
 
 ```
-Workspace  →  Project  →  Business
+Organization  →  OrganizationMember[]   (OWNER | EDITOR | VIEWER)
+              →  Workspace  →  Project  →  Business
                        →  ContentTemplate
                        →  Service[]
                        →  Location[]
@@ -523,8 +640,13 @@ Workspace  →  Project  →  Business
 ContentProfile / Template  →  owned by a user, or global via a __global__ sentinel
 ```
 
-**Workspace** is the tenant root — an agency or a customer account. **Project**
-is one generated site. Every other row reaches a Workspace through a Project, so
+**Organization** is the tenant root as of Phase 23: it carries the members and
+the roles every authorisation decision is made against, and it is what is
+billed. **Workspace** groups projects beneath it — it held the root position
+before this phase and was deliberately not renamed, because renaming a populated
+model is a destructive migration that deserves its own change. **Project**
+is one generated site, and carries `organizationId` under a composite foreign
+key that makes disagreement with its workspace impossible. Every other row reaches a Workspace through a Project, so
 a tenant's data is a single subtree that can be scoped, exported, or deleted as
 one unit, and every relation cascades on delete.
 
@@ -595,13 +717,19 @@ than forking into two implementations that drift.
 
 Ordered by dependency.
 
-**1. Authentication and tenant scoping.** Users, workspace membership, and roles.
-Every query must be scoped to the caller's workspace, and Postgres row-level
-security should back that up rather than relying on application code alone. The
-subtree data model makes this enforceable, but **nothing enforces it yet — there
-is no authentication layer at all today.** This is now the largest open risk in
-the project: the dashboard and the headless API write tenant data with no caller
-identity behind them.
+**1. Authentication.** Phase 23 built the half of this that decides *what* a
+caller may do: organizations, membership, roles, and a gate every write passes
+through. It did not build the half that decides *who* the caller is. There is no
+user table, no session and no login, so `userId` is supplied by the caller
+rather than proved — **anyone able to set it is any user, including an OWNER.**
+That is now the largest open risk in the project, and it is a smaller one than
+it was: the authorisation model the sessions will plug into already exists and
+is enforced.
+
+Row-level security is the second half of the same item. Every isolation
+guarantee today is an application-level `where` clause, so a query written
+without one is a query without a boundary. RLS would make the database refuse
+what the application forgot to.
 
 **2. Prove the AI path against a live model.** `ANTHROPIC_API_KEY` is not
 configured in this environment. Every AI suite runs against injected doubles, so
@@ -626,7 +754,17 @@ mean something.
 
 ### Known gaps, stated plainly
 
-- **No authentication, no authorization, no tenant scoping enforcement, no RLS.**
+- **No authentication.** Authorization exists and is enforced as of Phase 23,
+  but `userId` is asserted by the caller and never proved. Do not read "we have
+  RBAC" as "we have auth".
+- **No row-level security.** Tenant isolation is application-level `where`
+  clauses only; the database would not refuse a query that forgot one.
+- **The gate is only as complete as its call sites.** `syncProject` and
+  `enqueueJob` are gated. The dashboard read routes and the block-patch route
+  are not yet, and `saveGeneratedPages` is deliberately ungated because the
+  worker calls it to complete a job that was already authorised at enqueue time.
+- **The audit trail is best-effort**, written after the action by a listener the
+  bus may abandon. Failures are loud, but a lost row is possible.
 - **No `ANTHROPIC_API_KEY` configured**; the AI path is covered only by injected
   doubles and has no live integration test.
 - **`packages/templates` is an empty placeholder**; templates remain route-local.
