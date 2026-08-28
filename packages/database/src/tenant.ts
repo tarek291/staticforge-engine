@@ -667,6 +667,14 @@ export async function saveRefreshedPage(
     metaDescription: string;
     h1: string;
     content: unknown;
+    /**
+     * Realigned structured data, when the caller derived it.
+     *
+     * Not a field an editor or a model may set — it is computed from the copy
+     * that just changed. Optional because a caller that did not recompute it
+     * should leave the stored value alone rather than blank it.
+     */
+    schemaOrg?: unknown;
     generation?: unknown;
   },
   userId: string,
@@ -682,6 +690,9 @@ export async function saveRefreshedPage(
         metaDescription: page.metaDescription,
         h1: page.h1,
         content: page.content as Prisma.InputJsonObject,
+        ...(page.schemaOrg === undefined
+          ? {}
+          : { schemaOrg: page.schemaOrg as Prisma.InputJsonObject }),
         generation:
           page.generation === undefined
             ? Prisma.DbNull

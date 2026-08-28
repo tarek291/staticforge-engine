@@ -35,8 +35,20 @@ export type RefreshContentFn = (
   request: RefreshRequest,
 ) => Promise<AuthoredContent>;
 
-/** Fingerprint the authored slice, to tell a real revision from a no-op. */
-export function computeContentHash(page: GeneratedPage): string {
+/**
+ * Fingerprint the authored slice, to tell a real revision from a no-op.
+ *
+ * Takes the slice rather than a whole page, so a refresh and a block patch
+ * fingerprint the same content through the same function. Two hashes of "the
+ * authored part of a page" that could disagree would make `changed` mean
+ * different things depending on which path produced it.
+ */
+export function computeContentHash(page: {
+  title: string;
+  metaDescription: string;
+  h1: string;
+  content: unknown;
+}): string {
   return stableHash({
     title: page.title,
     metaDescription: page.metaDescription,

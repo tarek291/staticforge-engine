@@ -10,3 +10,4 @@ export * from "./job-budget.js";
 export * from "./sync/adapter.js";
 export * from "./sync/adapters.js";
 export * from "./sync/webhook-auth.js";
+export * from "./patch/block-path.js";

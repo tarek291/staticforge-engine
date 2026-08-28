@@ -20,6 +20,9 @@ importers:
       '@staticforge/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@staticforge/generator':
+        specifier: workspace:*
+        version: link:../../packages/generator
       '@staticforge/schemas':
         specifier: workspace:*
         version: link:../../packages/schemas

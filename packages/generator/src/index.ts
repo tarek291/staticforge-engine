@@ -9,3 +9,4 @@ export * from "./refresh-page.js";
 export * from "./save-output.js";
 export * from "./publish-seo.js";
 export * from "./verify-policy.js";
+export * from "./patch-page.js";
