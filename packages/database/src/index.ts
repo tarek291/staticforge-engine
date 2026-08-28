@@ -45,6 +45,7 @@ export * from "./sync.js";
 export * from "./impact.js";
 export * from "./access.js";
 export * from "./audit.js";
+export * from "./rate-limit.js";
 export * from "./registry.js";
 export * from "./registry-seed.js";
 export * from "./tenant.js";
@@ -55,6 +56,7 @@ export type {
   OrganizationMember,
   OrgRole,
   AuditLog,
+  RateLimitState,
   Workspace,
   Project,
   Service,

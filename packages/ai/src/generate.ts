@@ -1,4 +1,7 @@
 import { DEFAULT_CONTENT_PROFILE, type ContentProfile } from "@staticforge/schemas";
+import type { RateLimiter } from "@staticforge/core";
+
+import type { AwaitTokensOptions } from "./rate-limit.js";
 
 import { getAnthropicClient } from "./client.js";
 import type { ContentCache } from "./cache.js";
@@ -68,6 +71,20 @@ export function createAnthropicService(options: {
   profile?: ContentProfile;
   cache?: ContentCache;
   requireFacts?: boolean;
+  /**
+   * The tenant's shared token budget, already bound to its bucket.
+   *
+   * Supplied by whoever knows which project this run belongs to — this factory
+   * does not, and giving it a project id so it could build its own limiter
+   * would put the choice of bucket inside the thing being limited.
+   *
+   * Omitted for a local file run, which has no tenant and no shared budget.
+   */
+  rateLimiter?: RateLimiter;
+  /** Budget, pause ceiling and reporting for the wait. */
+  rateLimit?: AwaitTokensOptions;
+  /** What one call costs the bucket. Defaults to the output budget. */
+  tokenCostPerCall?: number;
 }): AIGenerationService {
   return new AIGenerationService({
     client: getAnthropicClient(),
@@ -75,6 +92,11 @@ export function createAnthropicService(options: {
     ...(options.cache !== undefined ? { cache: options.cache } : {}),
     ...(options.requireFacts !== undefined
       ? { requireFacts: options.requireFacts }
+      : {}),
+    ...(options.rateLimiter !== undefined ? { rateLimiter: options.rateLimiter } : {}),
+    ...(options.rateLimit !== undefined ? { rateLimit: options.rateLimit } : {}),
+    ...(options.tokenCostPerCall !== undefined
+      ? { tokenCostPerCall: options.tokenCostPerCall }
       : {}),
   });
 }

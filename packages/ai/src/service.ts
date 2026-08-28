@@ -37,6 +37,9 @@ import {
 } from "./prompts.js";
 import type { PagePromptDetails } from "./prompts.js";
 import { RetryExhaustedError, withRetry, type RetryOptions } from "./retry.js";
+import type { RateLimiter } from "@staticforge/core";
+
+import { awaitTokens, type AwaitTokensOptions } from "./rate-limit.js";
 
 /**
  * The AI content generation service.
@@ -206,6 +209,32 @@ export interface AIGenerationServiceOptions {
    * ungrounded page looks exactly like a grounded one.
    */
   requireFacts?: boolean;
+  /**
+   * The tenant's shared token budget.
+   *
+   * Bound to its bucket and its capacity by whoever constructs the service, so
+   * this class can spend from the budget but cannot widen it — a component able
+   * to raise its own limit is not limited.
+   *
+   * Omit for no limiting, which is what a local run and every test does. The
+   * absence is the *only* way to opt out: there is no flag on the call path,
+   * because a per-call bypass is a per-call bypass somebody eventually sets.
+   */
+  rateLimiter?: RateLimiter;
+  /** Budget, pause ceiling and reporting for the wait. */
+  rateLimit?: Omit<AwaitTokensOptions, "sleepFn"> & {
+    sleepFn?: (ms: number) => Promise<void>;
+  };
+  /**
+   * What one call costs the bucket.
+   *
+   * Defaults to `maxTokens` — the output budget, which is the only part of the
+   * cost knowable *before* the call and the part a provider's per-minute token
+   * limit is dominated by. Deliberately an estimate: metering actual usage
+   * would mean charging the bucket after the money was already spent, which is
+   * an accounting record rather than a limiter.
+   */
+  tokenCostPerCall?: number;
 }
 
 /**
@@ -277,6 +306,9 @@ export class AIGenerationService {
   private readonly cache: ContentCache | undefined;
   private readonly promptVersion: string;
   private readonly systemPrompt: string;
+  private readonly rateLimiter: RateLimiter | undefined;
+  private readonly rateLimitOptions: AwaitTokensOptions;
+  private readonly tokenCostPerCall: number;
 
   constructor(options: AIGenerationServiceOptions) {
     this.client = options.client;
@@ -289,6 +321,12 @@ export class AIGenerationService {
     this.requireFacts = options.requireFacts ?? false;
     this.cache = options.cache;
     this.promptVersion = options.promptVersion ?? PROMPT_VERSION;
+    this.rateLimiter = options.rateLimiter;
+    this.rateLimitOptions = options.rateLimit ?? {};
+    // The output budget: the only part of a call's cost that is knowable before
+    // making it, and the part a provider's per-minute token ceiling is
+    // dominated by.
+    this.tokenCostPerCall = options.tokenCostPerCall ?? this.maxTokens;
     // Rendered once: the prompt is derived from the profile, so it changes only
     // when the profile does.
     this.systemPrompt = buildSystemPrompt(this.profile);
@@ -554,6 +592,17 @@ export class AIGenerationService {
      */
     buildText: () => string = () => buildUserPrompt(request),
   ): Promise<Anthropic.Message> {
+    // Before the request is built, let alone sent. Every path that reaches a
+    // provider — fresh authoring and refresh alike — comes through here, which
+    // is why the gate is here and not at each caller: a limiter with two entry
+    // points is a limiter with one entry point somebody forgot.
+    //
+    // Note what this is *not*. `withRetry` below reacts to a 429 the provider
+    // has already sent, paid for in latency and in the caller's patience. This
+    // asks the tenant's own budget first, and it is the only thing that can see
+    // what the other workers are spending.
+    await awaitTokens(this.rateLimiter, this.tokenCostPerCall, this.rateLimitOptions);
+
     try {
       return await withRetry(
         () =>

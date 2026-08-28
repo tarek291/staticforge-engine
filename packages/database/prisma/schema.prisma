@@ -644,3 +644,52 @@ model AuditLog {
   @@index([resourceId, createdAt])
   @@index([action, createdAt])
 }
+
+// ---------------------------------------------------------------------------
+// Distributed rate limiting
+// ---------------------------------------------------------------------------
+
+/// One token bucket, shared by every process that consumes from it.
+///
+/// ## Why this is a table and not a counter in memory
+///
+/// Rate limiting in process memory works exactly until there is a second
+/// process, and Phase 14 made the worker a process you are meant to run more
+/// than one of. Two workers each politely holding themselves to the provider's
+/// limit will together exceed it, every time, and the failure arrives as 429s
+/// in the middle of a paid run rather than as anything anyone designed.
+///
+/// The limit belongs to the *tenant and the provider*, not to a process, so the
+/// state has to live where every process can see it. Postgres already holds the
+/// queue those processes coordinate through; adding Redis here would be a
+/// second thing to run and secure for a row that is updated a few times a
+/// minute.
+///
+/// ## Why the row can be thrown away
+///
+/// Nothing else references it and nothing cascades into it. A deleted row means
+/// the next caller starts from a full bucket, which is the same state a new
+/// tenant starts in — so this table can be truncated to recover from a bad
+/// configuration without touching anything that matters.
+model RateLimitState {
+  /// The bucket's identity, chosen by the caller — a project id, a provider
+  /// name, or both. Not generated: the whole point is that two processes
+  /// computing the same key reach the same row.
+  id String @id
+
+  /// Whole tokens currently available.
+  ///
+  /// Integer, so the fractional remainder of a refill has to be carried
+  /// somewhere — see `lastRefillAt`, which is advanced by exactly the time the
+  /// granted tokens represent rather than to "now". Rounding it away instead
+  /// would quietly under-deliver on every call and starve a caller that polls
+  /// faster than one token's worth of time.
+  availableTokens Int
+
+  /// The instant the bucket was last credited up to.
+  ///
+  /// Deliberately not "the last time this row was touched". Tokens accrue from
+  /// this point, so a denied request must leave it alone — the time it waited
+  /// is time the bucket was still filling.
+  lastRefillAt DateTime
+}

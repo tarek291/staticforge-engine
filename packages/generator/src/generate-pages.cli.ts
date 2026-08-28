@@ -144,6 +144,38 @@ function resolveJobId(): string | undefined {
  */
 const ONLY_SLUGS_ENV_VAR = "STATICFORGE_ONLY_SLUGS";
 
+/** Environment variables tuning the shared token bucket. */
+const RATE_LIMIT_CAPACITY_ENV_VAR = "STATICFORGE_RATE_LIMIT_CAPACITY";
+const RATE_LIMIT_REFILL_ENV_VAR = "STATICFORGE_RATE_LIMIT_REFILL_PER_SEC";
+
+/**
+ * How much of the provider's allowance one tenant may hold and spend.
+ *
+ * The defaults are deliberately conservative rather than tuned: a limiter set
+ * too high protects nothing, and the cost of one set too low is a slower run
+ * rather than a failed one. Both are overridable, because the right numbers
+ * belong to the account's actual plan and this engine cannot know it.
+ */
+function resolveRateLimitPolicy(): {
+  maxCapacity: number;
+  refillRatePerSec: number;
+} {
+  const read = (name: string, fallback: number): number => {
+    const raw = process.env[name];
+    const value = raw === undefined ? Number.NaN : Number(raw);
+
+    // A malformed value falls back rather than propagating. `NaN` capacity
+    // would make every comparison false and refuse every call — a limiter that
+    // fails closed on a typo is a build that never starts.
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  };
+
+  return {
+    maxCapacity: read(RATE_LIMIT_CAPACITY_ENV_VAR, 160_000),
+    refillRatePerSec: read(RATE_LIMIT_REFILL_ENV_VAR, 2_600),
+  };
+}
+
 /**
  * The pages this run may author, if it is scoped.
  *
@@ -276,13 +308,50 @@ async function main(): Promise<void> {
     // run may be held to different profiles, and a service is built around one.
     const cache = new FileContentCache(join(repoRoot, "data", "cache", "content"));
 
+    // The tenant's shared token budget, when there is a tenant. Built here, at
+    // the composition root, because this is the only place that knows both the
+    // project id and the database — and because the service must not be able to
+    // choose its own bucket.
+    //
+    // A local file run gets none: there is no tenant, no other worker, and
+    // nothing to coordinate with.
+    const rateLimiter =
+      projectId === undefined
+        ? undefined
+        : await (async () => {
+            const { createProjectRateLimiter, prisma } = await import(
+              "@staticforge/database"
+            );
+            const policy = resolveRateLimitPolicy();
+            console.log(
+              `  · rate limit: ${policy.maxCapacity} tokens, ` +
+                `${policy.refillRatePerSec}/s refill (shared across workers)`,
+            );
+            return createProjectRateLimiter(projectId, policy, prisma);
+          })();
+
     const router = createAuthoringRouter(
       (profile) =>
         mocked
           ? createMockService({ profile })
           : // Cached content survives between runs, so an unrelated rebuild does
             // not re-buy pages whose source has not moved.
-            createAnthropicService({ profile, cache }),
+            createAnthropicService({
+              profile,
+              cache,
+              ...(rateLimiter !== undefined ? { rateLimiter } : {}),
+              rateLimit: {
+                onWait: ({ waitForMs, totalWaitedMs }) => {
+                  // Said out loud. A run that pauses without explaining itself
+                  // looks like a run that has hung, and the operator's next
+                  // move is to kill it.
+                  console.log(
+                    `  · rate limited — waiting ${Math.round(waitForMs / 1000)}s ` +
+                      `(${Math.round(totalWaitedMs / 1000)}s total)`,
+                  );
+                },
+              },
+            }),
       // The same registry the page assembly was checked against. Two registries
       // would let a page pass validation under one policy and be authored under
       // another.

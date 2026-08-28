@@ -663,3 +663,180 @@ describe("fact grounding", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// The tenant's token budget, asked before the provider is
+// ---------------------------------------------------------------------------
+
+describe("rate limiting gates the provider call", () => {
+  /** A limiter that refuses `denials` times, then allows. */
+  function limiterDenying(denials: number) {
+    const asked: number[] = [];
+    let remaining = denials;
+
+    return {
+      asked,
+      limiter: (requestedTokens: number) => {
+        asked.push(requestedTokens);
+
+        if (remaining > 0) {
+          remaining -= 1;
+          return Promise.resolve({
+            allowed: false,
+            waitForMs: 2000,
+            remainingTokens: 0,
+            unsatisfiable: false,
+          });
+        }
+
+        return Promise.resolve({
+          allowed: true,
+          waitForMs: 0,
+          remainingTokens: 100,
+          unsatisfiable: false,
+        });
+      },
+    };
+  }
+
+  test("the bucket is asked before the request is sent", async () => {
+    const order: string[] = [];
+    const create = vi.fn().mockImplementation(() => {
+      order.push("provider");
+      return Promise.resolve(toolResponse(goodContent()));
+    });
+
+    await serviceWith(create, {
+      rateLimiter: (tokens: number) => {
+        order.push("limiter");
+        return Promise.resolve({
+          allowed: true,
+          waitForMs: 0,
+          remainingTokens: tokens,
+          unsatisfiable: false,
+        });
+      },
+    }).generatePageContent(DETAILS);
+
+    // Asking afterwards would debit the bucket for a call that had already been
+    // made and paid for — an accounting record rather than a limiter.
+    expect(order).toEqual(["limiter", "provider"]);
+  });
+
+  test("a refused call waits and does not reach the provider until allowed", async () => {
+    const create = vi.fn().mockResolvedValue(toolResponse(goodContent()));
+    const waits: number[] = [];
+    const { limiter, asked } = limiterDenying(2);
+
+    await serviceWith(create, {
+      rateLimiter: limiter,
+      rateLimit: {
+        sleepFn: (ms: number) => {
+          waits.push(ms);
+          // The provider must not have been touched during the pause. Asserted
+          // here rather than afterwards, because "it was called once in the
+          // end" is also true of an implementation that called it immediately.
+          expect(create).not.toHaveBeenCalled();
+          return Promise.resolve();
+        },
+      },
+    }).generatePageContent(DETAILS);
+
+    expect(waits).toEqual([2000, 2000]);
+    expect(asked).toHaveLength(3);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  test("no limiter leaves the call path exactly as it was", async () => {
+    const create = vi.fn().mockResolvedValue(toolResponse(goodContent()));
+
+    await serviceWith(create).generatePageContent(DETAILS);
+
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  test("the cost charged is the output budget by default", async () => {
+    const create = vi.fn().mockResolvedValue(toolResponse(goodContent()));
+    const asked: number[] = [];
+
+    await serviceWith(create, {
+      maxTokens: 8000,
+      rateLimiter: (tokens: number) => {
+        asked.push(tokens);
+        return Promise.resolve({
+          allowed: true,
+          waitForMs: 0,
+          remainingTokens: 1,
+          unsatisfiable: false,
+        });
+      },
+    }).generatePageContent(DETAILS);
+
+    // Charging a nominal 1 per call would bound requests per minute and say
+    // nothing about tokens per minute — the ceiling a long authoring run
+    // actually reaches first.
+    expect(asked).toEqual([8000]);
+  });
+
+  test("the cost is overridable without widening the bucket", async () => {
+    const create = vi.fn().mockResolvedValue(toolResponse(goodContent()));
+    const asked: number[] = [];
+
+    await serviceWith(create, {
+      maxTokens: 8000,
+      tokenCostPerCall: 1200,
+      rateLimiter: (tokens: number) => {
+        asked.push(tokens);
+        return Promise.resolve({
+          allowed: true,
+          waitForMs: 0,
+          remainingTokens: 1,
+          unsatisfiable: false,
+        });
+      },
+    }).generatePageContent(DETAILS);
+
+    expect(asked).toEqual([1200]);
+  });
+
+  test("a cached answer costs the bucket nothing", async () => {
+    const create = vi.fn().mockResolvedValue(toolResponse(goodContent()));
+    const store = new Map<string, unknown>();
+    const cache = {
+      get: (key: string) => Promise.resolve(store.get(key) as never),
+      set: (key: string, value: unknown) => {
+        store.set(key, value);
+        return Promise.resolve();
+      },
+    };
+    const asked: number[] = [];
+    const limiter = (tokens: number) => {
+      asked.push(tokens);
+      return Promise.resolve({
+        allowed: true,
+        waitForMs: 0,
+        remainingTokens: 1,
+        unsatisfiable: false,
+      });
+    };
+
+    const identity = {
+      businessId: "b1",
+      serviceId: "s1",
+      locationId: "l1",
+      sourceHash: "hash",
+    };
+
+    const first = serviceWith(create, { cache: cache as never, rateLimiter: limiter });
+    await first.generatePageContent({ ...DETAILS, cacheIdentity: identity });
+
+    const second = serviceWith(create, { cache: cache as never, rateLimiter: limiter });
+    await second.generatePageContent({ ...DETAILS, cacheIdentity: identity });
+
+    // The gate sits at the provider call, not at the entry point, so a page
+    // served from the cache neither spends money nor spends the tenant's
+    // allowance. Charging for it would make a warm cache look like load.
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(asked).toHaveLength(1);
+  });
+});
