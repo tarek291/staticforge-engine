@@ -84,7 +84,12 @@ export const SUPABASE_ANON_KEY_ENV_VAR = "SUPABASE_ANON_KEY";
  * start and accept them.
  */
 export function createSessionVerifier(
-  env: NodeJS.ProcessEnv = process.env,
+  // A plain record rather than `NodeJS.ProcessEnv`, because a caller that has
+  // *validated* its configuration should be able to pass the validated values
+  // rather than reaching back into the process for them. Only two keys are
+  // read, so the wider type costs nothing and removes a cast at every such
+  // call site — and a cast is where a wrong object eventually gets through.
+  env: Record<string, string | undefined> = process.env,
 ): SupabaseClient | undefined {
   const url = env[SUPABASE_URL_ENV_VAR]?.trim();
   const key = env[SUPABASE_ANON_KEY_ENV_VAR]?.trim();

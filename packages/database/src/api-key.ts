@@ -31,8 +31,9 @@ import { withDbRetry } from "./retry.js";
  * role gate is a second permission path just for keys, and a second path is how
  * one of them ends up missing a check that the other has.
  *
- * So a key is given a principal id and a membership row, and every existing
- * `requireCapability` call works on it unchanged. It defaults to EDITOR, which
+ * So a key is given a principal id, a `User` row, and a membership row — all in
+ * one transaction — and every existing `requireCapability` call works on it
+ * unchanged. It defaults to EDITOR, which
  * is the level that can sync and generate but cannot delete a project or mint
  * more keys — so a leaked key cannot be used to manufacture its own
  * replacements, which is what turns a leak into a persistent foothold.
@@ -143,12 +144,30 @@ export async function generateApiKey(
         },
       });
 
-      await tx.organizationMember.create({
+      const principalId = apiKeyPrincipalId(created.id);
+
+      // The machine principal's own `User` row, written before the membership
+      // that points at it.
+      //
+      // Phase 27 made `OrganizationMember.userId` a real foreign key, which
+      // turned this from a detail into a requirement: without the row the
+      // membership is refused and minting a key fails outright. That is the
+      // constraint doing its job — the previous behaviour would have been a
+      // membership naming a principal that existed nowhere.
+      //
+      // The address is under `.invalid`, the TLD RFC 2606 reserves so it can
+      // never resolve. A placeholder under a real domain is one that eventually
+      // receives a password reset.
+      await tx.user.create({
         data: {
-          organizationId,
-          userId: apiKeyPrincipalId(created.id),
-          role,
+          id: principalId,
+          email: `${principalId.replace(/[^a-z0-9._-]+/gi, "-").toLowerCase()}@principals.staticforge.invalid`,
+          name: `API key ${name}`,
         },
+      });
+
+      await tx.organizationMember.create({
+        data: { organizationId, userId: principalId, role },
       });
 
       return created;

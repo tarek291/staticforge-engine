@@ -45,6 +45,8 @@ function armCreate(id = "key_1", organizationId = "org_1"): void {
   } as any);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   prisma.organizationMember.create.mockResolvedValue({} as any);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  prisma.user.create.mockResolvedValue({} as any);
 }
 
 /** Everything handed to Prisma across every call, as one searchable string. */
@@ -154,6 +156,38 @@ describe("a key becomes a member of its organization", () => {
     expect(prisma.organizationMember.create).toHaveBeenCalledWith({
       data: { organizationId: "org_7", userId: "apikey:key_9", role: "EDITOR" },
     });
+  });
+
+  test("the machine principal gets a User row, or the foreign key refuses it", async () => {
+    armCreate("key_9", "org_7");
+
+    await generateApiKey("org_7", "CI pipeline", prisma);
+
+    // Phase 27 made `OrganizationMember.userId` a real foreign key. Without
+    // this row the membership is refused and minting fails outright — which is
+    // exactly what happened in production before this line existed, and what a
+    // mocked Prisma client cannot notice, because a mock enforces no
+    // constraints.
+    const data = prisma.user.create.mock.calls[0]?.[0]?.data as {
+      id: string;
+      email: string;
+    };
+
+    expect(data.id).toBe("apikey:key_9");
+    // Under the TLD reserved so it can never resolve.
+    expect(data.email).toMatch(/@principals\.staticforge\.invalid$/);
+  });
+
+  test("the user is written before the membership that points at it", async () => {
+    armCreate();
+
+    await generateApiKey("org_1", "CI pipeline", prisma);
+
+    expect(prisma.user.create).toHaveBeenCalled();
+    expect(prisma.organizationMember.create).toHaveBeenCalled();
+    expect(
+      prisma.user.create.mock.invocationCallOrder[0] ?? Infinity,
+    ).toBeLessThan(prisma.organizationMember.create.mock.invocationCallOrder[0] ?? 0);
   });
 
   test("both writes are in one transaction", async () => {
