@@ -5,12 +5,12 @@ instance. Generation, persistence, queueing, sync, headless editing and
 incremental publishing are all verified end to end, and an RBAC organization
 layer now gates every write and a shared token bucket keeps several workers
 inside one tenant's provider allowance. Not yet deployed. Machine callers now
-authenticate with hashed per-organization API keys (Phase 25), and one dashboard
-route now verifies either a key or a Supabase session (Phase 28). Every other
-route still acts as the local-operator constant. Paid paths sit behind metered
-quotas (Phase 26).
+authenticate with hashed per-organization API keys (Phase 25), and **every**
+`apps/web` API route now verifies either a key or a Supabase session (Phases
+28–29) — the local-operator constant is gone from the web server entirely. Paid
+paths sit behind metered quotas (Phase 26).
 **Audience:** Product and platform planning for the SaaS layer.
-**Last updated:** 2026-08-28 (reflects phases 01–28)
+**Last updated:** 2026-08-28 (reflects phases 01–29)
 
 ---
 
@@ -41,10 +41,12 @@ boundary, the persistence layer, the job queue, the data-sync boundary, the
 headless editing API, the incremental publishing path and the distributed rate
 limiter are built, tested, and exercised against the real database. A change now re-authors only the pages it
 actually reached, and a drained queue triggers the static host's build.
-**What remains is the commercial surface: human authentication, deployment, and
-billing.** Authorization and tenant scoping are built as of Phase 23, and a
-machine caller can prove which organization it is as of Phase 25. Proving *which
-person* a caller is, rather than taking their word for it, is not.
+**What remains is the commercial surface: a browser session, deployment, and
+billing.** Authorization and tenant scoping are built as of Phase 23; a machine
+caller can prove which organization it is as of Phase 25; every web API route
+enforces both as of Phase 29. What is missing is the last link for people —
+nothing turns a login into a bearer token, so the dashboard UI is a shell and
+the API is what is ready.
 
 ---
 
@@ -874,14 +876,88 @@ route, `projects/[id]`, the dashboard pages and the whole CLI still pass the
 real Supabase project — `SUPABASE_URL` and `SUPABASE_ANON_KEY` are not
 configured here, so the live verification exercised the API-key branch only.
 
-### 3.19 SEO publishing and internal linking *(Phases 05–06)*
+### 3.19 Full API lockdown *(Phase 29)*
+
+Phase 28 authenticated one route by hand. Repeating that by hand on the others
+is how the fifth one ends up missing a check nobody notices — so the logic
+became a helper, and a route is three lines of using it.
+
+**Why the guards return a result instead of throwing.** A thrown guard is
+forgotten silently: a route with no `try` still compiles, still runs, and
+answers `500` instead of `401` — safe by luck rather than by design. The helpers
+return a discriminated union, so reading `auth.principal` without first
+narrowing on `auth.ok` is a **compile error**. The type system enforces the
+check that a `catch` block only documents.
+
+The refusal arrives as a ready `Response` rather than a status code, so two
+routes cannot disagree about what a `401` body looks like.
+
+```ts
+const auth = await requireApiAuth(request, "jobs");
+if (!auth.ok) return auth.response;
+
+const allowed = await requireApiProjectCapability(id, auth.principal, "project:write");
+if (!allowed.ok) return allowed.response;
+```
+
+**Two gates, in an order that is load-bearing.** Authentication first, so an
+unidentified caller never reaches a project lookup — a route that read first
+would let an anonymous request measure which project ids exist. Then the
+capability: `project:write` is EDITOR or above, so a VIEWER authenticates and is
+still refused with a `403` naming their role rather than a `401` that would send
+them to re-authenticate a credential which is working fine. A non-member gets
+`404`, identical to a project that does not exist.
+
+**`LOCAL_OPERATOR_ID` is gone from `apps/web`.** Every API route authenticates:
+the projects list, both jobs routes, the block patch, and the sync webhook.
+`robots.txt` and `sitemap.xml` stay open because a crawler cannot present a
+credential and neither reads tenant data. The only surviving mentions of the
+constant are prose explaining what was removed.
+
+**A coverage test makes omission impossible.** Every individual gate is tested
+where it lives; what no unit test can see is the route somebody adds next month
+that forgets to call one — it compiles, it works, and it is unauthenticated. So
+a test walks `apps/web/app/**/route.ts` and fails if any route lacks an
+authentication call or uses the constant. Public routes are listed explicitly,
+which makes opening one a visible edit in a file about authentication rather
+than an absence nobody notices.
+
+It is a coarse check by nature — it reads source rather than behaviour, and a
+route could satisfy it while using the guard wrongly. It is not trying to prove
+correctness. It is trying to make *omission* impossible, and omission is the
+failure that actually happens.
+
+**The two dashboard pages stopped reading tenant data.** A server component
+receives no `Authorization` header and there is no session cookie yet, so they
+cannot authenticate at all — and the honest response to that is to stop
+pretending, not to keep an unauthenticated read because it was convenient. They
+render a shell pointing at the authenticated API. `ControlPanel`,
+`RefreshButton` and the `STATICFORGE_DASHBOARD` guard were deleted with them:
+the flag existed because those routes shipped no authentication, and leaving an
+unauthenticated control panel in the tree is the same hazard as the shared-secret
+verifier removed in Phase 25 — a working alternative path waiting to be wired
+back in.
+
+That is a real loss of function, and the control buttons were the more dangerous
+half: they queued paid AI runs from a page that could not say who was clicking.
+
+**The lockdown exposed the deeper inconsistency.** With authentication working, a
+verified EDITOR passed every gate and then got `404` — because the tenant read
+helpers still scoped on `Project.userId`, the column that records who *created*
+a project. Membership records who may reach it, and the two diverge the moment a
+second principal is given access. `projectVisibleTo` in `scope.ts` expresses the
+rule once and `repository.ts` and `tenant.ts` use it, with one deliberate
+exception documented in its own test: a `GenerationJob` carries its own
+denormalised `userId` and is scoped on that column directly.
+
+### 3.20 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.20 Zero-JavaScript presentation layer
+### 3.21 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -900,15 +976,15 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.21 Test coverage
+### 3.22 Test coverage
 
-**1170 tests across 59 files in six packages**, all under Vitest, all passing.
+**1191 tests across 62 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
 | `ai` | 243 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop |
-| `core` | 335 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, the session guard and the server-env contract, tenant paths, job budget |
-| `database` | 333 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle, the quota gate and the unified auth door — entirely against a mocked Prisma client |
+| `core` | 345 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, the session guard, the server-env contract, the route-coverage sweep, tenant paths, job budget |
+| `database` | 344 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle, the quota gate, the unified auth door and the two gates a locked-down write route runs — entirely against a mocked Prisma client |
 | `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
 | `cli` | 50 | Pipeline stages, the standalone worker, and queue-drain detection |
@@ -1067,11 +1143,10 @@ mean something.
 
 ### Known gaps, stated plainly
 
-- **Authentication reaches one route.** `GET /api/dashboard/projects` verifies a
-  Supabase session or an API key (Phase 28). The jobs route, the block-patch
-  route, `projects/[id]`, the dashboard pages and the whole CLI still pass the
-  `LOCAL_OPERATOR_ID` constant, so on those paths a human `userId` is asserted
-  and never proved.
+- **No browser session.** Every API route authenticates (Phase 29), but nothing
+  turns a login into a bearer token, so the two dashboard pages render a shell
+  rather than data. The CLI still acts as `local-operator`, which is intended —
+  it runs on an operator's own machine.
 - **The session branch is unproven against a real provider.** `SUPABASE_URL` and
   `SUPABASE_ANON_KEY` are not configured here; the live verification exercised
   the API-key branch only, and the JWT branch is covered by injected doubles.
