@@ -5,10 +5,12 @@ instance. Generation, persistence, queueing, sync, headless editing and
 incremental publishing are all verified end to end, and an RBAC organization
 layer now gates every write and a shared token bucket keeps several workers
 inside one tenant's provider allowance. Not yet deployed. Machine callers now
-authenticate with hashed per-organization API keys (Phase 25); people still do
-not authenticate at all. Paid paths now sit behind metered quotas (Phase 26).
+authenticate with hashed per-organization API keys (Phase 25), and one dashboard
+route now verifies either a key or a Supabase session (Phase 28). Every other
+route still acts as the local-operator constant. Paid paths sit behind metered
+quotas (Phase 26).
 **Audience:** Product and platform planning for the SaaS layer.
-**Last updated:** 2026-08-28 (reflects phases 01–26)
+**Last updated:** 2026-08-28 (reflects phases 01–28)
 
 ---
 
@@ -807,14 +809,79 @@ audit logger it cannot promise delivery, and it points the safe way for the same
 reason — an unmetered operation under-bills, while a meter able to fail a run
 could abort an hour-long build.
 
-### 3.18 SEO publishing and internal linking *(Phases 05–06)*
+### 3.18 Unified authentication on the dashboard API *(Phase 28)*
+
+Phase 27 built a session guard and nothing called it. This calls it, on one
+route, alongside the machine keys from Phase 25 — through one door.
+
+**One door, not two.** A second endpoint for machines would be a second place
+every authorisation check has to be repeated, and the one that gets forgotten is
+never the one anybody is looking at. Phase 25 already made an API key a member of
+its organization so that a key and a person could be asked the same question;
+`authenticateRequest` is where that pays off.
+
+The credential's *shape* picks the verifier — a `sf_org_…` prefix goes to the
+key path, anything else to the session path — and both fail identically. A
+caller cannot learn from a 401 whether it presented a malformed key, a real but
+revoked one, an expired JWT, or nothing at all. That is a routing decision, not
+an authentication one, and keeping it from becoming an oracle is the reason the
+two branches share a message.
+
+**Scoping goes through membership, not through the creator column.**
+`Project.userId` records who *created* a project; `OrganizationMember` records
+who may reach it, and the two diverge the moment a second person joins an
+organization. Listing by the creator would show an owner their own projects and
+hide their colleagues' — which reads as data loss rather than as a permissions
+model. There is no branch on the kind of principal in that query, and the
+absence is deliberate: a branch is where a person and a key would eventually be
+scoped differently.
+
+**The route reads and never writes.** A caller who verifies but has never been
+provisioned sees an empty list rather than having a row written for them.
+Just-in-time provisioning is a reasonable feature and a terrible side effect of
+a `GET`: a read that writes cannot be retried, cached, or reasoned about.
+
+**Configuration is validated, and lazily.** A Zod schema rather than
+`process.env.X ?? throw`, because a *wrong* value fails differently from a
+missing one and only the first is obvious — a `SUPABASE_URL` holding the
+database connection string satisfies "is defined" and works nowhere, and an
+anon key still carrying its `.env.example` placeholder rejects every user while
+looking configured. Writing the test for that found the schema too weak:
+`z.string().url()` accepts `postgres://…`, so the one wrong value an operator is
+genuinely likely to paste passed it. The scheme is checked now.
+
+Lazily, because the session verifier is built only if a session token is what
+actually arrives. A deployment with no Supabase project can still serve
+integrations holding API keys, and building it eagerly would turn one
+misconfiguration into two outages. A configuration failure propagates as itself
+and becomes a `500`; an unverifiable token is a `401`. Collapsing the two would
+send an operator looking at their token while the server sits misconfigured —
+and the `500` body says nothing useful to a stranger, because which environment
+variables a deployment is missing belongs in the log where the operator is, not
+in the response where an unauthenticated caller is.
+
+**A cross-phase regression, found only by running it.** Phase 27's foreign key
+broke Phase 25's key minting: `generateApiKey` writes an `OrganizationMember`
+for an `apikey:…` principal, and there was no `User` row for it to point at, so
+every mint failed on the constraint. No mocked test could have caught it — a
+mock enforces no constraints — and the first live call hit it. The machine
+principal is now provisioned in the same transaction, with the ordering pinned
+by a test.
+
+**What this phase is not.** Auth everywhere. The jobs route, the block-patch
+route, `projects/[id]`, the dashboard pages and the whole CLI still pass the
+`LOCAL_OPERATOR_ID` constant. And the session branch has never run against a
+real Supabase project — `SUPABASE_URL` and `SUPABASE_ANON_KEY` are not
+configured here, so the live verification exercised the API-key branch only.
+
+### 3.19 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.19 Zero-JavaScript presentation layer
+### 3.20 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -833,15 +900,15 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.20 Test coverage
+### 3.21 Test coverage
 
-**1114 tests across 55 files in six packages**, all under Vitest, all passing.
+**1170 tests across 59 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
 | `ai` | 243 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop |
-| `core` | 304 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, tenant paths, job budget |
-| `database` | 308 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle and the quota gate — entirely against a mocked Prisma client |
+| `core` | 335 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, the session guard and the server-env contract, tenant paths, job budget |
+| `database` | 333 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle, the quota gate and the unified auth door — entirely against a mocked Prisma client |
 | `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
 | `cli` | 50 | Pipeline stages, the standalone worker, and queue-drain detection |
@@ -874,6 +941,8 @@ Organization  →  OrganizationMember[]   (OWNER | EDITOR | VIEWER)
               →  ApiKey[]                (SHA-256 hashed; each is also a member)
               →  OrganizationQuota[]     (one ceiling per metric)
               →  UsageRecord[]           (append-only; summed per period)
+
+User  →  OrganizationMember[]   (a principal: a person, or an `apikey:…` machine)
               →  Workspace  →  Project  →  Business
                        →  ContentTemplate
                        →  Service[]
@@ -998,10 +1067,14 @@ mean something.
 
 ### Known gaps, stated plainly
 
-- **No authentication for people.** Machine callers authenticate with API keys
-  as of Phase 25, and authorization is enforced as of Phase 23 — but a human
-  `userId` is still asserted by the caller and never proved. Do not read "we
-  have RBAC" or "we have API keys" as "we have auth".
+- **Authentication reaches one route.** `GET /api/dashboard/projects` verifies a
+  Supabase session or an API key (Phase 28). The jobs route, the block-patch
+  route, `projects/[id]`, the dashboard pages and the whole CLI still pass the
+  `LOCAL_OPERATOR_ID` constant, so on those paths a human `userId` is asserted
+  and never proved.
+- **The session branch is unproven against a real provider.** `SUPABASE_URL` and
+  `SUPABASE_ANON_KEY` are not configured here; the live verification exercised
+  the API-key branch only, and the JWT branch is covered by injected doubles.
 - **No row-level security.** Tenant isolation is application-level `where`
   clauses only; the database would not refuse a query that forgot one.
 - **The gate is only as complete as its call sites.** `syncProject` and
