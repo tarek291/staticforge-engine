@@ -4,6 +4,7 @@ import {
   isWellFormedApiKey,
   readBearerToken,
   verifyUserSession,
+  type SessionUser,
   type SessionVerifier,
 } from "@staticforge/core";
 
@@ -26,6 +27,14 @@ import type { TenantProjectSummary } from "./tenant.js";
  * is looking at. Phase 25 already made an API key a member of its organization
  * precisely so that a key and a person could be asked the same question; this
  * is where that pays off.
+ *
+ * ## Three ways in, one shape out
+ *
+ * A bearer `sf_org_…` key, a bearer session token, or a browser cookie. The
+ * header is always preferred: a browser attaches its cookie to every request to
+ * this origin, so a caller that bothered to send a header meant it, and
+ * checking the cookie first would answer an integration as whoever happened to
+ * be logged in on that machine.
  *
  * ## Why the routing decision is not an oracle
  *
@@ -74,6 +83,21 @@ export interface AuthenticateOptions {
    * like any other unverifiable credential.
    */
   sessionVerifier?: (() => SessionVerifier | undefined) | undefined;
+  /**
+   * The person this request's cookies identify, if any.
+   *
+   * Consulted only when no bearer credential was presented. A browser sends a
+   * cookie on every request to the origin, including the ones an integration
+   * makes through it — so a caller that took the trouble to send a header meant
+   * that header, and preferring the cookie would silently answer as whoever
+   * happened to be logged in on that machine.
+   *
+   * Resolving this needs Next's request-scoped `cookies()`, which exists only
+   * inside the web app. It arrives as a function so the *ordering* — the part
+   * that can be got wrong — stays here, where it is tested, rather than living
+   * in a route handler nothing can exercise.
+   */
+  cookieUser?: (() => Promise<SessionUser | null>) | undefined;
 }
 
 /**
@@ -93,7 +117,25 @@ export async function authenticateRequest(
   const token = readBearerToken(authorizationHeader);
 
   if (token === undefined) {
-    throw new UnauthorizedError("No bearer credential was supplied.");
+    // No header. Fall back to a browser session, which is the only other way a
+    // caller can identify itself.
+    //
+    // Explicitly *after* the header and never before it: a browser attaches its
+    // cookie to every request to this origin, so preferring the cookie would
+    // answer an integration running in a logged-in browser as the person logged
+    // in there rather than as the key it presented.
+    const person = await options.cookieUser?.();
+
+    if (person !== null && person !== undefined) {
+      return {
+        kind: "session",
+        userId: person.id,
+        email: person.email,
+        label: person.name ?? person.email,
+      };
+    }
+
+    throw new UnauthorizedError("No bearer credential and no browser session.");
   }
 
   // The fork. Shape only: a well-formed key goes to the key path, everything

@@ -13,6 +13,7 @@ import {
 } from "@staticforge/database";
 
 import { ServerEnvError, readServerEnv } from "./env";
+import { readCookieUser } from "../utils/supabase/server";
 
 /**
  * The guard every API route in this app goes through.
@@ -31,6 +32,17 @@ import { ServerEnvError, readServerEnv } from "./env";
  *
  * The refusal arrives as a ready `Response` rather than as a code, so two
  * routes cannot disagree about what a 401 body looks like.
+ *
+ * ## Three ways in, one shape out
+ *
+ * A bearer `sf_org_…` key, a bearer session token, or a browser cookie. Routes
+ * did not change to gain the third: the CLI keeps sending a header and the
+ * dashboard will send a cookie, and both arrive at the same `principal`.
+ *
+ * The header always wins. A browser attaches its cookie to every request to
+ * this origin, including ones an integration makes through it, so a caller that
+ * bothered to send a header meant that header — and checking the cookie first
+ * would answer as whoever happened to be logged in on that machine.
  */
 
 /** A caller who proved who they are, or the refusal to send back. */
@@ -89,7 +101,14 @@ export async function requireApiAuth(
     const principal = await authenticateRequest(
       request.headers.get("authorization"),
       prisma,
-      { sessionVerifier: resolveSessionVerifier },
+      {
+        sessionVerifier: resolveSessionVerifier,
+        // Consulted only when no header arrived. Reading cookies needs Next's
+        // request-scoped store, which is why this is a callback rather than a
+        // value: the *ordering* lives in `@staticforge/database`, where it is
+        // tested, and only the mechanics live here.
+        cookieUser: readCookieUser,
+      },
     );
 
     return { ok: true, principal };

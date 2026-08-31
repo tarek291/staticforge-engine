@@ -30,11 +30,20 @@ const APP_DIR = resolve(HERE, "../../../../apps/web/app");
 /**
  * Routes that are deliberately open, and why.
  *
- * Both are public by definition — a crawler cannot present a credential — and
- * neither reads tenant data: they render from the static manifest the build
- * produced, not from the database.
+ * `robots.txt` and `sitemap.xml` are public by definition — a crawler cannot
+ * present a credential — and neither reads tenant data: they render from the
+ * static manifest the build produced, not from the database.
+ *
+ * `auth/login` is open because obtaining a credential is what it is for. It is
+ * exempted by name rather than by a pattern like "anything under /auth", so
+ * opening a second unauthenticated endpoint stays a visible edit to this list
+ * rather than a route that quietly matched a rule.
  */
-const PUBLIC_ROUTES = new Set(["robots.txt/route.ts", "sitemap.xml/route.ts"]);
+const PUBLIC_ROUTES = new Set([
+  "robots.txt/route.ts",
+  "sitemap.xml/route.ts",
+  "api/auth/login/route.ts",
+]);
 
 /** Calls that count as authenticating. */
 const AUTH_CALLS = ["requireApiAuth", "authorizeProjectAccess", "authenticateRequest"];
@@ -90,10 +99,11 @@ describe("every API route authenticates", () => {
     }
   });
 
-  test("the public routes are the two that cannot present a credential", () => {
+  test("the public routes are only the ones that cannot present a credential", () => {
     // Pinned, so adding a third is a deliberate edit to this list rather than a
     // route that quietly joined it.
     expect([...PUBLIC_ROUTES].sort()).toEqual([
+      "api/auth/login/route.ts",
       "robots.txt/route.ts",
       "sitemap.xml/route.ts",
     ]);
