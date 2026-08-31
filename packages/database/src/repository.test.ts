@@ -135,7 +135,7 @@ describe("query shape", () => {
     const arg = prisma.project.findFirst.mock.calls[0]?.[0];
     // Scoped in the query, not checked after it: the owner is part of finding
     // the project at all.
-    expect(arg?.where).toEqual({ id: "prj_1", userId: "local-operator" });
+    expect(arg?.where).toEqual({ id: "prj_1", organization: { members: { some: { userId: "local-operator" } } } });
     expect(arg?.include).toMatchObject({
       workspace: true,
       business: true,
@@ -152,7 +152,7 @@ describe("query shape", () => {
 
     expect(prisma.project.findFirst.mock.calls[0]?.[0]?.where).toEqual({
       id: "prj_1",
-      userId: "user_other",
+      organization: { members: { some: { userId: "user_other" } } },
     });
   });
 
@@ -522,7 +522,7 @@ describe("saveGeneratedPages", () => {
       prisma.generatedPage.deleteMany.mock.invocationCallOrder[0] ?? 0;
 
     expect(prisma.project.findFirst).toHaveBeenCalledWith({
-      where: { id: "prj_1", userId: "local-operator" },
+      where: { id: "prj_1", organization: { members: { some: { userId: "local-operator" } } } },
       select: { id: true },
     });
     expect(ownershipOrder).toBeLessThan(deleteOrder);
@@ -562,7 +562,7 @@ describe("saveGeneratedPages", () => {
         projectId: "prj_1",
         // Scoped through the relation as well as by id, so a refactor that
         // drops the ownership check still cannot reach another tenant's rows.
-        project: { userId: "local-operator" },
+        project: { organization: { members: { some: { userId: "local-operator" } } } },
         slug: { notIn: ["bueroreinigung-duisburg", "grundreinigung-essen"] },
       },
     });
@@ -664,7 +664,7 @@ describe("saveGeneratedPages", () => {
     expect(prisma.generatedPage.deleteMany).toHaveBeenCalledWith({
       where: {
         projectId: "prj_1",
-        project: { userId: "local-operator" },
+        project: { organization: { members: { some: { userId: "local-operator" } } } },
         slug: { notIn: [] },
       },
     });
@@ -713,7 +713,7 @@ describe("manual edits survive a generation run", () => {
     expect(prisma.generatedPage.deleteMany).toHaveBeenCalledWith({
       where: {
         projectId: "prj_1",
-        project: { userId: "local-operator" },
+        project: { organization: { members: { some: { userId: "local-operator" } } } },
         slug: { notIn: ["bueroreinigung-duisburg", "hand-written-page"] },
       },
     });

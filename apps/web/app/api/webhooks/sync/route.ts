@@ -36,10 +36,11 @@ import {
  *    same `requireCapability` gate every other write passes runs unchanged. A
  *    key issued as a VIEWER is refused here exactly as a person would be.
  *
- * Not gated by `STATICFORGE_DASHBOARD`. That guard exists because the
- * dashboard's control routes ship no authentication at all; this one does, and
- * hiding a webhook behind a local-only flag would make it useless for the thing
- * it is for.
+ * Not gated by a feature flag, and as of Phase 29 nothing else is either. The
+ * local-only `STATICFORGE_DASHBOARD` switch existed because the dashboard's
+ * control routes shipped no authentication; every route now authenticates, so
+ * the flag protected nothing and has been removed. A flag is a deployment
+ * convention, a gate is a check, and only one of them survives being forgotten.
  */
 export const dynamic = "force-dynamic";
 

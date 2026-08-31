@@ -10,6 +10,7 @@ import type {
   Service,
 } from "@staticforge/schemas";
 
+import { projectVisibleTo } from "./scope.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -135,7 +136,7 @@ export async function getProjectPayload(
   // connection would waste the whole invocation. A read repeats cleanly.
   const project = await withDbRetry(() =>
     prisma.project.findFirst({
-      where: { id: projectId, userId },
+      where: { id: projectId, ...projectVisibleTo(userId) },
       include: {
         workspace: true,
         business: true,
@@ -309,7 +310,7 @@ export async function loadResumablePages(
 ): Promise<Map<string, ResumablePage>> {
   const rows = await withDbRetry(() =>
     prisma.generatedPage.findMany({
-      where: { projectId, project: { userId }, source: "AI" },
+      where: { projectId, project: projectVisibleTo(userId), source: "AI" },
       select: {
         slug: true,
         title: true,
@@ -440,7 +441,7 @@ export async function saveGeneratedPages(
   return withDbRetry(() =>
     prisma.$transaction(async (tx) => {
       const owned = await tx.project.findFirst({
-        where: { id: projectId, userId },
+        where: { id: projectId, ...projectVisibleTo(userId) },
         select: { id: true },
       });
 
@@ -462,7 +463,7 @@ export async function saveGeneratedPages(
       const { count: removed } = await tx.generatedPage.deleteMany({
         where: {
           projectId,
-          project: { userId },
+          project: projectVisibleTo(userId),
           slug: { notIn: [...slugs, ...protectedSlugs] },
         },
       });

@@ -1,16 +1,13 @@
 import { ProjectIdSchema } from "@staticforge/core";
 import {
   AccessDeniedError,
-  LOCAL_OPERATOR_ID,
+  QuotaExceededError,
   enqueueJob,
   prisma,
 } from "@staticforge/database";
 import { LocaleSchema } from "@staticforge/schemas";
 
-import {
-  dashboardDisabledResponse,
-  isDashboardEnabled,
-} from "@/lib/dashboard/guard";
+import { requireApiAuth } from "@/lib/auth";
 
 /**
  * Queue an engine run.
@@ -35,12 +32,21 @@ import {
  * line that a shell reads on Windows, and one becomes a directory name, so "is
  * a non-empty string" is not a sufficient check for either — even though this
  * route no longer builds that command itself.
+ *
+ * ## Who may queue one
+ *
+ * A queued job spends money on a paid AI run, so this is a write in every sense
+ * that matters. The caller is identified here and the role and quota gates run
+ * inside `enqueueJob` — not repeated at this route, because a check that exists
+ * in two places is a check that eventually differs in two places.
  */
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<Response> {
-  if (!isDashboardEnabled()) {
-    return dashboardDisabledResponse();
+  const auth = await requireApiAuth(request, "jobs");
+
+  if (!auth.ok) {
+    return auth.response;
   }
 
   const body: unknown = await request.json().catch(() => ({}));
@@ -106,12 +112,23 @@ export async function POST(request: Request): Promise<Response> {
   try {
     job = await enqueueJob(
       parsedProjectId.data,
-      LOCAL_OPERATOR_ID,
+      auth.principal.userId,
       kind,
       prisma,
       target,
     );
   } catch (error: unknown) {
+    if (error instanceof QuotaExceededError) {
+      // 402: the request was well-formed and the caller was allowed. What is
+      // exhausted is the plan, and that is a different conversation from a
+      // permissions problem — sending 403 for it points an operator at their
+      // role while the actual fix is on an invoice.
+      return Response.json(
+        { error: error.message, quota: error.verdict },
+        { status: 402 },
+      );
+    }
+
     if (error instanceof AccessDeniedError) {
       // 403 for a member whose role is too weak, 404 for someone with no
       // membership at all — the second is indistinguishable from a project that

@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import type { JobKind, JobStatus, PrismaClient } from "@prisma/client";
 
 import { requireCapability } from "./access.js";
+import { projectVisibleTo } from "./scope.js";
 import { requireQuota } from "./quota.js";
 import { withDbRetry } from "./retry.js";
 
@@ -211,7 +212,7 @@ export async function getProjectForUser(
   prisma: PrismaClient,
 ): Promise<TenantProjectDetail | null> {
   const project = await prisma.project.findFirst({
-    where: { id: projectId, userId },
+    where: { id: projectId, ...projectVisibleTo(userId) },
     include: {
       workspace: { select: { name: true } },
       business: { select: { name: true } },
@@ -304,7 +305,7 @@ export async function enqueueJob(
   scope?: readonly string[],
 ): Promise<JobSummary | null> {
   const project = await prisma.project.findFirst({
-    where: { id: projectId, userId },
+    where: { id: projectId, ...projectVisibleTo(userId) },
     select: { id: true, organizationId: true },
   });
 
@@ -530,7 +531,7 @@ export async function countExpectedPages(
 ): Promise<number | null> {
   const project = await withDbRetry(() =>
     prisma.project.findFirst({
-      where: { id: projectId, userId },
+      where: { id: projectId, ...projectVisibleTo(userId) },
       select: { _count: { select: { services: true, locations: true } } },
     }),
   );
@@ -671,7 +672,7 @@ export async function getPageForUser(
   prisma: PrismaClient,
 ): Promise<StoredPage | null> {
   const page = await prisma.generatedPage.findFirst({
-    where: { projectId, slug, project: { userId } },
+    where: { projectId, slug, project: projectVisibleTo(userId) },
   });
 
   if (page === null) {
@@ -739,7 +740,7 @@ export async function saveRefreshedPage(
   // to a connection blip means paying again for the same revision.
   const { count } = await withDbRetry(() =>
     prisma.generatedPage.updateMany({
-      where: { projectId, slug: page.slug, project: { userId } },
+      where: { projectId, slug: page.slug, project: projectVisibleTo(userId) },
       data: {
         title: page.title,
         metaDescription: page.metaDescription,

@@ -46,6 +46,7 @@ export * from "./impact.js";
 export * from "./access.js";
 export * from "./api-key.js";
 export * from "./authenticate.js";
+export * from "./scope.js";
 export * from "./quota.js";
 export * from "./audit.js";
 export * from "./rate-limit.js";

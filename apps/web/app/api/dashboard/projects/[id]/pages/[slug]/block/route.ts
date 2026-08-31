@@ -1,6 +1,5 @@
 import { ProjectIdSchema } from "@staticforge/core";
 import {
-  LOCAL_OPERATOR_ID,
   getPageForUser,
   getProjectPayload,
   prisma,
@@ -9,10 +8,7 @@ import {
 import { patchPageContent, validateInputData } from "@staticforge/generator";
 import { GeneratedPageSchema, PageSlugSchema } from "@staticforge/schemas";
 
-import {
-  dashboardDisabledResponse,
-  isDashboardEnabled,
-} from "@/lib/dashboard/guard";
+import { requireApiAuth, requireApiProjectCapability } from "@/lib/auth";
 
 /**
  * Replace one block of a published page.
@@ -31,6 +27,18 @@ import {
  * contract, the quality profile and the verified record, and a failure at any
  * of them discards the patch whole. Nothing is written on a rejection — the
  * page the editor was looking at is the page that stays published.
+ *
+ * ## Who may send one
+ *
+ * Two gates, in this order. `requireApiAuth` establishes *who* — a Supabase
+ * session or an API key, refused identically — and `requireApiProjectCapability`
+ * establishes *what they may do*: `project:write`, which is EDITOR or above. A
+ * VIEWER authenticates and is still refused, with a 403 naming their role.
+ *
+ * This route used to run as the `LOCAL_OPERATOR_ID` constant behind a
+ * local-only feature flag. A flag is a deployment convention; a gate is a
+ * check. Publishing an editor that rewrites live pages on the strength of the
+ * former was never going to survive contact with a customer.
  */
 export const dynamic = "force-dynamic";
 
@@ -42,10 +50,6 @@ export async function PATCH(
   request: Request,
   context: Context,
 ): Promise<Response> {
-  if (!isDashboardEnabled()) {
-    return dashboardDisabledResponse();
-  }
-
   const { id, slug } = await context.params;
 
   const parsedProjectId = ProjectIdSchema.safeParse(id);
@@ -85,12 +89,34 @@ export async function PATCH(
     );
   }
 
-  // Both reads are scoped to the operator, and both answer `null` for a project
+  // Who, then what. Authentication first so an unidentified caller never
+  // reaches a project lookup — a route that read before it authenticated would
+  // let an anonymous request measure which project ids exist.
+  const auth = await requireApiAuth(request, "projects/pages/block");
+
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  // `project:write` is EDITOR or above. A VIEWER has authenticated and is still
+  // refused here, which is the whole reason authentication and authorisation
+  // are two calls rather than one.
+  const allowed = await requireApiProjectCapability(
+    parsedProjectId.data,
+    auth.principal,
+    "project:write",
+  );
+
+  if (!allowed.ok) {
+    return allowed.response;
+  }
+
+  // Both reads are scoped to the caller, and both answer `null` for a project
   // that is not theirs — the same answer a project that does not exist gives.
   const stored = await getPageForUser(
     parsedProjectId.data,
     slug,
-    LOCAL_OPERATOR_ID,
+    auth.principal.userId,
     prisma,
   );
 
@@ -100,7 +126,7 @@ export async function PATCH(
 
   const payload = await getProjectPayload(
     parsedProjectId.data,
-    LOCAL_OPERATOR_ID,
+    auth.principal.userId,
     prisma,
   ).catch(() => null);
 
@@ -170,7 +196,7 @@ export async function PATCH(
         generatedAt: new Date().toISOString(),
       },
     },
-    LOCAL_OPERATOR_ID,
+    auth.principal.userId,
     prisma,
   );
 

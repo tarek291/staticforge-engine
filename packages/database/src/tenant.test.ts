@@ -136,10 +136,7 @@ describe("getProjectForUser", () => {
 
     await getProjectForUser("prj_1", LOCAL_OPERATOR_ID, prisma);
 
-    expect(prisma.project.findFirst.mock.calls[0]?.[0]?.where).toEqual({
-      id: "prj_1",
-      userId: LOCAL_OPERATOR_ID,
-    });
+    expect(prisma.project.findFirst.mock.calls[0]?.[0]?.where).toEqual({ id: "prj_1", organization: { members: { some: { userId: LOCAL_OPERATOR_ID } } } });
   });
 
   test("returns null for a project owned by someone else", async () => {
@@ -189,10 +186,7 @@ describe("enqueueJob", () => {
 
     await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "BUILD", prisma);
 
-    expect(prisma.project.findFirst.mock.calls[0]?.[0]?.where).toEqual({
-      id: "prj_1",
-      userId: LOCAL_OPERATOR_ID,
-    });
+    expect(prisma.project.findFirst.mock.calls[0]?.[0]?.where).toEqual({ id: "prj_1", organization: { members: { some: { userId: LOCAL_OPERATOR_ID } } } });
   });
 
   test("refuses to queue work against another tenant's project", async () => {
@@ -247,6 +241,10 @@ describe("getJobForUser", () => {
 
     await getJobForUser("job_1", LOCAL_OPERATOR_ID, prisma);
 
+    // A job carries its own denormalised `userId` — see the schema — so it is
+    // scoped on the column directly rather than through the project's
+    // organization. That is the one read here that is not membership-scoped,
+    // and it is deliberate.
     expect(prisma.generationJob.findFirst.mock.calls[0]?.[0]?.where).toEqual({
       id: "job_1",
       userId: LOCAL_OPERATOR_ID,
@@ -604,7 +602,7 @@ describe("saveRefreshedPage", () => {
     expect(prisma.generatedPage.updateMany.mock.calls[0]?.[0]?.where).toEqual({
       projectId: "prj_1",
       slug: "bueroreinigung-duisburg",
-      project: { userId: "local-operator" },
+      project: { organization: { members: { some: { userId: "local-operator" } } } },
     });
   });
 
@@ -655,7 +653,7 @@ describe("countExpectedPages", () => {
 
     expect(prisma.project.findFirst.mock.calls[0]?.[0]?.where).toEqual({
       id: "prj_1",
-      userId: "user_other",
+      organization: { members: { some: { userId: "user_other" } } },
     });
   });
 });

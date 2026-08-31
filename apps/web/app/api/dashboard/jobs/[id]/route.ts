@@ -1,11 +1,16 @@
-import { LOCAL_OPERATOR_ID, getJobForUser, prisma } from "@staticforge/database";
+import { getJobForUser, prisma } from "@staticforge/database";
 
-import {
-  dashboardDisabledResponse,
-  isDashboardEnabled,
-} from "@/lib/dashboard/guard";
+import { requireApiAuth } from "@/lib/auth";
 
-/** Poll one job's status and logs. */
+/**
+ * Poll one job's status and logs.
+ *
+ * A job log carries a tenant's project ids, page slugs and engine output, so
+ * this is a tenant read like any other and is scoped to the caller who proved
+ * who they are. A job belonging to someone else answers `404` — the same answer
+ * as a job that does not exist, because two answers would let anyone holding a
+ * job id confirm it is real.
+ */
 export const dynamic = "force-dynamic";
 
 interface Context {
@@ -13,15 +18,17 @@ interface Context {
 }
 
 export async function GET(
-  _request: Request,
+  request: Request,
   context: Context,
 ): Promise<Response> {
-  if (!isDashboardEnabled()) {
-    return dashboardDisabledResponse();
+  const auth = await requireApiAuth(request, "jobs/[id]");
+
+  if (!auth.ok) {
+    return auth.response;
   }
 
   const { id } = await context.params;
-  const job = await getJobForUser(id, LOCAL_OPERATOR_ID, prisma);
+  const job = await getJobForUser(id, auth.principal.userId, prisma);
 
   if (job === null) {
     return Response.json({ error: "Job not found." }, { status: 404 });

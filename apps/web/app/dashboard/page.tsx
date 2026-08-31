@@ -1,24 +1,31 @@
-import Link from "next/link";
 import type { ReactElement } from "react";
 
-import { DASHBOARD_ENV_VAR, isDashboardEnabled } from "@/lib/dashboard/guard";
-import {
-  LOCAL_OPERATOR_ID,
-  isDatabaseReachable,
-  listProjectsForUser,
-  prisma,
-} from "@staticforge/database";
+import { isDatabaseReachable, prisma } from "@staticforge/database";
 
 /**
- * The dashboard index: every project the database holds.
+ * The dashboard index.
  *
- * Dynamic, and it must be. The generated pages are static because their content
- * is fixed at build time; this reads live rows, and prerendering it would show
- * an operator whatever was true when the site was last built.
+ * ## Why this page no longer lists projects
  *
- * The English chrome here is not a language-neutrality regression: that rule
- * governs *generated* pages, whose every string comes from tenant data. This is
- * operator tooling, and it has no tenant.
+ * It used to read them server-side as `LOCAL_OPERATOR_ID` — a constant, not an
+ * identity. That was honest while there was one operator and no notion of who
+ * anyone was, and it stopped being defensible the moment organizations,
+ * memberships and roles existed: a server component rendering one tenant's data
+ * on the strength of a hardcoded string is a tenancy boundary that exists
+ * everywhere except here.
+ *
+ * Removing the constant leaves this page with no way to know who is asking. A
+ * server component receives no `Authorization` header, and there is no session
+ * cookie yet — Phase 27 verifies a bearer token, and nothing has been built to
+ * turn a browser session into one. So the page stops pretending, and points at
+ * the endpoint that does authenticate.
+ *
+ * That is a real loss of function and it is the correct trade. The alternative
+ * was keeping an unauthenticated read of tenant data because it was convenient,
+ * which is the shape of every "temporary" hole that ships.
+ *
+ * The next step is a session cookie and a client-side fetch against
+ * `GET /api/dashboard/projects`, which already enforces exactly this.
  */
 export const dynamic = "force-dynamic";
 
@@ -28,109 +35,48 @@ export const metadata = {
 };
 
 export default async function DashboardPage(): Promise<ReactElement> {
+  // The one thing this page can still answer without knowing who is asking:
+  // whether the engine has a database at all. It names no tenant and leaks no
+  // row.
   const reachable = await isDatabaseReachable(prisma);
-
-  // Orphan recovery is deliberately not done here any more. A job whose lease
-  // lapsed is not failed, it is *reclaimed*: the worker picks it up and the run
-  // resumes from the pages the previous attempt already wrote. Failing it from
-  // the dashboard would throw that work away, and would do so from a process
-  // that no longer knows anything about who is running what.
-
-  const projects = reachable ? await listProjectsForUser(LOCAL_OPERATOR_ID, prisma) : [];
 
   return (
     <div className="flex flex-col gap-8">
       <header className="flex flex-col gap-2">
         <h1 className="text-2xl font-semibold tracking-tight">Projects</h1>
         <p className="text-sm text-neutral-500">
-          Read-only view of the engine&apos;s data. Generation and builds run as
-          host commands; nothing here writes to the database.
+          This view is not signed in. Project data is tenant data, and the web
+          server no longer reads it without a credential.
         </p>
       </header>
 
-      {!isDashboardEnabled() && (
-        <p className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-          Control endpoints are disabled. They run build commands on this
-          machine and ship no authentication, so they are opt-in: start the dev
-          server with <code>{DASHBOARD_ENV_VAR}=local</code> to enable them.
+      <div className="flex flex-col gap-4 rounded-md border border-neutral-200 p-6 text-sm dark:border-neutral-800">
+        <p className="text-neutral-600 dark:text-neutral-300">
+          Every project listing goes through the authenticated API. Ask it with
+          a Supabase session token, or with an organization API key:
         </p>
-      )}
 
-      {!reachable ? (
+        <pre className="overflow-x-auto rounded bg-neutral-100 p-4 font-mono text-xs dark:bg-neutral-900">
+          {`curl -H "Authorization: Bearer <token-or-sf_org_key>" \\
+  http://localhost:3000/api/dashboard/projects`}
+        </pre>
+
+        <p className="text-neutral-500">
+          Mint a key with{" "}
+          <code>
+            corepack pnpm staticforge api-keys create --org-id &lt;id&gt; --name
+            &quot;local&quot;
+          </code>
+          .
+        </p>
+      </div>
+
+      {!reachable && (
         <p className="rounded-md border border-neutral-200 p-6 text-sm text-neutral-500 dark:border-neutral-800">
           No database reachable. Set <code>DATABASE_URL</code> to browse cloud
           projects — the engine also runs entirely from <code>data/input</code>,
           which needs no database at all.
         </p>
-      ) : projects.length === 0 ? (
-        <p className="rounded-md border border-neutral-200 p-6 text-sm text-neutral-500 dark:border-neutral-800">
-          No projects yet. Seed one with{" "}
-          <code>corepack pnpm --filter @staticforge/database db:seed</code>.
-        </p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[52rem] text-left text-sm">
-            <thead className="border-b border-neutral-200 text-xs uppercase tracking-wide text-neutral-500 dark:border-neutral-800">
-              <tr>
-                <th className="py-2 pr-4 font-medium">Project</th>
-                <th className="py-2 pr-4 font-medium">Workspace</th>
-                <th className="py-2 pr-4 font-medium">Business</th>
-                <th className="py-2 pr-4 font-medium">Template</th>
-                <th className="py-2 pr-4 font-medium">Profile</th>
-                <th className="py-2 pr-4 text-right font-medium">Services</th>
-                <th className="py-2 pr-4 text-right font-medium">Cities</th>
-                <th className="py-2 text-right font-medium">Pages</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-neutral-100 dark:divide-neutral-900">
-              {projects.map((project) => (
-                <tr key={project.id}>
-                  <td className="py-3 pr-4">
-                    <Link
-                      href={`/dashboard/projects/${project.id}`}
-                      className="font-medium underline underline-offset-4"
-                    >
-                      {project.name}
-                    </Link>
-                    <span className="block text-xs text-neutral-500">
-                      {project.id}
-                    </span>
-                  </td>
-                  <td className="py-3 pr-4 text-neutral-500">
-                    {project.workspaceName}
-                  </td>
-                  <td className="py-3 pr-4 text-neutral-500">
-                    {project.businessName ?? "—"}
-                  </td>
-                  <td className="py-3 pr-4 font-mono text-xs">
-                    {project.templateId}
-                  </td>
-                  <td className="py-3 pr-4 font-mono text-xs">
-                    {project.contentProfileId}
-                  </td>
-                  <td className="py-3 pr-4 text-right tabular-nums">
-                    {project.serviceCount}
-                  </td>
-                  <td className="py-3 pr-4 text-right tabular-nums">
-                    {project.locationCount}
-                  </td>
-                  <td className="py-3 text-right tabular-nums">
-                    {project.pageCount}
-                    {project.pageCount !== project.expectedPages && (
-                      // The grid says how many pages *should* exist; a mismatch
-                      // means the project has not been generated since it
-                      // changed.
-                      <span className="text-neutral-500">
-                        {" "}
-                        / {project.expectedPages}
-                      </span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
       )}
     </div>
   );
