@@ -85,13 +85,36 @@ boundaries fall where the problem changed.
   │                                                                       │
   │   26 metering + quotas          27 human identity                     │
   │        checked before                User table · FK · session guard  │
-  │        metered after                 ⚠ guard not yet wired to a route │
+  │        metered after                                                  │
+  └───────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  ERA IV · THE CLOSED SYSTEM                              phases 28-31 │
+  │  "prove who is calling, then survive somebody trying to break it"     │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │                                                                       │
+  │   28 one route authenticated ──▶ 29 every route, by one helper        │
+  │      sf_org_ prefix ÷ JWT          LOCAL_OPERATOR_ID gone from web    │
+  │                                              │                        │
+  │                                              ▼                        │
+  │   30 browser sessions ──────────▶ the same door, two credentials      │
+  │      HttpOnly cookies · SSR        header wins over cookie, always    │
+  │                                                                       │
+  │   ─────────────────────── red team audit ───────────────────────      │
+  │                                                                       │
+  │   31 the checks moved INSIDE the data layer                           │
+  │        ▸ RBAC in the functions, not only in front of them             │
+  │        ▸ quotas HOLD what they admit   40/40 ▶ 10/40 under load       │
+  │        ▸ billing outlives its tenant   no cascade from Organization   │
+  │        ▸ the worker survives a promise nobody awaited                 │
+  │        ▸ login is metered, on a key no header can forge               │
   └───────────────────────────────────────────────────────────────────────┘
 
   NOT BUILT — the honest half of this map
   ────────────────────────────────────────────────────────────────────────
-  ✗ authentication as a working gate   nothing calls verifyUserSession;
-                                       userId is asserted, not proved
+  ✗ the /login page                    middleware redirects to a 404
+  ✗ Supabase credentials               nobody has ever actually signed in
   ✗ row-level security                 isolation is application-level only
   ✗ deployment / CI                    verify is run by hand; worker unhosted
   ✗ invoicing                          usage is metered, never priced
@@ -701,11 +724,15 @@ lower bound — work already queued has not been metered yet, and a meter write
 lost to an unreachable database is never metered at all. A tenant can exceed its
 limit by roughly the volume of work in flight when it crossed the line.
 
-The gate is also **not atomic**: two callers arriving together both read the
-same total and both pass. That was refused in Phase 24 and is accepted here, and
-the difference is what is being protected. The rate limiter guards someone
-else's hard ceiling, where overshooting produces 429s mid-run; a quota guards a
-commercial agreement, where overshooting produces a conversation.
+The gate was also **not atomic**, and that was accepted here after being refused
+in Phase 24 — the rate limiter guards someone else's hard ceiling, where
+overshooting produces 429s mid-run, while a quota guards a commercial agreement,
+where overshooting produces a conversation.
+
+> **Superseded by Phase 31.** The audit measured it rather than reasoning about
+> it: 40 concurrent callers against a limit of 10 all passed. "A conversation"
+> was the right frame for two callers and the wrong one for forty. The gate now
+> holds what it admits — see [Phase 31](#31--red-team-remediation).
 
 **Ordering inside each gate is load-bearing.** Permission is checked before
 quota, so a caller who may not touch a project learns that rather than learning
@@ -741,10 +768,130 @@ The meter charges only for work that happened: a failed job meters nothing, a
 run that authored no pages meters nothing, and a run with no tenant meters
 nothing rather than putting the charge on somebody else's invoice.
 
+> **Changed in Phase 31.** The first two now report *zero against the hold taken
+> at admission*, which is a refund rather than a silence. Once the gate reserves
+> what it admits, staying quiet leaves the estimate charged — so the refusal has
+> to be stated to be honoured.
+
 > **Not automated: advancing `resetDate` when a period rolls.** A quota counts
 > from whenever it was last set, so a monthly plan needs its reset date moved by
 > hand or by a scheduled job that does not exist yet. Until then a quota is a
 > lifetime allowance rather than a recurring one — see the gaps list.
+
+---
+
+### 27–29 — Identity, and closing every route
+
+Phase 23 decided *what* a caller may do and left *who they are* asserted rather
+than proved. These three closed that.
+
+**27 — human identity.** A `User` table, a real foreign key from
+`OrganizationMember`, and `verifyUserSession` validating a Supabase token. The
+migration created user rows before adding the constraint, because a foreign key
+added first would have rejected every existing membership.
+
+**28 — one authenticated route.** `GET /api/dashboard/projects` routes an
+`sf_org_` prefix to `verifyApiKey` and anything else to the JWT path, then
+returns projects through `OrganizationMember`.
+
+**29 — every route, by one helper.** Repeating an auth check by hand is how the
+fifth route ends up missing one nobody notices, so it became `requireApiAuth`.
+The guards **return a discriminated union rather than throwing**: a route that
+forgets a thrown guard still compiles and answers `500` instead of `401` — safe
+by luck. Reading `auth.principal` without narrowing on `auth.ok` is a compile
+error.
+
+`LOCAL_OPERATOR_ID` was removed from `apps/web` entirely, and a route-coverage
+test fails the build if a new route skips the guard. The two dashboard pages
+stopped reading tenant data rather than keep an unauthenticated read that was
+merely convenient.
+
+### 30 — Browser sessions and the hybrid door
+
+`@supabase/ssr` keeps tokens in `HttpOnly` cookies, a login route exchanges
+credentials for them, middleware refreshes them, and the existing guard accepts
+either a header or a cookie. **No API route changed** — that was the requirement.
+
+**The header always wins, and the ordering is the security property.** A browser
+attaches its cookie to every request to this origin, including ones an
+integration makes through it, so checking the cookie first would answer a machine
+caller as whoever happened to be logged in on that machine. A bad header is not
+rescued by a good cookie either: falling back would mean a revoked key silently
+keeps working for anyone signed in.
+
+`getUser()` everywhere, never `getSession()` — the latter decodes the cookie the
+client sent and verifies nothing, so a page guard built on it is one an attacker
+writes their own cookie for.
+
+The middleware deliberately does not run on `/api`: those routes answer `401`,
+and a page guard in front of them would turn an integration's clear refusal into
+a `302` toward an HTML form. It imports `@staticforge/core/auth-paths`, a
+subpath, because the root barrel reaches for `node:crypto` and the Edge runtime
+cannot load it.
+
+The `next=` parameter carries a path and never a URL. `//evil.com` and
+`/\evil.com` both look like paths and are both refused.
+
+> **Still missing: the `/login` page itself.** The middleware redirects to it and
+> it does not exist. Supabase is unconfigured, so nobody has actually signed in.
+
+### 31 — Red Team remediation
+
+An adversarial audit of phases 01–29, with no code written during it. Five
+findings; three of them the same shape — **the check existed, one layer too far
+out.**
+
+**RBAC moved into the data layer.** Phase 29 gated every route and left the
+functions open, so the guarantee was "every caller remembered". The acting
+identity is now a **required** parameter on every privileged `database`
+function, which turned each call site into a compile error — how they were all
+found. A key needs `member:manage` because a key *is* a member: an EDITOR who
+could mint an OWNER key would be an OWNER by a route no check would notice.
+
+**`setQuota` is guarded differently, and deliberately.** Gating it with
+`member:manage` would have been *worse than leaving it open* — OWNER holds that
+capability, and the OWNER is the person the quota bills. It would have let a
+customer raise their own spending cap while reading as a security improvement.
+`requirePlatformOperator` asks a question no tenant role can answer.
+
+**Billing outlives its tenant.** `UsageRecord` cascaded from `Organization`, so
+deleting an account erased the last month nobody had invoiced yet. The relation
+is gone.
+
+**Quotas hold what they admit.** Usage is metered retrospectively, so
+`SELECT ... FOR UPDATE` alone does not close the race: ten serialised callers
+still read a total nothing has written to, and all ten still pass. The gate now
+writes its estimate at admission, in the same transaction as the job row, and
+the meter settles `actual - held` — so a failed run reports zero, which *is* the
+refund.
+
+| Gate | Admitted, 40 concurrent, limit 10 |
+| --- | --- |
+| Phase 26 read-only check | **40 of 40** |
+| Phase 31 reserving gate | **10 of 40** |
+
+**The worker survives a promise nobody awaited.** Node exits on an unhandled
+rejection and the bus deliberately abandons listeners that overrun, so one bad
+webhook took down a worker mid-build — then the worker that reclaimed the job.
+Twenty rejections in a minute still exits, loudly: the point is to turn a
+process-ending accident into a process-ending decision.
+
+**Login is rate limited on two keys**, the caller's address and a global one.
+Not on the email, which would let anyone lock a named user out of their own
+account. The global key is the half that holds, because `X-Forwarded-For` is
+forgeable; the address is read from the **rightmost** entry rather than the
+leftmost.
+
+**The `NaN` spin is closed.** `Math.max(1000, NaN)` is `NaN` and
+`setTimeout(fn, NaN)` fires immediately — and `waited += NaN` disabled the
+budget check permanently, for the rest of the call. The loop is now bounded by
+counting as well as by arithmetic, because a guard against bad numbers that is
+itself made of numbers protects nothing the next bug of the same shape cannot
+switch off again.
+
+Seven mutations, all caught. One survived on the first attempt and the **test**
+was at fault rather than the code — it passed an id that could not have matched
+anyway, so the guard was never exercised.
 
 ---
 

@@ -41,12 +41,19 @@ boundary, the persistence layer, the job queue, the data-sync boundary, the
 headless editing API, the incremental publishing path and the distributed rate
 limiter are built, tested, and exercised against the real database. A change now re-authors only the pages it
 actually reached, and a drained queue triggers the static host's build.
-**What remains is the commercial surface: a browser session, deployment, and
+**What remains is the commercial surface: a sign-in page, deployment, and
 billing.** Authorization and tenant scoping are built as of Phase 23; a machine
 caller can prove which organization it is as of Phase 25; every web API route
-enforces both as of Phase 29. What is missing is the last link for people —
-nothing turns a login into a bearer token, so the dashboard UI is a shell and
-the API is what is ready.
+enforces both as of Phase 29; and as of Phase 30 a person can hold a session in
+an `HttpOnly` cookie that the same guard accepts, header first. Phase 31 was a
+remediation of an adversarial audit rather than a feature — the role checks
+moved out of the routes and *into* the data layer, the quota gate became atomic
+by holding what it admits, the billing ledger stopped cascading away with its
+tenant, and the worker stopped dying on a promise nobody awaited.
+
+What is missing is the `/login` page itself and the Supabase credentials behind
+it: the route works, the form does not exist, and nobody has actually signed
+in.
 
 ---
 
@@ -769,8 +776,11 @@ already queued has not been metered yet, and a meter write lost to an
 unreachable database is never metered at all, so a tenant can exceed its limit
 by roughly the volume of work in flight when it crossed the line.
 
-The gate is also not atomic: two callers arriving together both read the same
-total and both pass, exactly as a read-then-write token bucket would. That was
+The gate was also not atomic: two callers arriving together both read the same
+total and both pass, exactly as a read-then-write token bucket would.
+**Phase 31 closed this** — see 3.21. The reasoning that follows is kept because
+the *asymmetry* it describes is still true, and is what made the fix
+non-obvious: a lock alone does not help a total that nothing has written to. That was
 refused in Phase 24 and is accepted here, and the difference is what is being
 protected. The rate limiter guards someone else's hard ceiling, where
 overshooting produces 429s in the middle of a paid run, so it is a single atomic
@@ -806,7 +816,11 @@ recomputed from the records when it is doubted.
 
 The meter charges only for work that happened: a failed job meters nothing, a
 run that authored no pages meters nothing, and a run with no tenant meters
-nothing rather than putting the charge on somebody else's invoice. Like the
+nothing rather than putting the charge on somebody else's invoice.
+
+**Changed in Phase 31:** the first two now report zero *against the hold taken at
+admission*, which is a refund rather than a silence. Once the gate reserves what
+it admits, staying quiet would leave the estimate charged. Like the
 audit logger it cannot promise delivery, and it points the safe way for the same
 reason — an unmetered operation under-bills, while a meter able to fail a run
 could abort an hour-long build.
@@ -950,14 +964,248 @@ rule once and `repository.ts` and `tenant.ts` use it, with one deliberate
 exception documented in its own test: a `GenerationJob` carries its own
 denormalised `userId` and is scoped on that column directly.
 
-### 3.20 SEO publishing and internal linking *(Phases 05–06)*
+### 3.20 Browser sessions and the hybrid door *(Phase 30)*
+
+Phase 29 closed the API and left people with no way to hold a credential. This
+is the other half: `@supabase/ssr` keeps the tokens in `HttpOnly` cookies, a
+login route exchanges an email and password for them, middleware refreshes them
+on every request, and the existing guard accepts either a header or a cookie.
+
+**No API route changed.** That was the requirement, and it is what the shape
+buys: `authenticateRequest` gained an optional cookie resolver, so the CLI keeps
+sending a bearer key, a dashboard sends a cookie, and both arrive at the same
+principal through the same door.
+
+**The header always wins, and the ordering is the security property.** A browser
+attaches its cookie to every request to this origin — including ones an
+integration makes through it — so checking the cookie first would answer a
+machine caller as whoever happened to be logged in on that machine. A bad header
+is not rescued by a good cookie either: the caller chose a credential and it was
+refused, and falling back would mean a revoked key silently keeps working for
+anyone signed in.
+
+That ordering lives in `@staticforge/database`, not in the route. Reading
+cookies needs Next's request-scoped store, so the *mechanics* have to live in
+the app — but the part that can be got wrong is the sequence, and that belongs
+where it can be tested.
+
+**`getUser()` everywhere, never `getSession()`.** The latter decodes the cookie
+the client sent and verifies nothing, so on a server it answers with whatever
+the client wrote. Only `getUser()` revalidates against the auth server. A page
+guard built on a decode is a page guard an attacker writes their own cookie for.
+
+**The middleware threads its response object through** rather than building a
+fresh one at the end. `createServerClient` writes rotated cookies through
+`setAll`, and those writes have to land on the response actually returned — the
+obvious tidy-up drops them, and the symptom is users being logged out at random
+intervals with nothing in any log.
+
+It deliberately does not run on `/api`. Those routes authenticate themselves and
+answer `401`; a page guard in front of them would turn an integration's clear
+refusal into a `302` toward an HTML form, which is the least actionable thing a
+machine client can receive.
+
+The `next=` parameter carries a path and never a URL. A redirect target a caller
+controls is an open redirect, and "sign in here, then we will send you on" is a
+phishing flow indistinguishable from a working one. `//evil.com` and
+`/\evil.com` both look like paths and are both refused.
+
+**The middleware imports `@staticforge/core/auth-paths`, a subpath, not the
+package root.** Middleware runs on the Edge runtime and the root barrel
+re-exports modules reaching for `node:crypto` — the API-key hashing among them —
+which the Edge runtime cannot load. The build failed on exactly that.
+
+The login route returns no token. The SSR client's adapter writes `HttpOnly`
+cookies, so a cross-site script cannot read the session; returning the access
+token in JSON, the obvious shape for an API, would hand that protection back for
+one client's convenience. A wrong password and an unknown address get the same
+`401`, because two answers make this a way to enumerate a customer's users.
+
+> **Still missing: the `/login` page itself.** The middleware redirects to it and
+> it does not exist, so the redirect lands on a 404. And `SUPABASE_URL` /
+> `SUPABASE_ANON_KEY` are unconfigured, so every session path has been exercised
+> against injected doubles and against its failure path only.
+
+---
+
+### 3.21 Red Team remediation *(Phase 31)*
+
+An adversarial audit of phases 01–29 — concurrency, authorization, worker
+stability, data integrity — with no code written during it. Five findings.
+Three of them turned out to be the same shape: **the check existed, one layer
+too far out.**
+
+#### RBAC moved into the data layer
+
+Phase 29 gated every route and left the functions behind them open, so the
+guarantee was "every caller remembered". That holds until somebody adds route
+twelve, a CLI command, a background job or a script — and the evidence that they
+forgot is a customer's VIEWER holding an OWNER credential.
+
+`generateApiKey`, `revokeApiKey`, `listApiKeys`, `listAuditEvents` and
+`saveRefreshedPage` now check on their first line. The acting identity is a
+**required** parameter, not an optional one: an optional identity is one a
+caller omits, and the caller that omits it is the route somebody adds in a
+hurry. Making it required turned every call site into a compile error, which is
+how all of them were found.
+
+A key needs `member:manage` because a key **is** a member — Phase 25 made it one
+deliberately. So minting one is adding a member, and an EDITOR who could mint an
+OWNER key would be an OWNER by a two-step route no permission check anywhere
+would notice.
+
+**`setQuota` is guarded differently, and this is the important part.** Gating it
+with `member:manage` — the strictest thing a tenant role can be asked for —
+would have been *worse than leaving it open*. OWNER holds that capability, every
+organization has an OWNER, and the OWNER is the person the quota bills. The gate
+would have let a customer raise their own spending cap while reading as a
+security improvement.
+
+So there is a boundary above every tenant. `requirePlatformOperator` asks a
+question no tenant role can answer, and API-key principals are excluded
+explicitly: a key that satisfied it would be a tenant credential holding
+platform authority, issued by the very function the boundary guards.
+
+#### The billing ledger stopped cascading
+
+`UsageRecord` had `onDelete: Cascade` on `Organization`, so deleting an account
+erased every record of what it had consumed — and the last month of an account
+that churns is exactly the month nobody has invoiced yet. A `DELETE` on one
+table quietly emptied the ledger of another.
+
+`organizationId` is now a plain `String`, the shape `AuditLog` already used and
+for the same reason: **a financial record must outlive its subject.** Nothing
+enforces the id still resolves, which is correct — an invoice for a closed
+account has to remain explicable after the account is gone.
+
+#### Quotas are held, not merely checked
+
+The Phase 26 gate was a TOCTOU, and the fix is not the obvious one.
+
+Usage is metered *retrospectively*, so between a check passing and the work
+finishing there was nothing for any other caller to see. `SELECT ... FOR UPDATE`
+**alone does not fix that**: ten serialised callers still read a total nothing
+has written to, and all ten still pass. Serialising the checks changes the order
+they happen in, not their answer.
+
+So the gate now *holds* what it admits. `reserveQuota` locks the quota row,
+sums usage in a **separate statement** — so READ COMMITTED gives it a fresh
+snapshot including the hold the caller ahead just committed — and writes a
+`UsageRecord` for its estimate. Folding the sum into the locking query as a CTE
+would look tidier and fix nothing, which is why a test asserts the two
+statements and their order.
+
+`enqueueJob` does this inside the same transaction as the job row: a hold
+without its job charges for a run that does not exist, a job without its hold is
+the original race, so neither commits alone. The amount lands on
+`GenerationJob.reservedUnits`, because the halves happen in different processes
+— the API admits, a worker completes — and the row is the only place the number
+can wait.
+
+The meter therefore reports the truth and the writer stores **`actual - held`**.
+`billing-meter` no longer returns early on a failed or empty run: it reports
+zero, which *is* the refund. Returning early would leave the estimate charged —
+the exact over-billing that plugin exists to avoid.
+
+Verified against live Postgres, 40 concurrent transactions on separate
+connections against a limit of 10:
+
+| Gate | Admitted |
+| --- | --- |
+| Phase 26 read-only check | **40 of 40** |
+| Phase 31 reserving gate | **10 of 40** |
+
+#### The worker survives a promise nobody awaited
+
+Node exits on an unhandled rejection, and the plugin bus deliberately abandons
+listeners that overrun its deadline. So one misconfigured deploy webhook took
+down a worker half way through a paid build — then took down the worker that
+reclaimed the job, because they run the same plugin. A fleet-wide outage from a
+bad URL, with nothing in any log explaining it.
+
+Surviving is right *here* and not in general: nothing awaits a detached promise,
+so nothing downstream depends on it, and every promise the job loop depends on
+is awaited. But absorbing without limit turns a crash into an invisible
+haemorrhage, so twenty in a minute exits — loudly, and saying the job is
+resumable. The point is to convert a process-ending accident into a
+process-ending **decision**. `uncaughtException` is deliberately not caught: the
+state after one is genuinely unknown.
+
+#### Login is rate limited, on two keys
+
+Not on the email — that would let anyone lock a named user out of their own
+account by failing on their behalf, a denial of service handed out to whoever
+asked for it.
+
+On the caller's address **and** a global key. The global one is the half that
+holds: `X-Forwarded-For` is forgeable, so a per-address limiter alone is evaded
+by rotating the header, and a limiter keyed on a value the caller chooses binds
+the honest users and nobody else. The address is read from the **rightmost**
+entry — the one appended by the hop nearest this server — rather than the
+leftmost that every tutorial reaches for.
+
+The global bucket is checked first, so a flood cannot spend through other
+people's buckets on the way past. It fails **open** on a database error: a blip
+would otherwise lock every customer out of their own dashboard, which is a worse
+and much more likely outcome than an unmetered minute of guessing.
+
+#### The NaN spin, and a bound that arithmetic cannot break
+
+`Math.max(1000, NaN)` is `NaN`, and `setTimeout(fn, NaN)` fires immediately — so
+`awaitTokens` stopped waiting and hammered the limiter's database as fast as the
+event loop allowed.
+
+The second half made it an outage. `waited += NaN` makes `waited` permanently
+`NaN`, and `NaN > budgetMs` is `false` — so the budget check, the only guard
+between this and a process alive, holding a lease, and never finishing, was
+silently switched off for the rest of the call. Including for later grants that
+came back perfectly valid.
+
+Durations are validated at both entrances, differently on purpose. A bad
+**option** falls back to the documented default, because a caller who passed
+`millis(undefined)` gave no usable budget. A bad **grant** throws
+`RateLimitContractError`, because there is no honest substitute for "how long
+until there is capacity" — and because a `RateLimitTimeoutError` here would say
+"the bucket stayed full for two minutes" and send an operator to look at
+capacity settings for a fault nowhere near them.
+
+**The loop is now also bounded by counting.** Validating the input fixes the bug
+that exists; it does not fix the shape of it. The budget check is *arithmetic*,
+and arithmetic is precisely what a non-finite number breaks — so a guard against
+bad numbers that is itself made of numbers protects nothing the next bug of the
+same shape cannot switch off again. `attempt` is compared against
+`Math.ceil(budgetMs / MIN_PAUSE_MS) + 1`: an integer against an integer, which
+no arithmetic can poison, and exactly the largest number of passes a healthy run
+can make.
+
+The mutation argued for it. Weakening the validator to accept `NaN` did not fail
+the suite — it **hung** it, exactly as the bug hangs a worker. With the counting
+bound in place the same mutation fails eight tests in seconds.
+
+#### How the fixes were checked
+
+Seven mutations, all caught, all reverted: removing the hold write fails eight
+tests; dropping `FOR UPDATE` fails one; removing the key role check fails four;
+letting an `apikey:` principal be the platform operator fails one; restoring the
+meter's silent-on-failure branch fails two; removing the crash guard's budget
+fails two; weakening the duration validator fails eight.
+
+One survived on the first attempt — the `apikey:` exclusion — and the **test**
+was the problem rather than the code: it passed an id that could not have
+matched anyway, so the guard was never exercised. It was replaced with the case
+that does exercise it: an operator configuring a machine credential as the
+platform operator, refused even though the id matches exactly.
+
+---
+
+### 3.22 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.21 Zero-JavaScript presentation layer
+### 3.23 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -976,18 +1224,25 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.22 Test coverage
+### 3.24 Test coverage
 
-**1191 tests across 62 files in six packages**, all under Vitest, all passing.
+**1286 tests across 64 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
-| `ai` | 243 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop |
-| `core` | 345 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, the session guard, the server-env contract, the route-coverage sweep, tenant paths, job budget |
-| `database` | 344 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle, the quota gate, the unified auth door and the two gates a locked-down write route runs — entirely against a mocked Prisma client |
+| `ai` | 255 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop and its refusal of any wait that is not a duration |
+| `core` | 379 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, the session guard, the server-env contract, the route-coverage sweep, tenant paths, job budget, the settlement of quota holds, and the forgery-resistant client address |
+| `database` | 384 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle, the quota gate, the unified auth door, the two gates a locked-down write route runs, the atomic reservation gate under a simulated running total, and the data-layer role checks — entirely against a mocked Prisma client |
 | `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
-| `cli` | 50 | Pipeline stages, the standalone worker, and queue-drain detection |
+| `cli` | 59 | Pipeline stages, the standalone worker, queue-drain detection, and the crash guard that keeps a worker alive through a detached rejection |
+
+**Mocks cannot prove a concurrency property**, and the quota gate's guarantee is
+Postgres's rather than TypeScript's. So it was also checked against the live
+database, with a control run: 40 concurrent transactions on separate
+connections against a limit of 10 admitted 40 under the old read-only check and
+10 under the reserving gate. Both probe tenants were deleted afterwards and the
+database confirmed clean.
 
 The database suite never opens a connection — one test asserts that explicitly,
 so the guarantee cannot rot silently. AI suites run against injected stubs, so
@@ -1001,7 +1256,8 @@ the tests fail rather than pass quietly, which a fixed-list stub would not.
 Two properties are worth noting for anyone assessing risk. First, tests were
 repeatedly validated by *mutation* — deliberately breaking the code under test
 to confirm the relevant tests fail, then reverting. A test that has never failed
-has not been shown to work. Second, the generator assertions deliberately use
+has not been shown to work, and Phase 31 found one that had not: a mutation
+survived, and the test rather than the code turned out to be at fault. Second, the generator assertions deliberately use
 Node's strict assertion library rather than the framework's, because loose
 equality would have weakened 60 existing comparisons during the runner
 migration.
@@ -1106,19 +1362,26 @@ than forking into two implementations that drift.
 
 Ordered by dependency.
 
-**1. Authentication.** Phase 23 built the half of this that decides *what* a
-caller may do: organizations, membership, roles, and a gate every write passes
-through. It did not build the half that decides *who* the caller is. There is no
-user table, no session and no login, so `userId` is supplied by the caller
-rather than proved — **anyone able to set it is any user, including an OWNER.**
-That is now the largest open risk in the project, and it is a smaller one than
-it was: the authorisation model the sessions will plug into already exists and
-is enforced.
+**1. The `/login` page, and the credentials behind it.** Authentication is
+otherwise finished as a mechanism: Phase 23 decides *what* a caller may do,
+Phase 25 gives a machine a credential it can prove, Phase 27 adds real user
+rows, Phase 29 enforces both on every API route, Phase 30 puts a person's
+session in an `HttpOnly` cookie the same guard accepts, and Phase 31 moved the
+role checks *inside* the data layer so a route that forgets is no longer the
+only thing standing in the way.
 
-Row-level security is the second half of the same item. Every isolation
+What is left is small and total: **there is no `/login` page.** The middleware
+redirects to it and it does not exist, so the redirect lands on a 404. And
+`SUPABASE_URL` / `SUPABASE_ANON_KEY` are unconfigured, so nobody has ever
+actually signed in — every session path is exercised against injected doubles
+and against its failure path only.
+
+**Row-level security is the remaining half of the same item.** Every isolation
 guarantee today is an application-level `where` clause, so a query written
 without one is a query without a boundary. RLS would make the database refuse
-what the application forgot to.
+what the application forgot to. Phase 31 narrowed the exposure — permission is
+now checked inside the functions rather than only in front of them — but that
+is defence in the application, not in the database.
 
 **2. Prove the AI path against a live model.** `ANTHROPIC_API_KEY` is not
 configured in this environment. Every AI suite runs against injected doubles, so
@@ -1143,40 +1406,54 @@ mean something.
 
 ### Known gaps, stated plainly
 
-- **No browser session.** Every API route authenticates (Phase 29), but nothing
-  turns a login into a bearer token, so the two dashboard pages render a shell
-  rather than data. The CLI still acts as `local-operator`, which is intended —
-  it runs on an operator's own machine.
+- **No `/login` page.** Browser sessions work (Phase 30) and the route behind
+  the form is built; the form is not. The middleware redirects to a 404. The
+  CLI still acts as `local-operator`, which is intended — it runs on an
+  operator's own machine.
 - **The session branch is unproven against a real provider.** `SUPABASE_URL` and
   `SUPABASE_ANON_KEY` are not configured here; the live verification exercised
   the API-key branch only, and the JWT branch is covered by injected doubles.
 - **No row-level security.** Tenant isolation is application-level `where`
   clauses only; the database would not refuse a query that forgot one.
-- **The gate is only as complete as its call sites.** `syncProject` and
-  `enqueueJob` are gated. The dashboard read routes and the block-patch route
-  are not yet, and `saveGeneratedPages` is deliberately ungated because the
-  worker calls it to complete a job that was already authorised at enqueue time.
+- ~~**The gate is only as complete as its call sites.**~~ **Closed in Phase 31.**
+  The role check moved inside the `database` functions, with the acting identity
+  as a required parameter, so a caller that forgets is a compile error rather
+  than an open door. `saveGeneratedPages` and `saveRefreshedPage` are gated too:
+  reaching a page was never permission to rewrite it.
 - **The audit trail is best-effort**, written after the action by a listener the
   bus may abandon. Failures are loud, but a lost row is possible.
 - **The rate limiter has never held back a real provider call.** With no
   `ANTHROPIC_API_KEY` configured, the bucket and the wait loop are verified
   against Postgres and against injected doubles respectively, but the last inch
   — a held-back call reaching the provider late rather than not at all — is
-  unproven.
+  unproven. Its *wait loop* is no longer a hazard: Phase 31 closed the `NaN`
+  spin and bounded the loop by counting as well as by arithmetic.
 - **No `ANTHROPIC_API_KEY` configured**; the AI path is covered only by injected
   doubles and has no live integration test.
 - **`packages/templates` is an empty placeholder**; templates remain route-local.
 - **Per-business eligibility is not exposed through the database read path** —
   the DB path treats every service and location on a project as eligible.
 - **No CI pipeline and no deployment**; `verify` is run by hand, and the worker
-  has no host.
+  has no host — which now also means the crash guard added in Phase 31 has never
+  run anywhere but a test.
 - **Nothing turns usage into an invoice.** Phase 26 meters consumption and
   enforces quotas; no code prices a `UsageRecord` or charges anyone.
 - **`resetDate` is never advanced automatically.** A quota counts from whenever
   it was last set, so a monthly plan is a lifetime allowance until an operator
   or a scheduled job moves the date. There is no such job.
-- **The quota gate is not atomic**, deliberately — see 3.17. Concurrent callers
-  can each pass, so a limit is a soft bound rather than a hard one.
+- **`setQuota` has no caller.** It is guarded by `requirePlatformOperator`
+  (Phase 31) and reachable only from a script — there is no CLI command and no
+  platform-admin surface, so setting a customer's ceiling means writing code.
+- **The platform boundary is one identity, not a role.** `requirePlatformOperator`
+  cannot express two administrators, an audit of who changed a limit, or a
+  support engineer with read-only access to billing. It is honest for a system
+  with one operator and it is the one place a real platform-admin role would
+  replace.
+- ~~**The quota gate is not atomic.**~~ **Closed in Phase 31.** The gate now
+  holds what it admits, so a concurrent caller's sum sees the admission. Proven
+  live: 40 concurrent transactions against a limit of 10 admitted 40 before and
+  10 after. A residual softness remains and is smaller and named — an unsettled
+  hold stays charged, which counts *against* the tenant rather than for them.
 - Businesses and content templates cannot be imported from CSV, only services
   and locations.
 - `refresh-page` does not yet pass the realigned `schemaOrg` through
