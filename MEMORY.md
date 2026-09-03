@@ -1,38 +1,46 @@
 # Project Memory — outstanding technical debt
 
-**Last updated:** 2026-08-28, after phases 01–29 were merged into `main`.
+**Last updated:** 2026-08-31, after phases 01–30 were merged into `main`.
 
 This file is the short, blunt record of what is *not* built. It exists because
 the architecture briefing describes the engine at its best and this does not.
 Read both. For the full state, see [STATICFORGE_CONTEXT.md](STATICFORGE_CONTEXT.md).
 
-Where the project stands: phases 01–29 merged and pushed, 1191 tests across 62
+Where the project stands: phases 01–30 merged and pushed, 1214 tests across 64
 files passing, running against a live Supabase PostgreSQL instance, with a
 standalone queue worker, a data-sync boundary, headless block editing,
 database-backed templates and profiles, a plugin runtime, a read-only AI gap
 analyst, incremental publishing, a distributed rate limiter, RBAC organizations
 with an audit trail, hashed API keys, metered quotas, and every `apps/web` API
-route behind an authentication guard.
+route behind an authentication guard that accepts a bearer credential or a
+browser cookie.
 
 ---
 
-## 1. No browser session — the dashboard UI is a shell
+## 1. No sign-in *page*, and no Supabase project configured
 
-**Closed as of Phase 29: the API is not the gap any more.** Every route in
-`apps/web` authenticates — a Supabase session JWT or an `sf_org_…` API key,
-through one guard, with RBAC on the writes and a coverage test that fails the
-build if a new route skips it. `LOCAL_OPERATOR_ID` no longer appears in any web
-code path.
+**Browser sessions are built as of Phase 30.** `@supabase/ssr` keeps the tokens
+in `HttpOnly` cookies, `POST /api/auth/login` exchanges an email and password
+for them, middleware refreshes the session on every request and redirects
+`/dashboard/*` to `/login`, and `requireApiAuth` accepts a bearer credential or
+a cookie — header first, so an integration running inside a logged-in browser
+still acts as the key it presented.
 
-What is missing is the last link for people: **nothing turns a login into a
-bearer token.** There is no cookie, no sign-in flow, and no client that holds a
-session — so the two dashboard pages render a shell pointing at the API rather
-than reading tenant data, and the control buttons that queued paid runs were
-removed with them.
+Two things remain before a person can actually sign in:
 
-A server component receives no `Authorization` header, which is why those pages
-could not simply be gated: they had nothing to be gated *on*. The API is ready
-for a session; the browser half is not built.
+- **There is no `/login` page.** The middleware redirects to it and it does not
+  exist, so the redirect lands on a 404. The API route behind it works; the form
+  does not exist.
+- **`SUPABASE_URL` and `SUPABASE_ANON_KEY` are not configured.** `.env` holds
+  only `DATABASE_URL`, so every session path — login, cookie verification,
+  middleware — has been exercised against injected doubles and against the
+  *failure* path only. See `apps/web/.env.example`.
+
+Also missing: **`/api/auth/login` has no rate limiting.** Phase 24's token
+bucket is keyed on an organization, which this endpoint does not know because
+knowing it is what signing in establishes; keying on the email would let anyone
+lock a named user out. Supabase's own limits on the endpoint behind it are the
+whole protection today.
 
 The CLI still acts as `local-operator`. That is intended — it runs on an
 operator's own machine — and it is why the constant still exists at all.

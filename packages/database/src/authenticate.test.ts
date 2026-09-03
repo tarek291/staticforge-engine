@@ -376,3 +376,130 @@ describe("a missing identity provider is our problem, not the caller's", () => {
     expect(error.detail).toMatch(/no identity provider is configured/i);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 30: a browser cookie is the third way in
+// ---------------------------------------------------------------------------
+
+/**
+ * The hybrid door.
+ *
+ * The property that matters is the *ordering*. A browser attaches its cookie to
+ * every request to this origin, including the ones an integration makes through
+ * it — so checking the cookie first would answer a machine caller as whoever
+ * happened to be logged in on that machine. The header always wins, and these
+ * tests are mostly about proving it.
+ */
+describe("a browser session is accepted when no header arrives", () => {
+  /** A cookie store holding one signed-in person. */
+  function cookieUser(user: { id: string; email: string; name?: string | null }) {
+    const calls: number[] = [];
+
+    return {
+      calls,
+      resolve: () => {
+        calls.push(1);
+        return Promise.resolve({
+          id: user.id,
+          email: user.email,
+          name: user.name ?? null,
+        });
+      },
+    };
+  }
+
+  test("a cookie identifies the person", async () => {
+    const cookie = cookieUser({ id: "user-uuid", email: "alice@example.com", name: "Alice" });
+
+    const principal = await authenticateRequest(null, prisma, {
+      cookieUser: cookie.resolve,
+    });
+
+    // The same shape a bearer session produces, so no route had to change to
+    // gain this.
+    expect(principal).toEqual({
+      kind: "session",
+      userId: "user-uuid",
+      email: "alice@example.com",
+      label: "Alice",
+    });
+  });
+
+  test("the label falls back to the email", async () => {
+    const cookie = cookieUser({ id: "u1", email: "alice@example.com" });
+
+    const principal = await authenticateRequest(null, prisma, {
+      cookieUser: cookie.resolve,
+    });
+
+    expect(principal.label).toBe("alice@example.com");
+  });
+
+  test("no cookie and no header is still a refusal", async () => {
+    await expect(
+      authenticateRequest(null, prisma, { cookieUser: () => Promise.resolve(null) }),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+  });
+
+  test("with no cookie resolver at all, nothing changes", async () => {
+    // Every caller that predates this option keeps working unchanged.
+    await expect(authenticateRequest(null, prisma)).rejects.toBeInstanceOf(
+      UnauthorizedError,
+    );
+  });
+});
+
+describe("a header always beats a cookie", () => {
+  test("an API key wins over a signed-in browser", async () => {
+    armKey({ id: "key_1", name: "CI", organizationId: "org_1", revokedAt: null });
+    const cookie = { calls: 0 };
+
+    const principal = await authenticateRequest(`Bearer ${RAW_KEY}`, prisma, {
+      cookieUser: () => {
+        cookie.calls += 1;
+        return Promise.resolve({ id: "person", email: "p@example.com", name: null });
+      },
+    });
+
+    // The cookie is never even read. An integration running inside a logged-in
+    // browser must act as the key it presented, not as the person at the
+    // keyboard — and the cheapest way to guarantee that is not to look.
+    expect(principal.kind).toBe("api-key");
+    expect(cookie.calls).toBe(0);
+  });
+
+  test("a bearer session token wins too", async () => {
+    const { verifier } = acceptingSession({ id: "bearer-user", email: "b@example.com" });
+    let cookieRead = false;
+
+    const principal = await authenticateRequest(`Bearer ${JWT}`, prisma, {
+      sessionVerifier: () => verifier,
+      cookieUser: () => {
+        cookieRead = true;
+        return Promise.resolve({ id: "cookie-user", email: "c@example.com", name: null });
+      },
+    });
+
+    expect(principal.userId).toBe("bearer-user");
+    expect(cookieRead).toBe(false);
+  });
+
+  test("a bad header is not rescued by a good cookie", async () => {
+    armKey(null);
+    let cookieRead = false;
+
+    // The caller chose a credential and it was refused. Falling back to the
+    // cookie would mean a revoked key silently keeps working for anyone whose
+    // browser happens to be signed in.
+    await expect(
+      authenticateRequest(`Bearer ${RAW_KEY}`, prisma, {
+        cookieUser: () => {
+          cookieRead = true;
+          return Promise.resolve({ id: "u", email: "u@example.com", name: null });
+        },
+      }),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+
+    expect(cookieRead).toBe(false);
+  });
+});

@@ -7,7 +7,8 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./csv": "./src/csv-importer.ts"
+    "./csv": "./src/csv-importer.ts",
+    "./auth-paths": "./src/auth/protected-paths.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
