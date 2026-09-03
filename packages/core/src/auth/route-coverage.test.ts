@@ -118,6 +118,62 @@ describe("every API route authenticates", () => {
   });
 });
 
+describe("the one route without a credential has a limiter instead", () => {
+  /** The login route's source, comments stripped. */
+  function loginSource(): string {
+    return readFileSync(join(APP_DIR, "api/auth/login/route.ts"), "utf8")
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("*") && !line.trim().startsWith("//"))
+      .join("\n");
+  }
+
+  test("it spends from the token bucket", () => {
+    // The route is exempt from authentication because obtaining a credential is
+    // what it is for. Exempt from authentication and unmetered is an open
+    // password-guessing endpoint, so the exemption is paid for here.
+    expect(loginSource()).toContain("consumeApiTokens");
+  });
+
+  test("it is limited on the global key as well as the caller's", () => {
+    const source = loginSource();
+
+    // Both, and the global one is what actually holds. The per-address key is
+    // derived from a header, and a request that has not passed through a
+    // trusted proxy can carry any header it likes — so an attacker rotating
+    // that value would get a fresh bucket every time. The global key is derived
+    // from nothing, so no header changes it.
+    expect(source).toContain("LOGIN_GLOBAL_RATE_LIMIT_KEY");
+    expect(source).toContain("loginRateLimitKey");
+  });
+
+  test("it is not keyed on the email", () => {
+    // That would be a denial of service dressed as a protection: anyone could
+    // lock a named user out of their own account by failing on their behalf.
+    expect(loginSource()).not.toMatch(/rateLimitKey\([^)]*email/i);
+  });
+
+  test("the limit is spent before the credentials are checked", () => {
+    const source = loginSource();
+    const limited = source.indexOf("refuseIfTooFast");
+    const checked = source.indexOf("signInWithPassword");
+
+    // A limiter that ran after the check would charge for successes and let the
+    // guessing through free, which is the exact inverse of the point.
+    expect(limited).toBeGreaterThanOrEqual(0);
+    expect(checked).toBeGreaterThanOrEqual(0);
+    expect(limited).toBeLessThan(checked);
+  });
+
+  test("a refusal says nothing about the account", () => {
+    const source = loginSource();
+
+    // "Too many attempts" and nothing else. Naming which bucket filled would
+    // tell a caller whether anybody else is signing in from their address.
+    expect(source).toContain("Too many sign-in attempts");
+    expect(source).toMatch(/status: 429/);
+  });
+});
+
 describe("server-rendered pages do not read tenant data unauthenticated", () => {
   test("no dashboard page uses the local-operator constant", () => {
     const pages = ["dashboard/page.tsx", "dashboard/projects/[id]/page.tsx"];

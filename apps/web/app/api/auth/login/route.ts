@@ -1,4 +1,11 @@
 import { z } from "zod";
+import {
+  LOGIN_GLOBAL_RATE_LIMIT_KEY,
+  LOGIN_RATE_LIMIT,
+  clientAddress,
+  loginRateLimitKey,
+} from "@staticforge/core";
+import { consumeApiTokens, prisma } from "@staticforge/database";
 
 import { ServerEnvError } from "@/lib/env";
 import { createClient } from "@/utils/supabase/server";
@@ -27,14 +34,29 @@ import { createClient } from "@/utils/supabase/server";
  * a customer's users — and a list of real addresses is the first half of a
  * credential-stuffing run.
  *
- * ## What it does not have, stated plainly
+ * ## How it is rate limited
  *
- * Rate limiting. Phase 24 built a distributed token bucket, and it is keyed on
- * an organization — which this endpoint does not know, because knowing it is
- * what signing in establishes. Keying on the email instead would let anyone
- * lock a named user out by failing on their behalf, which is a denial of
- * service dressed as a protection. Supabase applies its own limits on the auth
- * endpoint behind this, and that is the whole of the protection today.
+ * Phase 24's token bucket, on two keys at once. Phase 30 left this endpoint
+ * open because the bucket was keyed on an organization, which signing in is
+ * what establishes; the answer is that this endpoint keys on something else.
+ *
+ * **Not on the email.** That would let anyone lock a named user out of their
+ * own account by failing on their behalf — a denial of service handed out to
+ * whoever asked for it.
+ *
+ * **On the caller's address**, which bounds one machine, **and on a global
+ * key**, which bounds everybody. Both, because the first is derived from a
+ * header and a request that has not passed through a trusted proxy can carry
+ * whatever header it likes: an attacker rotating that value gets a fresh bucket
+ * every time. The global bucket is keyed on nothing at all, so no header
+ * changes it, and it is what actually holds against a distributed run.
+ *
+ * The global one is checked first, so a flood cannot be used to fill up other
+ * people's per-address buckets on the way past.
+ *
+ * A refused attempt still costs a token. That is the point — a limiter that
+ * only charged for successes would meter the honest users and let the guessing
+ * through free.
  */
 export const dynamic = "force-dynamic";
 
@@ -48,6 +70,12 @@ const CredentialsSchema = z.object({
 });
 
 export async function POST(request: Request): Promise<Response> {
+  const refusal = await refuseIfTooFast(request);
+
+  if (refusal !== null) {
+    return refusal;
+  }
+
   const body: unknown = await request.json().catch(() => undefined);
   const parsed = CredentialsSchema.safeParse(body);
 
@@ -99,4 +127,66 @@ export async function POST(request: Request): Promise<Response> {
       email: data.user.email ?? null,
     },
   });
+}
+
+/**
+ * Spend an attempt from the global bucket and this caller's own.
+ *
+ * @returns A `429` to send back, or `null` when the attempt may proceed.
+ */
+async function refuseIfTooFast(request: Request): Promise<Response | null> {
+  const buckets: ReadonlyArray<{ key: string; burst: number; refill: number }> = [
+    // Global first. Checked before the per-address bucket so a flood cannot
+    // spend its way through other people's buckets on the way past — and so the
+    // one limit a forged header cannot dodge is the one that runs even when the
+    // address is nonsense.
+    {
+      key: LOGIN_GLOBAL_RATE_LIMIT_KEY,
+      burst: LOGIN_RATE_LIMIT.globalBurst,
+      refill: LOGIN_RATE_LIMIT.globalRefillPerSec,
+    },
+    {
+      key: loginRateLimitKey(clientAddress(request.headers)),
+      burst: LOGIN_RATE_LIMIT.perAddressBurst,
+      refill: LOGIN_RATE_LIMIT.perAddressRefillPerSec,
+    },
+  ];
+
+  for (const bucket of buckets) {
+    let grant;
+
+    try {
+      grant = await consumeApiTokens(bucket.key, 1, bucket.burst, bucket.refill, prisma);
+    } catch (error: unknown) {
+      // The limiter needs the database, and this endpoint is reachable without
+      // one. Failing *open* is the deliberate choice: a database blip would
+      // otherwise lock every customer out of their own dashboard, which is a
+      // worse and much more likely outcome than an unmetered minute of
+      // guessing. Loud, so it cannot be the silent state.
+      // eslint-disable-next-line no-console
+      console.error(
+        `[auth/login] rate limiter unavailable, allowing the attempt: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+
+      return null;
+    }
+
+    if (!grant.allowed) {
+      // No detail about which bucket, and none about the account. "Too many
+      // attempts" is the whole answer: saying *whose* limit was hit would tell
+      // a caller whether anyone else is signing in from their address.
+      return Response.json(
+        { error: "Too many sign-in attempts. Try again shortly." },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(Math.max(1, Math.ceil(grant.waitForMs / 1000))),
+          },
+        },
+      );
+    }
+  }
+
+  return null;
 }

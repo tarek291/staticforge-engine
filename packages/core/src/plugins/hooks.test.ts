@@ -24,6 +24,7 @@ const JOB_EVENT = {
   exitCode: 0,
   resumed: false,
   pageCount: 9,
+  reservedUnits: 1,
   durationMs: 1234,
   completedAt: "2026-08-27T12:00:00.000Z",
 } as const;
@@ -93,6 +94,7 @@ describe("a listener receives what it was told about", () => {
       locationsUpdated: 0,
       locationsRemoved: 0,
       scopedPages: 0,
+      reservedUnits: 1,
       organizationId: "org-1",
       syncedAt: "2026-08-27T12:00:00.000Z",
     })).resolves.toMatchObject({ delivered: 0, failures: [] });
@@ -397,6 +399,7 @@ describe("the audit logger plugin", () => {
       locationsUpdated: 0,
       locationsRemoved: 0,
       scopedPages: 0,
+      reservedUnits: 1,
       organizationId: "org-1",
       syncedAt: "2026-08-27T12:00:00.000Z",
     });

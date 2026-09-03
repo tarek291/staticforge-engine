@@ -2,6 +2,7 @@ import type { PrismaClient } from "@prisma/client";
 import { beforeEach, describe, expect, test } from "vitest";
 import { mockDeep, type DeepMockProxy } from "vitest-mock-extended";
 
+import { armQuotaGate, holdsWritten } from "./quota.fixtures.js";
 import {
   LOCAL_OPERATOR_ID,
   enqueueJob,
@@ -31,6 +32,13 @@ let prisma: DeepMockProxy<PrismaClient>;
 
 beforeEach(() => {
   prisma = mockDeep<PrismaClient>();
+  // The gate and the job row commit together now, so the wrapper has to run its
+  // callback against the same mock or nothing inside it is observable.
+  prisma.$transaction.mockImplementation(((run: (tx: typeof prisma) => Promise<unknown>) =>
+    run(prisma)) as unknown as typeof prisma.$transaction);
+  // No quota configured, which is what every test here assumed before the gate
+  // existed. Tests about quotas arm it themselves.
+  armQuotaGate(prisma, { limit: null });
 });
 
 const OTHER_USER = "someone-else";
@@ -591,6 +599,27 @@ describe("saveRefreshedPage", () => {
     content: { hero: { heading: "x" } },
   };
 
+  beforeEach(() => {
+    // Phase 31: reaching a page is not permission to rewrite it, so the write
+    // resolves the project's organization and checks the role first.
+    prisma.project.findUnique.mockResolvedValue({ organizationId: "org-1" } as never);
+    prisma.organizationMember.findUnique.mockResolvedValue({ role: "EDITOR" } as never);
+  });
+
+  test("a VIEWER cannot rewrite a page it can read", async () => {
+    prisma.organizationMember.findUnique.mockResolvedValue({ role: "VIEWER" } as never);
+
+    await expect(
+      saveRefreshedPage("prj_1", page, "viewer-user", prisma),
+    ).rejects.toMatchObject({ name: "AccessDeniedError" });
+
+    // The scope predicate alone would have let this through: a VIEWER can reach
+    // every page in their organization. What it would have written is a page
+    // stamped MANUAL, which is permanently exempt from regeneration — damage a
+    // read-only role must not be able to do.
+    expect(prisma.generatedPage.updateMany).not.toHaveBeenCalled();
+  });
+
   test("is scoped through the project relation", async () => {
     prisma.generatedPage.updateMany.mockResolvedValue({ count: 1 } as never);
 
@@ -675,14 +704,8 @@ describe("enqueueJob refuses an exhausted organization", () => {
   }
 
   /** Arm the quota and the usage behind it. */
-  function armQuota(limit: number, used: number): void {
-    prisma.organizationQuota.findUnique.mockResolvedValue({
-      limit,
-      resetDate: new Date(Date.now() - 3600_000),
-    } as never);
-    prisma.usageRecord.aggregate.mockResolvedValue({
-      _sum: { amount: used },
-    } as never);
+  function armQuota(limit: number | null, used = 0): void {
+    armQuotaGate(prisma, { limit, used });
   }
 
   test("an exhausted quota refuses before the row is written", async () => {
@@ -719,7 +742,7 @@ describe("enqueueJob refuses an exhausted organization", () => {
     // A VIEWER should learn it may not write, not how much allowance the
     // organization has left.
     expect(error?.name).toBe("AccessDeniedError");
-    expect(prisma.organizationQuota.findUnique).not.toHaveBeenCalled();
+    expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
   });
 
   test("a scoped job asks for exactly the pages it names", async () => {
@@ -733,17 +756,53 @@ describe("enqueueJob refuses an exhausted organization", () => {
       "c",
     ]);
 
-    // The scope is exact, so the gate can be exact. An unscoped run cannot know
-    // its grid until it loads, which is why it asks for one rather than
-    // guessing a number that would over-charge the gate.
-    expect(prisma.usageRecord.aggregate).toHaveBeenCalled();
-    const verdictInput = prisma.organizationQuota.findUnique.mock.calls[0]?.[0]?.where;
-    expect(verdictInput).toEqual({
-      organizationId_metric: {
+    // The scope is exact, so the gate can be exact — and the hold it takes is
+    // that exact number. An unscoped run cannot know its grid until it loads,
+    // which is why it asks for one rather than guessing a number that would
+    // over-charge the gate.
+    expect(holdsWritten(prisma)).toEqual([
+      {
         organizationId: "org-1",
         metric: "AI_GENERATED_PAGES",
+        amount: 3,
+        resourceId: null,
       },
-    });
+    ]);
+
+    // And the hold is written down on the job, because the refund is owed by a
+    // different process than the one that took it.
+    expect(
+      prisma.generationJob.create.mock.calls[0]?.[0]?.data as { reservedUnits: number },
+    ).toMatchObject({ reservedUnits: 3 });
+  });
+
+  test("the hold and the job commit together, or neither does", async () => {
+    armOwnedProject();
+    armQuota(100, 0);
+    prisma.generationJob.create.mockResolvedValue(jobRow() as never);
+
+    await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "GENERATE", prisma);
+
+    // Both inside one transaction. A hold that committed without its job would
+    // charge a tenant for a run that does not exist; a job that committed
+    // without its hold is the race this replaces. Neither half is allowed to
+    // land alone, so the mock's transaction wrapper must have run.
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.usageRecord.create).toHaveBeenCalledTimes(1);
+    expect(prisma.generationJob.create).toHaveBeenCalledTimes(1);
+  });
+
+  test("a refused job holds nothing, so a retry is not charged for being refused", async () => {
+    armOwnedProject();
+    armQuota(10, 10);
+
+    await expect(
+      enqueueJob("prj_1", LOCAL_OPERATOR_ID, "GENERATE", prisma),
+    ).rejects.toMatchObject({ name: "QuotaExceededError" });
+
+    // A gate that metered its refusals would charge a tenant for being told no
+    // — and charge again every time they tried.
+    expect(prisma.usageRecord.create).not.toHaveBeenCalled();
   });
 
   test("room left lets the job through", async () => {
@@ -759,11 +818,18 @@ describe("enqueueJob refuses an exhausted organization", () => {
 
   test("no configured quota does not block anything", async () => {
     armOwnedProject();
-    prisma.organizationQuota.findUnique.mockResolvedValue(null as never);
+    armQuota(null);
     prisma.generationJob.create.mockResolvedValue(jobRow() as never);
 
     expect(
       await enqueueJob("prj_1", LOCAL_OPERATOR_ID, "BUILD", prisma),
     ).not.toBeNull();
+
+    // Nothing was held, so nothing is owed back — and the job records that
+    // rather than a number the meter would later refund out of thin air.
+    expect(prisma.usageRecord.create).not.toHaveBeenCalled();
+    expect(
+      prisma.generationJob.create.mock.calls[0]?.[0]?.data as { reservedUnits: number },
+    ).toMatchObject({ reservedUnits: 0 });
   });
 });

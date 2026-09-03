@@ -1,6 +1,7 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import type { AuditRecord } from "@staticforge/core";
 
+import { requireCapability } from "./access.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -76,17 +77,23 @@ export const MAX_AUDIT_PAGE = 200;
  * leaks across tenants is worse than none — it is a breach recorded in the
  * product that was sold as the safeguard.
  *
- * Callers must still check that the caller may read this organization;
- * `requireRole` is that check, and it is deliberately not called here so this
- * module stays a data accessor rather than half a gate.
+ * The check is *here*, not left to the caller. The previous note in this spot
+ * argued that a data accessor should stay a data accessor and let the route
+ * decide — which is exactly the reasoning the Phase 31 audit found had left
+ * every privileged function in this package open. A trail that records who did
+ * what is not something to hand out on the honour system.
  *
+ * @throws {AccessDeniedError} Unless the caller holds `member:manage`.
  * @returns Newest first.
  */
 export async function listAuditEvents(
   organizationId: string,
+  actingUserId: string,
   prisma: PrismaClient,
   query: AuditQuery = {},
 ): Promise<AuditEntry[]> {
+  await requireCapability(organizationId, actingUserId, "member:manage", prisma);
+
   const rows = await withDbRetry(() =>
     prisma.auditLog.findMany({
       where: {

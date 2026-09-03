@@ -34,6 +34,7 @@ function syncEvent(over: Partial<ProjectSyncEvent> = {}): ProjectSyncEvent {
     locationsUpdated: 0,
     locationsRemoved: 0,
     scopedPages: 3,
+    reservedUnits: 1,
     syncedAt: "2026-08-28T00:00:00.000Z",
     ...over,
   };
@@ -50,6 +51,7 @@ function jobEvent(over: Partial<JobCompletedEvent> = {}): JobCompletedEvent {
     ok: true,
     exitCode: 0,
     resumed: false,
+    reservedUnits: 1,
     pageCount: 9,
     durationMs: 4321,
     completedAt: "2026-08-28T00:01:00.000Z",

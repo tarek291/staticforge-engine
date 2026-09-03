@@ -9,7 +9,7 @@ import type { Location, Service } from "@staticforge/schemas";
 
 import { requireCapability } from "./access.js";
 import { affectedSlugs, findAffectedPages } from "./impact.js";
-import { requireQuota } from "./quota.js";
+import { requireQuotaReservation } from "./quota.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -344,8 +344,10 @@ async function announceSync(
   userId: string,
   organizationId: string | null,
   result: SyncResult,
+  reservedUnits = 0,
 ): Promise<void> {
   await hooks.emit("afterProjectSync", {
+    reservedUnits,
     projectId,
     userId,
     organizationId,
@@ -478,9 +480,22 @@ export async function syncProject(
   // — which is exactly what somebody near their limit most needs to know.
   // Keeping the check and the charge on the same paths is what stops the two
   // drifting into a system that bills for what it did not gate, or the reverse.
-  if (options.enqueue ?? true) {
-    await requireQuota(snapshot.organizationId, "SYNC_OPERATIONS", 1, prisma);
-  }
+  //
+  // The gate *holds* the unit it admits rather than only checking for it, so a
+  // burst of concurrent syncs cannot all read the same total and all pass. One
+  // unit is also the exact charge — a sync is one operation whatever it finds
+  // — so the hold and the settlement are equal and the ledger ends with the
+  // single row it always had.
+  const reservation =
+    (options.enqueue ?? true)
+      ? await requireQuotaReservation(
+          snapshot.organizationId,
+          "SYNC_OPERATIONS",
+          1,
+          prisma,
+          projectId,
+        )
+      : { reserved: 0 };
 
   const diff = diffSyncPayload(payload, snapshot);
 
@@ -497,7 +512,14 @@ export async function syncProject(
       note: "The incoming data matches what this project already holds.",
     };
 
-    await announceSync(hooks, projectId, userId, snapshot.organizationId, unchanged);
+    await announceSync(
+      hooks,
+      projectId,
+      userId,
+      snapshot.organizationId,
+      unchanged,
+      reservation.reserved,
+    );
 
     return unchanged;
   }
@@ -614,7 +636,14 @@ export async function syncProject(
       note: "Applied, but no run was queued: this caller supplied no queue.",
     };
 
-    await announceSync(hooks, projectId, userId, snapshot.organizationId, applied);
+    await announceSync(
+      hooks,
+      projectId,
+      userId,
+      snapshot.organizationId,
+      applied,
+      reservation.reserved,
+    );
 
     return applied;
   }
@@ -633,7 +662,14 @@ export async function syncProject(
       note: `Applied, but no run was queued: ${plan.reason}`,
     };
 
-    await announceSync(hooks, projectId, userId, snapshot.organizationId, quiet);
+    await announceSync(
+      hooks,
+      projectId,
+      userId,
+      snapshot.organizationId,
+      quiet,
+      reservation.reserved,
+    );
 
     return quiet;
   }
@@ -641,7 +677,14 @@ export async function syncProject(
   const jobId = await options.enqueueJob(projectId, userId, plan.scope);
   const result: SyncResult = { changed: true, diff, jobId, scope: plan.scope };
 
-  await announceSync(hooks, projectId, userId, snapshot.organizationId, result);
+  await announceSync(
+    hooks,
+    projectId,
+    userId,
+    snapshot.organizationId,
+    result,
+    reservation.reserved,
+  );
 
   return result;
 }

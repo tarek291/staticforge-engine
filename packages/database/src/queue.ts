@@ -58,6 +58,16 @@ export interface ClaimedJob {
   totalCount: number | null;
   /** Whether this claim picked up work an earlier attempt left unfinished. */
   resumed: boolean;
+  /**
+   * Quota units held when this job was admitted.
+   *
+   * Carried on the claim for the same reason the scope is: the hold was taken
+   * in another process, and the row is the only place it is written down. The
+   * meter nets it against what the run actually authored, so a worker that
+   * lost this number would leave an estimate charged for work that may never
+   * have happened.
+   */
+  reservedUnits: number;
 }
 
 /** Options for {@link claimNextJob}. */
@@ -153,6 +163,7 @@ export async function claimNextJob(
         targetSlugs: true,
         completedCount: true,
         totalCount: true,
+        reservedUnits: true,
         project: { select: { locale: true, organizationId: true } },
       },
     }),
@@ -178,6 +189,7 @@ export async function claimNextJob(
     completedCount: job.completedCount,
     totalCount: job.totalCount,
     resumed: candidate.status === "RUNNING",
+    reservedUnits: job.reservedUnits,
   };
 }
 

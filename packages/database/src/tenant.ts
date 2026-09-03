@@ -1,9 +1,9 @@
 import { Prisma } from "@prisma/client";
 import type { JobKind, JobStatus, PrismaClient } from "@prisma/client";
 
-import { requireCapability } from "./access.js";
+import { requireCapability, requireProjectCapability } from "./access.js";
 import { projectVisibleTo } from "./scope.js";
-import { requireQuota } from "./quota.js";
+import { requireQuotaReservation } from "./quota.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -319,37 +319,54 @@ export async function enqueueJob(
   // line in this product with a real marginal cost.
   await requireCapability(project.organizationId, userId, "project:write", prisma);
 
-  // The commercial ceiling, after the permission check and before the write.
-  // Ordered that way deliberately: a caller who may not touch this project at
-  // all should learn that, not learn how much quota it has left.
-  //
   // The amount is what the run will *at least* consume. A scoped job names its
   // pages, so that count is exact; an unscoped one cannot know its grid until
   // it loads, so it asks for one — enough to stop an exhausted tenant queueing
   // anything, and deliberately not a guess that would over-charge the gate.
-  // The precise figure is metered afterwards, from what the run actually wrote.
-  await requireQuota(
-    project.organizationId,
-    "AI_GENERATED_PAGES",
-    scope !== undefined && scope.length > 0 ? scope.length : 1,
-    prisma,
-  );
+  // The precise figure is settled afterwards, from what the run actually wrote.
+  const wanted = scope !== undefined && scope.length > 0 ? scope.length : 1;
 
-  const job = await prisma.generationJob.create({
-    data: {
-      projectId,
-      userId,
-      kind,
-      status: "PENDING",
-      ...(target !== undefined
-        ? { targetSlug: target.slug, feedback: target.feedback }
-        : {}),
-      // Written only when there is one. An explicit empty array and an absent
-      // scope mean the same thing to the column default, but sending one would
-      // make a full run look like a scoped run that found nothing — which is
-      // the opposite reading and the more alarming one.
-      ...(scope !== undefined && scope.length > 0 ? { targetSlugs: [...scope] } : {}),
-    },
+  // The gate and the write, in one transaction.
+  //
+  // They have to be atomic together. The gate holds quota by writing a usage
+  // row, and a hold that committed without its job would charge a tenant for a
+  // run that does not exist — while a job that committed without its hold is
+  // the race this replaces. Either half alone is a bug, so neither commits
+  // alone.
+  //
+  // The permission check stays outside: it reads membership, takes no locks,
+  // and holding a transaction open across it would widen the window every
+  // concurrent enqueue waits in for no benefit. Ordered before the quota gate
+  // deliberately — a caller who may not touch this project at all should learn
+  // that, not learn how much quota it has left.
+  const job = await prisma.$transaction(async (tx) => {
+    const reservation = await requireQuotaReservation(
+      project.organizationId,
+      "AI_GENERATED_PAGES",
+      wanted,
+      tx,
+    );
+
+    return tx.generationJob.create({
+      data: {
+        projectId,
+        userId,
+        kind,
+        status: "PENDING",
+        // What the meter must give back. Stored on the row because the two
+        // halves happen in different processes — this one admits the job, a
+        // worker completes it — so there is nowhere else the number can wait.
+        reservedUnits: reservation.reserved,
+        ...(target !== undefined
+          ? { targetSlug: target.slug, feedback: target.feedback }
+          : {}),
+        // Written only when there is one. An explicit empty array and an absent
+        // scope mean the same thing to the column default, but sending one would
+        // make a full run look like a scoped run that found nothing — which is
+        // the opposite reading and the more alarming one.
+        ...(scope !== undefined && scope.length > 0 ? { targetSlugs: [...scope] } : {}),
+      },
+    });
   });
 
   return toJobSummary(job);
@@ -713,6 +730,12 @@ export async function getPageForUser(
  * project is — the same guarantee `getPageForUser` gives on the read side,
  * applied to the write that follows it rather than assumed from it.
  *
+ * Reachability is not permission, which is why the role check below is separate
+ * from the `where` clause and comes first. A VIEWER can reach every page in
+ * their organization; the scope predicate alone would have let them rewrite one
+ * and stamp it `MANUAL`, permanently exempting it from regeneration.
+ *
+ * @throws {AccessDeniedError} Unless the caller holds `project:write` — EDITOR.
  * @returns Whether the page was found and rewritten.
  */
 export async function saveRefreshedPage(
@@ -736,6 +759,8 @@ export async function saveRefreshedPage(
   userId: string,
   prisma: PrismaClient,
 ): Promise<boolean> {
+  await requireProjectCapability(projectId, userId, "project:write", prisma);
+
   // Retried: this lands immediately after a paid authoring call, so losing it
   // to a connection blip means paying again for the same revision.
   const { count } = await withDbRetry(() =>

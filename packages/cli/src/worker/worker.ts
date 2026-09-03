@@ -63,6 +63,14 @@ export interface ClaimedJobLike {
   userId: string;
   /** The organization this job belongs to, for the audit trail. */
   organizationId: string | null;
+  /**
+   * Quota units held for this run when it was admitted.
+   *
+   * Carried from the row rather than recomputed, because the estimate was made
+   * in another process and only the row remembers it. The meter gives it back
+   * against what the run actually authored.
+   */
+  reservedUnits?: number;
   kind: "GENERATE" | "BUILD" | "REFRESH";
   locale: string;
   targetSlug: string | null;
@@ -263,6 +271,10 @@ export async function runWorkerOnce(
     exitCode: result.exitCode,
     resumed: job.resumed,
     pageCount: pagesWritten,
+    // Defaulted rather than required, so a caller built before this column
+    // existed still compiles. Zero is the honest reading for one: nothing was
+    // held, so nothing is owed back.
+    reservedUnits: job.reservedUnits ?? 0,
     durationMs: result.durationMs,
     completedAt: new Date().toISOString(),
   });

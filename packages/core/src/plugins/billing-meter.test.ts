@@ -30,6 +30,7 @@ function jobEvent(over: Partial<JobCompletedEvent> = {}): JobCompletedEvent {
     exitCode: 0,
     resumed: false,
     pageCount: 9,
+    reservedUnits: 1,
     durationMs: 4321,
     completedAt: "2026-08-28T00:01:00.000Z",
     ...over,
@@ -50,6 +51,7 @@ function syncEvent(over: Partial<ProjectSyncEvent> = {}): ProjectSyncEvent {
     locationsUpdated: 0,
     locationsRemoved: 0,
     scopedPages: 3,
+    reservedUnits: 1,
     syncedAt: "2026-08-28T00:00:00.000Z",
     ...over,
   };
@@ -98,6 +100,9 @@ describe("finished work is metered", () => {
         organizationId: "org_1",
         metric: USAGE_METRICS.aiGeneratedPages,
         amount: 9,
+        // The hold taken at admission travels with the report, so the writer
+        // can store the difference rather than counting the run twice.
+        reservedUnits: 1,
         resourceId: "job_1",
       },
     ]);
@@ -123,6 +128,9 @@ describe("finished work is metered", () => {
         organizationId: "org_1",
         metric: USAGE_METRICS.syncOperations,
         amount: 1,
+        // Held one, cost one. The writer settles a difference of zero and the
+        // ledger keeps the single row the gate already wrote.
+        reservedUnits: 1,
         resourceId: "prj_1",
       },
     ]);
@@ -145,30 +153,57 @@ describe("finished work is metered", () => {
     await hooks.emit("afterProjectSync", syncEvent({ changed: false }));
     await hooks.emit("afterProjectSync", syncEvent({ changed: true }));
 
-    expect(metered).toHaveLength(1);
+    // Both are reported, and that is the point: the setting decides the
+    // *amount*, not whether to speak. The unchanged sync reports zero against a
+    // hold of one, which gives the gate's unit back — staying silent would have
+    // left it charged, so the setting would have raised the bill it was set to
+    // lower.
+    expect(metered.map((entry) => entry.amount - entry.reservedUnits)).toEqual([
+      -1, 0,
+    ]);
   });
 });
 
 describe("work that produced nothing is not charged for", () => {
-  test("a failed job meters nothing", async () => {
+  test("a failed job reports zero, and gives its hold back", async () => {
     const { hooks, metered } = install();
 
-    await hooks.emit("afterJobCompleted", jobEvent({ ok: false, exitCode: 1 }));
+    await hooks.emit(
+      "afterJobCompleted",
+      jobEvent({ ok: false, exitCode: 1, reservedUnits: 4 }),
+    );
 
     // Charging for the engine's own failure is the hardest charge to defend and
-    // the easiest to avoid making.
-    expect(metered).toEqual([]);
+    // the easiest to avoid making. Before Phase 31 that meant staying silent;
+    // now silence would leave the four units held at admission standing against
+    // the tenant, so the refusal has to be *stated* to be honoured.
+    expect(metered[0]?.amount).toBe(0);
+    expect(metered[0]?.reservedUnits).toBe(4);
   });
 
-  test("a run that wrote no pages meters nothing", async () => {
+  test("a run that wrote no pages gives its whole hold back", async () => {
     const { hooks, metered } = install();
 
-    await hooks.emit("afterJobCompleted", jobEvent({ pageCount: 0 }));
+    await hooks.emit("afterJobCompleted", jobEvent({ pageCount: 0, reservedUnits: 3 }));
 
     // Every page cached, resumed, or out of scope. Nothing was authored, so
     // nothing is owed — which is the whole reason the count is read back from
     // the row rather than estimated from the grid.
-    expect(metered).toEqual([]);
+    expect(metered[0]?.amount).toBe(0);
+    expect(metered[0]?.reservedUnits).toBe(3);
+  });
+
+  test("a run that authored less than it held reports the shortfall", async () => {
+    const { hooks, metered } = install();
+
+    await hooks.emit("afterJobCompleted", jobEvent({ pageCount: 2, reservedUnits: 10 }));
+
+    // The writer stores `actual - held`, so this is a credit of eight. An
+    // append-only ledger cannot correct a charge by editing it; a negative row
+    // is how the correction stays readable next to what it corrects.
+    const entry = metered[0];
+
+    expect(entry === undefined ? null : entry.amount - entry.reservedUnits).toBe(-8);
   });
 
   test("a run with no tenant meters nothing", async () => {
@@ -177,8 +212,10 @@ describe("work that produced nothing is not charged for", () => {
     await hooks.emit("afterJobCompleted", jobEvent({ organizationId: null }));
     await hooks.emit("afterProjectSync", syncEvent({ organizationId: null }));
 
-    // A local run. There is nobody to bill, and inventing an organization would
-    // put the charge on somebody else's invoice.
+    // A local run. There is nobody to bill, nothing was held against anybody,
+    // and inventing an organization would put the charge on somebody else's
+    // invoice. This is the one case that still reports nothing at all — there
+    // is no hold to give back.
     expect(metered).toEqual([]);
   });
 });
