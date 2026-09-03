@@ -3,6 +3,9 @@ import type { RateLimiter, TokenGrant } from "@staticforge/core";
 
 import {
   DEFAULT_MAX_PAUSE_MS,
+  DEFAULT_RATE_LIMIT_BUDGET_MS,
+  MIN_PAUSE_MS,
+  RateLimitContractError,
   RateLimitImpossibleError,
   RateLimitTimeoutError,
   awaitTokens,
@@ -250,5 +253,176 @@ describe("the limiter is asked for the real cost", () => {
     // and say nothing about tokens per minute, which is the limit a long
     // authoring run actually reaches first.
     expect(asked).toEqual([16_000]);
+  });
+});
+
+/**
+ * A limiter answering with something that is not a duration.
+ *
+ * The bug this closes had two halves, and the second is the one that made it an
+ * outage rather than a wrong number.
+ *
+ * `Math.max(1000, NaN)` is `NaN`, and `setTimeout(fn, NaN)` fires immediately —
+ * so the loop stops waiting and hammers the limiter as fast as the event loop
+ * allows. Then `waited += NaN` makes `waited` permanently `NaN`, and
+ * `NaN > budgetMs` is `false`, so the budget check is silently disabled for the
+ * rest of the call. The one guard against a process that is alive, holding a
+ * lease and never finishing, is switched off by a single bad answer — and stays
+ * off even for later grants that are perfectly valid.
+ */
+describe("a limiter that answers with nonsense fails fast", () => {
+  /** Everything that is not a duration, and how each one arrives. */
+  const notDurations: ReadonlyArray<[string, number]> = [
+    // A wait computed in TypeScript from a division by zero, which is exactly
+    // how the database gate nearly produced one.
+    ["NaN", Number.NaN],
+    // "Never" expressed as a number rather than as `unsatisfiable`.
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["-Infinity", Number.NEGATIVE_INFINITY],
+    // A clock that went backwards between two reads.
+    ["a negative wait", -5000],
+  ];
+
+  for (const [label, waitForMs] of notDurations) {
+    test(`${label} throws instead of being slept on`, async () => {
+      const { fn, waits } = recordingSleep();
+      const { limiter } = scripted({
+        allowed: false,
+        waitForMs,
+        remainingTokens: 0,
+        unsatisfiable: false,
+      });
+
+      const error = await errorFrom<RateLimitContractError>(
+        awaitTokens(limiter, 100, { sleepFn: fn }),
+      );
+
+      expect(error).toBeInstanceOf(RateLimitContractError);
+      // Nothing was slept on. `setTimeout(fn, NaN)` fires immediately, so
+      // passing it through is what turned this into a spin.
+      expect(waits).toEqual([]);
+    });
+  }
+
+  test("it does not spin the loop against the limiter", async () => {
+    let calls = 0;
+    const limiter: RateLimiter = () => {
+      calls += 1;
+
+      return Promise.resolve({
+        allowed: false,
+        waitForMs: Number.NaN,
+        remainingTokens: 0,
+        unsatisfiable: false,
+      });
+    };
+
+    await errorFrom(awaitTokens(limiter, 100, { sleepFn: () => Promise.resolve() }));
+
+    // Asked once and refused. Before the fix this loop ran until something
+    // else broke, querying Postgres on every pass.
+    expect(calls).toBe(1);
+  });
+
+  test("the error names the limiter, not the tenant's capacity", async () => {
+    const { limiter } = scripted({
+      allowed: false,
+      waitForMs: Number.NaN,
+      remainingTokens: 0,
+      unsatisfiable: false,
+    });
+
+    const error = await errorFrom<RateLimitContractError>(
+      awaitTokens(limiter, 100, { sleepFn: () => Promise.resolve() }),
+    );
+
+    // A `RateLimitTimeoutError` here would say "the bucket stayed full for two
+    // minutes" and send an operator to look at capacity settings for a fault
+    // nowhere near them. The value that caused it is carried on the error.
+    expect(error.message).toMatch(/limiter is misbehaving/i);
+    expect(error.message).toMatch(/waiting will not fix it/i);
+    expect(Number.isNaN(error.reported as number)).toBe(true);
+  });
+
+  test("a valid wait is still honoured, so the guard is not just refusing everything", async () => {
+    const { fn, waits } = recordingSleep();
+    const { limiter } = scripted(deny(2000));
+
+    await awaitTokens(limiter, 100, { sleepFn: fn });
+
+    expect(waits).toEqual([2000]);
+  });
+
+  test("zero is a duration and keeps its one-second floor", async () => {
+    const { fn, waits } = recordingSleep();
+    const { limiter } = scripted(deny(0));
+
+    // Zero is valid, not nonsense — it means "ask again shortly". The floor is
+    // what stops it spinning, and it must survive a guard aimed at NaN.
+    await awaitTokens(limiter, 100, { sleepFn: fn });
+
+    expect(waits).toEqual([1000]);
+  });
+});
+
+describe("a budget that is not a number cannot disable the timeout", () => {
+  test("a NaN budget falls back to the default rather than being honoured", async () => {
+    const { fn, waits } = recordingSleep();
+    const limiter: RateLimiter = () => Promise.resolve(deny(DEFAULT_MAX_PAUSE_MS));
+
+    const error = await errorFrom<RateLimitTimeoutError>(
+      // `??` only catches null and undefined, so this NaN used to flow straight
+      // through — and `waited + pause > NaN` is `false`, which disables the
+      // timeout exactly as completely as a poisoned `waited` does. This is the
+      // same bug arriving through the front door.
+      awaitTokens(limiter, 100, { budgetMs: Number.NaN, sleepFn: fn }),
+    );
+
+    expect(error).toBeInstanceOf(RateLimitTimeoutError);
+    // Bounded by the default budget rather than running for ever.
+    expect(waits.reduce((total, ms) => total + ms, 0)).toBeLessThanOrEqual(
+      DEFAULT_RATE_LIMIT_BUDGET_MS,
+    );
+  });
+
+  test("a NaN pause ceiling falls back to the default", async () => {
+    const { fn, waits } = recordingSleep();
+    const { limiter } = scripted(deny(1_000_000));
+
+    await awaitTokens(limiter, 100, { maxPauseMs: Number.NaN, sleepFn: fn });
+
+    // Capped at the default rather than sleeping for a fortnight, which would
+    // starve the lease renewal this ceiling exists to protect.
+    expect(waits).toEqual([DEFAULT_MAX_PAUSE_MS]);
+  });
+
+  test("the iteration cap never fires before the budget does", async () => {
+    const { fn, waits } = recordingSleep();
+    // A long budget and the shortest legal pause: the most iterations a healthy
+    // run can possibly make.
+    const limiter: RateLimiter = () => Promise.resolve(deny(MIN_PAUSE_MS));
+
+    const error = await errorFrom<RateLimitTimeoutError>(
+      awaitTokens(limiter, 100, { budgetMs: 600_000, sleepFn: fn }),
+    );
+
+    // The cap is a backstop against arithmetic that has stopped working, and a
+    // backstop that fires during normal operation is a bug of its own — it
+    // would cut a legitimate ten-minute wait short and report it as a timeout
+    // that never happened. The budget is what stopped this, at its full length.
+    expect(error).toBeInstanceOf(RateLimitTimeoutError);
+    expect(waits.length).toBe(600_000 / MIN_PAUSE_MS);
+  });
+
+  test("an explicit zero budget is still honoured, because zero is a number", async () => {
+    const { limiter } = scripted(deny(1000));
+
+    // The fallback must trigger on "not a duration", not on "falsy". Zero is a
+    // real budget and means "do not wait at all".
+    const error = await errorFrom<RateLimitTimeoutError>(
+      awaitTokens(limiter, 100, { budgetMs: 0, sleepFn: () => Promise.resolve() }),
+    );
+
+    expect(error).toBeInstanceOf(RateLimitTimeoutError);
   });
 });
