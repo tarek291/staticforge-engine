@@ -44,6 +44,7 @@ export * from "./queue.js";
 export * from "./sync.js";
 export * from "./impact.js";
 export * from "./access.js";
+export * from "./platform.js";
 export * from "./api-key.js";
 export * from "./authenticate.js";
 export * from "./scope.js";

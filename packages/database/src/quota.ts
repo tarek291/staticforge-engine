@@ -1,5 +1,6 @@
 import type { PrismaClient, UsageMetric } from "@prisma/client";
 
+import { requirePlatformOperator } from "./platform.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -120,6 +121,57 @@ export async function sumUsage(
 }
 
 /**
+ * Refuse a quota row that cannot honestly be counted against.
+ *
+ * Both gates share it so the two cannot drift — and a misconfiguration that
+ * one refused and the other allowed would be worse than either behaviour on
+ * its own, because which one you hit would depend on the code path.
+ *
+ * @returns A refusal verdict, or `null` when the row is usable.
+ */
+function refuseUnusableQuota(
+  quota: { limit: number; resetDate: Date },
+  metric: UsageMetricName,
+  requestedAmount: number,
+): QuotaVerdict | null {
+  if (quota.resetDate > new Date()) {
+    // A reset date in the future means "nothing counts yet", which is a quota
+    // that silently permits everything — the failure mode a quota exists to
+    // prevent. Refused rather than allowed, so a typo surfaces as a blocked
+    // operation with an explanation instead of as an unlimited account.
+    return {
+      allowed: false,
+      metric,
+      used: 0,
+      limit: quota.limit,
+      requested: requestedAmount,
+      remaining: null,
+      resetDate: quota.resetDate.toISOString(),
+      reason:
+        `The ${metric} quota for this organization has a reset date in the ` +
+        `future (${quota.resetDate.toISOString()}), so no usage can be counted ` +
+        `against it. Fix the quota rather than waiting: this will not clear ` +
+        `on its own.`,
+    };
+  }
+
+  if (quota.limit < 0) {
+    return {
+      allowed: false,
+      metric,
+      used: 0,
+      limit: quota.limit,
+      requested: requestedAmount,
+      remaining: null,
+      resetDate: quota.resetDate.toISOString(),
+      reason: `The ${metric} quota is negative (${quota.limit}), which is not a limit anyone meant to set.`,
+    };
+  }
+
+  return null;
+}
+
+/**
  * Decide whether an organization may consume more of a metric.
  *
  * Read-only. It records nothing — a gate that metered its own checks would
@@ -159,42 +211,10 @@ export async function checkQuota(
     };
   }
 
-  const now = new Date();
+  const refusal = refuseUnusableQuota(quota, metric, requestedAmount);
 
-  if (quota.resetDate > now) {
-    // A reset date in the future means "nothing counts yet", which is a quota
-    // that silently permits everything — the failure mode a quota exists to
-    // prevent. Refused rather than allowed, so a typo surfaces as a blocked
-    // operation with an explanation instead of as an unlimited account.
-    const verdict: QuotaVerdict = {
-      allowed: false,
-      metric,
-      used: 0,
-      limit: quota.limit,
-      requested: requestedAmount,
-      remaining: null,
-      resetDate: quota.resetDate.toISOString(),
-      reason:
-        `The ${metric} quota for this organization has a reset date in the ` +
-        `future (${quota.resetDate.toISOString()}), so no usage can be counted ` +
-        `against it. Fix the quota rather than waiting: this will not clear ` +
-        `on its own.`,
-    };
-
-    return verdict;
-  }
-
-  if (quota.limit < 0) {
-    return {
-      allowed: false,
-      metric,
-      used: 0,
-      limit: quota.limit,
-      requested: requestedAmount,
-      remaining: null,
-      resetDate: quota.resetDate.toISOString(),
-      reason: `The ${metric} quota is negative (${quota.limit}), which is not a limit anyone meant to set.`,
-    };
+  if (refusal !== null) {
+    return refusal;
   }
 
   const used = await sumUsage(organizationId, metric, quota.resetDate, prisma);
@@ -223,11 +243,15 @@ export async function checkQuota(
 }
 
 /**
- * Refuse unless the organization has room.
+ * Refuse unless the organization has room. **Reads only — not a gate.**
  *
- * The form every gate should use. `checkQuota` returns a verdict a caller can
- * ignore; this one cannot be ignored by accident, which is the same reason
- * `requireRole` throws rather than returning a boolean.
+ * Kept for callers that want to *report* a limit: a dashboard showing how much
+ * is left, a dry run explaining what a sync would cost. Those want an answer,
+ * not a hold.
+ *
+ * Do not admit work on this. It reads a total that concurrent callers are all
+ * reading at the same moment and all passing, which is the race Phase 31 found
+ * — use {@link requireQuotaReservation}, which holds what it admits.
  *
  * @throws {QuotaExceededError} When the operation would exceed the limit.
  */
@@ -305,11 +329,25 @@ export interface QuotaSetting {
  *
  * Upserted on the pair, because two rows for one metric would make the answer
  * depend on which was read first — and the generous one would win.
+ *
+ * ## Why this is not guarded by a tenant role
+ *
+ * Every tenant capability is held by OWNER, and OWNER is the person the quota
+ * bills. Gating this with `member:manage` would let a customer raise their own
+ * spending cap — worse than leaving it open, because it would look like a
+ * control while being none. A plan's ceiling is sold, not self-served, so it is
+ * guarded by a question no tenant role can answer: is this the platform?
+ *
+ * @param actingUserId - Who is setting it. Must be the platform operator.
+ * @throws {UnauthorizedError} For any tenant principal or API key.
  */
 export async function setQuota(
   setting: QuotaSetting,
+  actingUserId: string,
   prisma: PrismaClient,
 ): Promise<QuotaVerdict> {
+  requirePlatformOperator(actingUserId);
+
   const resetDate = setting.resetDate ?? new Date();
 
   await withDbRetry(() =>
@@ -331,4 +369,261 @@ export async function setQuota(
   );
 
   return checkQuota(setting.organizationId, setting.metric, 0, prisma);
+}
+
+// ---------------------------------------------------------------------------
+// The atomic gate
+// ---------------------------------------------------------------------------
+
+/**
+ * A quota client that may be the base client or a transaction handle.
+ *
+ * The gate has to be able to run *inside* a caller's transaction — that is the
+ * whole point of it — so it takes the narrow surface it actually uses rather
+ * than a `PrismaClient`, and an interactive transaction handle satisfies it.
+ */
+export type QuotaExecutor = Pick<PrismaClient, "$queryRawUnsafe" | "usageRecord">;
+
+/**
+ * A hold placed on an organization's quota.
+ *
+ * `reserved` is what was actually taken, and it is not always `requested`: a
+ * tenant with no quota configured has nothing to hold, and a refused operation
+ * holds nothing either. Callers must refund exactly this number and never the
+ * number they asked for.
+ */
+export interface QuotaReservation {
+  /** The verdict, in the same shape `checkQuota` returns. */
+  verdict: QuotaVerdict;
+  /** Units held. Zero when nothing was written — unlimited, or refused. */
+  reserved: number;
+}
+
+/**
+ * The quota row, locked.
+ *
+ * `FOR UPDATE` is the entire mechanism. Concurrent callers for the same
+ * organization and metric queue behind this row, and the sum that follows is a
+ * separate statement — so under READ COMMITTED it takes a *fresh* snapshot once
+ * the lock is granted, and therefore sees the reservation the caller ahead of
+ * it just committed.
+ *
+ * Both halves are load-bearing. The lock without the second snapshot would
+ * serialise two callers who then read the same stale total and both pass, which
+ * is exactly the bug this replaces — and is why folding the sum into this
+ * statement as a CTE would look tidier and fix nothing.
+ *
+ * `NOWAIT` is deliberately absent. A caller arriving during another's check
+ * should wait its turn — milliseconds — rather than be refused for a quota it
+ * may well have room in.
+ */
+const LOCK_QUOTA_SQL = `
+  SELECT "limit", "resetDate"
+  FROM "OrganizationQuota"
+  WHERE "organizationId" = $1 AND "metric" = $2::"UsageMetric"
+  FOR UPDATE
+`;
+
+/** Consumption since an instant, read *after* the lock. See {@link LOCK_QUOTA_SQL}. */
+const SUM_USAGE_SQL = `
+  SELECT COALESCE(SUM("amount"), 0)::bigint AS used
+  FROM "UsageRecord"
+  WHERE "organizationId" = $1 AND "metric" = $2::"UsageMetric" AND "recordedAt" >= $3
+`;
+
+/**
+ * Check an organization's ceiling and hold the units, atomically.
+ *
+ * ## Why a check alone was not enough
+ *
+ * Usage is metered *retrospectively* — a row appears once work has finished. So
+ * a gate that only reads is a gate every concurrent caller passes: ten requests
+ * arriving together all sum the same zero, all find room, and all proceed.
+ *
+ * A lock does not fix that by itself, and this is the part worth being precise
+ * about: ten *serialised* callers still read a total that nothing has written
+ * to yet, and still all pass. Serialising the checks changes the order they
+ * happen in and not their answer. The admission itself has to become visible,
+ * which means writing at admission time.
+ *
+ * So this holds the units it admits. The hold is an ordinary `UsageRecord`, and
+ * the next caller's sum includes it precisely because the lock forces that sum
+ * to happen after this transaction commits.
+ *
+ * ## The hold is not the charge
+ *
+ * It is an estimate taken on credit, and it must be settled. When the work
+ * finishes, the meter writes the *difference* between what actually happened
+ * and what was held — a negative row when the run authored less than expected,
+ * and the whole amount back when it failed or was never run. That is why
+ * {@link QuotaReservation.reserved} is returned rather than assumed: refunding
+ * the requested amount when a different amount was held would credit a tenant
+ * for quota they never consumed.
+ *
+ * A hold that is never settled stays charged, and that direction is chosen. An
+ * unsettled hold counts against a tenant's own ceiling, where they see it and
+ * complain; the opposite failure lets a limit be exceeded silently and surfaces
+ * as an invoice nobody can defend.
+ *
+ * @param organizationId - The tenant.
+ * @param metric - What is being consumed.
+ * @param requestedAmount - Units to hold. Non-positive holds nothing.
+ * @param prisma - The client, or a transaction handle to join an existing one.
+ * @param resourceId - What the hold is for, carried onto the row.
+ */
+export async function reserveQuota(
+  organizationId: string,
+  metric: UsageMetricName,
+  requestedAmount: number,
+  prisma: QuotaExecutor,
+  resourceId?: string | null,
+): Promise<QuotaReservation> {
+  const rows = await prisma.$queryRawUnsafe<
+    Array<{ limit: number; resetDate: Date }>
+  >(LOCK_QUOTA_SQL, organizationId, metric);
+
+  const quota = rows[0];
+
+  if (quota === undefined) {
+    // No quota configured. The one deliberate fail-open in this module, carried
+    // over from `checkQuota`: quotas are opt-in, and a default of zero would
+    // have stopped every existing tenant the moment the table shipped.
+    //
+    // Nothing is held, so nothing must be refunded. There is also nothing to
+    // serialise on — `FOR UPDATE` locked no row — which is right, because an
+    // absent ceiling cannot be raced past.
+    return {
+      reserved: 0,
+      verdict: {
+        allowed: true,
+        metric,
+        used: 0,
+        limit: null,
+        requested: requestedAmount,
+        remaining: null,
+        resetDate: null,
+      },
+    };
+  }
+
+  const refusal = refuseUnusableQuota(quota, metric, requestedAmount);
+
+  if (refusal !== null) {
+    return { reserved: 0, verdict: refusal };
+  }
+
+  const [sum] = await prisma.$queryRawUnsafe<Array<{ used: bigint | number }>>(
+    SUM_USAGE_SQL,
+    organizationId,
+    metric,
+    quota.resetDate,
+  );
+
+  // A Postgres `SUM` arrives as a bigint through this driver and as a number
+  // through some others. Coerced once, here, because `bigint + number` is a
+  // TypeError rather than a wrong answer — and a gate that throws on a healthy
+  // database refuses every tenant.
+  const used = Number(sum?.used ?? 0);
+  const wanted = Math.max(0, requestedAmount);
+  const allowed = used + wanted <= quota.limit;
+
+  const verdict: QuotaVerdict = {
+    allowed,
+    metric,
+    used,
+    limit: quota.limit,
+    requested: requestedAmount,
+    remaining: Math.max(0, quota.limit - used),
+    resetDate: quota.resetDate.toISOString(),
+    ...(allowed
+      ? {}
+      : {
+          reason:
+            `${metric} quota exceeded: ${used} of ${quota.limit} used since ` +
+            `${quota.resetDate.toISOString()}, and this operation needs ` +
+            `${requestedAmount} more.`,
+        }),
+  };
+
+  if (!allowed || wanted === 0) {
+    // A refused operation writes nothing. A gate that metered its own refusals
+    // would charge a tenant for being told no — and charge again on every retry.
+    return { reserved: 0, verdict };
+  }
+
+  // Through the query builder rather than raw SQL, unlike the two reads above.
+  // Only the lock needs raw SQL — `FOR UPDATE` has no expression in Prisma's
+  // API — and an insert written by hand would also have to mint the id the
+  // schema default supplies. It is inside the same transaction either way, so
+  // it is inside the same lock.
+  await prisma.usageRecord.create({
+    data: {
+      organizationId,
+      metric,
+      amount: wanted,
+      resourceId: resourceId ?? null,
+    },
+    select: { id: true },
+  });
+
+  return { reserved: wanted, verdict };
+}
+
+/**
+ * Hold quota or refuse, throwing.
+ *
+ * The form every gate should take, for the reason `requireRole` throws: a
+ * verdict a caller can ignore is a verdict a caller eventually ignores.
+ *
+ * @throws {QuotaExceededError} When the operation would exceed the limit.
+ */
+export async function requireQuotaReservation(
+  organizationId: string,
+  metric: UsageMetricName,
+  requestedAmount: number,
+  prisma: QuotaExecutor,
+  resourceId?: string | null,
+): Promise<QuotaReservation> {
+  const reservation = await reserveQuota(
+    organizationId,
+    metric,
+    requestedAmount,
+    prisma,
+    resourceId,
+  );
+
+  if (!reservation.verdict.allowed) {
+    throw new QuotaExceededError(organizationId, reservation.verdict);
+  }
+
+  return reservation;
+}
+
+/**
+ * Settle a hold against what actually happened.
+ *
+ * Writes the difference, never a replacement: `actual - held`. A run that
+ * authored fewer pages than were held writes a negative row, which is how this
+ * table has always expressed a correction — the ledger is append-only, so a
+ * charge stays readable next to its adjustment instead of being overwritten by
+ * it.
+ *
+ * A difference of zero writes nothing, which is the ordinary case for a metric
+ * whose estimate is exact. `SYNC_OPERATIONS` is always exactly one unit, so it
+ * holds one, settles one, and leaves a single row — the same ledger the
+ * retrospective meter produced before this gate existed.
+ *
+ * @param entry - The usage as it really was. `amount` is the true figure.
+ * @param reservedAmount - What {@link reserveQuota} reported holding.
+ * @returns The id of the adjustment row, or `null` when the hold was already right.
+ */
+export async function settleQuotaReservation(
+  entry: UsageEntry,
+  reservedAmount: number,
+  prisma: PrismaClient,
+): Promise<string | null> {
+  return recordUsage(
+    { ...entry, amount: entry.amount - Math.max(0, reservedAmount) },
+    prisma,
+  );
 }

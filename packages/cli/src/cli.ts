@@ -408,6 +408,15 @@ async function runAnalyze(values: Record<string, unknown>): Promise<void> {
  * credentials and not withdraw them is one where a key pasted into a public
  * repository can never be turned off, and that is a worse gap than having no
  * keys at all.
+ *
+ * ## Who this runs as
+ *
+ * All three actions now pass an acting identity, because Phase 31 moved the
+ * role check inside the data layer: minting, listing and revoking each require
+ * `member:manage` — OWNER — in the target organization. The CLI runs on an
+ * operator's own machine and acts as `resolveOperatorId()`, the same principal
+ * every other command uses, so an operator who is not an OWNER of the
+ * organization they name is refused here rather than at the database.
  */
 async function runApiKeys(values: {
   "org-id"?: string | undefined;
@@ -415,9 +424,10 @@ async function runApiKeys(values: {
   "key-id"?: string | undefined;
   role?: string | undefined;
 }, action: string | undefined): Promise<void> {
-  const { generateApiKey, listApiKeys, prisma, revokeApiKey } = await import(
-    "@staticforge/database"
-  );
+  const { generateApiKey, listApiKeys, prisma, resolveOperatorId, revokeApiKey } =
+    await import("@staticforge/database");
+
+  const actingUserId = resolveOperatorId();
 
   const organizationId = values["org-id"]?.trim();
 
@@ -447,6 +457,7 @@ async function runApiKeys(values: {
 
       const minted = await generateApiKey(
         organizationId,
+        actingUserId,
         name,
         prisma,
         role === undefined ? {} : { role },
@@ -465,7 +476,7 @@ async function runApiKeys(values: {
     }
 
     if (action === "list") {
-      const keys = await listApiKeys(organizationId, prisma);
+      const keys = await listApiKeys(organizationId, actingUserId, prisma);
 
       if (keys.length === 0) {
         console.log(`No API keys for organization ${organizationId}.`);
@@ -494,7 +505,7 @@ async function runApiKeys(values: {
         return;
       }
 
-      const revoked = await revokeApiKey(keyId, organizationId, prisma);
+      const revoked = await revokeApiKey(keyId, organizationId, actingUserId, prisma);
 
       if (revoked === null) {
         // Scoped to the organization, so this is also the answer for a key that

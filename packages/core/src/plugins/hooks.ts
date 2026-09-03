@@ -58,6 +58,19 @@ export interface JobCompletedEvent {
    * half. Billing on the estimate would charge for work that did not happen.
    */
   pageCount: number;
+  /**
+   * Quota units held when this operation was admitted, awaiting settlement.
+   *
+   * The gate that let this operation start wrote a usage row for its estimate,
+   * so that concurrent callers could see the admission before it finished. That
+   * hold is a charge until something nets it against reality — which is what
+   * the meter does with this number and `pageCount`.
+   *
+   * Zero when nothing was held: no quota configured, or no tenant to hold it
+   * against. Settling zero against zero writes nothing, so a listener needs no
+   * special case for it.
+   */
+  reservedUnits: number;
   durationMs: number;
   completedAt: string;
 }
@@ -86,6 +99,19 @@ export interface ProjectSyncEvent {
    * that eventually gets truncated by whatever is logging it.
    */
   scopedPages: number;
+  /**
+   * Quota units held when this operation was admitted, awaiting settlement.
+   *
+   * The gate that let this operation start wrote a usage row for its estimate,
+   * so that concurrent callers could see the admission before it finished. That
+   * hold is a charge until something nets it against reality — which is what
+   * the meter does with this number and `the single unit a sync costs`.
+   *
+   * Zero when nothing was held: no quota configured, or no tenant to hold it
+   * against. Settling zero against zero writes nothing, so a listener needs no
+   * special case for it.
+   */
+  reservedUnits: number;
   syncedAt: string;
 }
 

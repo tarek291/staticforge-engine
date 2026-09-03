@@ -14,7 +14,29 @@ import type { StaticForgePlugin } from "./plugin.js";
  * So consumption is metered from lifecycle events, once the work is finished
  * and its verdict is durable. The ceiling that stops a tenant *starting* work
  * it cannot afford is a separate mechanism, checked before, and it lives in
- * `checkQuota`.
+ * `reserveQuota`.
+ *
+ * ## What changed in Phase 31, and why this plugin now reports negatives
+ *
+ * Retrospective metering alone left a race: nothing was written between a
+ * quota check passing and the work finishing, so every concurrent caller read
+ * the same total and every one of them passed. The gate now *holds* what it
+ * admits — it writes its estimate as a usage row at admission time, so the
+ * next caller's sum can see it.
+ *
+ * That makes this plugin's job subtraction rather than addition. It reports
+ * the difference between what really happened and what was held, so:
+ *
+ * - a run that authored fewer pages than were held reports a **negative**
+ *   amount, giving the excess back;
+ * - a run that **failed** reports the whole hold back, because a failed run
+ *   produced nothing a customer can use and the estimate must not stand;
+ * - a sync, whose estimate is exactly right, reports zero and writes nothing.
+ *
+ * The early returns below are therefore no longer "return without metering".
+ * Each one now has to give a hold back, and the difference matters: skipping
+ * the write would leave an estimate charged for work that never happened,
+ * which is precisely the over-billing this plugin exists to avoid.
  *
  * ## What this plugin cannot promise
  *
@@ -34,8 +56,16 @@ export interface UsageEvent {
   organizationId: string;
   /** Mirrors the `UsageMetric` enum in the schema. */
   metric: "AI_GENERATED_PAGES" | "SYNC_OPERATIONS";
-  /** How many units. */
+  /** How many units the operation really consumed. */
   amount: number;
+  /**
+   * Units already held for it by the quota gate at admission.
+   *
+   * The writer stores the *difference*, so this is what stops an operation
+   * being counted twice — once by the gate that admitted it and once by the
+   * meter that saw it finish.
+   */
+  reservedUnits: number;
   /** What it happened to — a job id, a project id. */
   resourceId: string | null;
 }
@@ -89,28 +119,24 @@ export function createBillingMeterPlugin(
     setup(hooks) {
       hooks.on("afterJobCompleted", async (payload) => {
         if (payload.organizationId === null) {
-          // A local run with no tenant. There is nobody to bill, and inventing
-          // an organization would put the charge on somebody else's invoice.
+          // A local run with no tenant. There is nobody to bill, nothing was
+          // held against anybody, and inventing an organization would put the
+          // charge on somebody else's invoice.
           return;
         }
 
-        if (!payload.ok) {
-          // A failed run produced no pages a customer can use. Metering it
-          // would charge for the engine's own failure, which is the charge
-          // hardest to defend and the easiest to avoid making.
-          return;
-        }
-
-        if (payload.pageCount <= 0) {
-          // A run that wrote nothing — every page cached, resumed or out of
-          // scope. Nothing was authored, so nothing is owed.
-          return;
-        }
+        // A failed run produced no pages a customer can use, and a run that
+        // wrote nothing — every page cached, resumed or out of scope —
+        // authored nothing either. Both are worth zero, and both still have to
+        // be reported, because the hold taken at admission is standing against
+        // the tenant until this says otherwise.
+        const actual = payload.ok ? Math.max(0, payload.pageCount) : 0;
 
         await write({
           organizationId: payload.organizationId,
           metric: USAGE_METRICS.aiGeneratedPages,
-          amount: payload.pageCount,
+          amount: actual,
+          reservedUnits: payload.reservedUnits,
           // The job, not the project. A charge has to be traceable to the run
           // that caused it, and a project accumulates hundreds of them.
           resourceId: payload.jobId,
@@ -122,14 +148,18 @@ export function createBillingMeterPlugin(
           return;
         }
 
-        if (!countUnchangedSyncs && !payload.changed) {
-          return;
-        }
+        // An operator who has turned this off still has a hold to give back,
+        // so this decides the *amount* rather than whether to write. Returning
+        // early here would leave the gate's unit charged for an operation the
+        // operator said not to charge for — the setting would raise the bill
+        // it was set to lower.
+        const actual = !countUnchangedSyncs && !payload.changed ? 0 : 1;
 
         await write({
           organizationId: payload.organizationId,
           metric: USAGE_METRICS.syncOperations,
-          amount: 1,
+          amount: actual,
+          reservedUnits: payload.reservedUnits,
           resourceId: payload.projectId,
         });
       });

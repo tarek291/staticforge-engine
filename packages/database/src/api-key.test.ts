@@ -23,8 +23,23 @@ import {
 
 let prisma: DeepMockProxy<PrismaClient>;
 
+/** Who the tests act as. An OWNER, because minting a key needs `member:manage`. */
+const OWNER = "owner-user";
+
+/** Make the acting principal hold a role, or none at all. */
+function actAs(role: "OWNER" | "EDITOR" | "VIEWER" | null): void {
+  prisma.organizationMember.findUnique.mockResolvedValue(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    role === null ? null : ({ role } as any),
+  );
+}
+
 beforeEach(() => {
   prisma = mockDeep<PrismaClient>();
+  // Phase 31 moved the role check inside these functions, so every call needs a
+  // principal that holds one. Armed as OWNER by default and narrowed per test,
+  // which keeps the tests about key handling rather than about membership.
+  actAs("OWNER");
   // The transaction wrapper runs its callback against the same mock, so the
   // writes inside it are observable.
   prisma.$transaction.mockImplementation(((run: (tx: typeof prisma) => Promise<unknown>) =>
@@ -66,7 +81,7 @@ describe("the plaintext key never reaches the database", () => {
   test("nothing passed to Prisma contains it", async () => {
     armCreate();
 
-    const minted = await generateApiKey("org_1", "CI pipeline", prisma);
+    const minted = await generateApiKey("org_1",OWNER, "CI pipeline", prisma);
 
     // The whole security property, asserted against *every* argument this
     // module handed to the client — not only the one field a reader would think
@@ -77,7 +92,7 @@ describe("the plaintext key never reaches the database", () => {
   test("not even the secret half of it", async () => {
     armCreate();
 
-    const minted = await generateApiKey("org_1", "CI pipeline", prisma);
+    const minted = await generateApiKey("org_1",OWNER, "CI pipeline", prisma);
     const secretPart = minted.plaintext.slice(API_KEY_PREFIX.length);
 
     expect(everythingWritten()).not.toContain(secretPart);
@@ -86,7 +101,7 @@ describe("the plaintext key never reaches the database", () => {
   test("what is stored is the hash of what was returned", async () => {
     armCreate();
 
-    const minted = await generateApiKey("org_1", "CI pipeline", prisma);
+    const minted = await generateApiKey("org_1",OWNER, "CI pipeline", prisma);
     const data = prisma.apiKey.create.mock.calls[0]?.[0]?.data as {
       keyHash: string;
     };
@@ -98,7 +113,7 @@ describe("the plaintext key never reaches the database", () => {
   test("the row that is written has no field for a secret", async () => {
     armCreate();
 
-    await generateApiKey("org_1", "CI pipeline", prisma);
+    await generateApiKey("org_1",OWNER, "CI pipeline", prisma);
     const data = prisma.apiKey.create.mock.calls[0]?.[0]?.data as Record<string, unknown>;
 
     expect(Object.keys(data).sort()).toEqual(["keyHash", "name", "organizationId"]);
@@ -107,7 +122,7 @@ describe("the plaintext key never reaches the database", () => {
   test("the summary handed back to a caller carries no secret", async () => {
     armCreate();
 
-    const minted = await generateApiKey("org_1", "CI pipeline", prisma);
+    const minted = await generateApiKey("org_1",OWNER, "CI pipeline", prisma);
 
     // `plaintext` is a sibling of the record, not part of it, so a route that
     // returns `key` cannot leak the credential by forgetting to strip a field.
@@ -134,7 +149,7 @@ describe("the plaintext key never reaches the database", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ] as any);
 
-    await listApiKeys("org_1", prisma);
+    await listApiKeys("org_1", OWNER, prisma);
 
     const select = prisma.apiKey.findMany.mock.calls[0]?.[0]?.select as Record<
       string,
@@ -151,7 +166,7 @@ describe("a key becomes a member of its organization", () => {
   test("the membership is written with the key", async () => {
     armCreate("key_9", "org_7");
 
-    await generateApiKey("org_7", "CI pipeline", prisma);
+    await generateApiKey("org_7", OWNER, "CI pipeline", prisma);
 
     expect(prisma.organizationMember.create).toHaveBeenCalledWith({
       data: { organizationId: "org_7", userId: "apikey:key_9", role: "EDITOR" },
@@ -161,7 +176,7 @@ describe("a key becomes a member of its organization", () => {
   test("the machine principal gets a User row, or the foreign key refuses it", async () => {
     armCreate("key_9", "org_7");
 
-    await generateApiKey("org_7", "CI pipeline", prisma);
+    await generateApiKey("org_7", OWNER, "CI pipeline", prisma);
 
     // Phase 27 made `OrganizationMember.userId` a real foreign key. Without
     // this row the membership is refused and minting fails outright — which is
@@ -181,7 +196,7 @@ describe("a key becomes a member of its organization", () => {
   test("the user is written before the membership that points at it", async () => {
     armCreate();
 
-    await generateApiKey("org_1", "CI pipeline", prisma);
+    await generateApiKey("org_1",OWNER, "CI pipeline", prisma);
 
     expect(prisma.user.create).toHaveBeenCalled();
     expect(prisma.organizationMember.create).toHaveBeenCalled();
@@ -193,7 +208,7 @@ describe("a key becomes a member of its organization", () => {
   test("both writes are in one transaction", async () => {
     armCreate();
 
-    await generateApiKey("org_1", "CI pipeline", prisma);
+    await generateApiKey("org_1",OWNER, "CI pipeline", prisma);
 
     // A key with no membership would authenticate and then be refused
     // everything, which reads to an operator as a permissions bug rather than
@@ -204,7 +219,7 @@ describe("a key becomes a member of its organization", () => {
   test("EDITOR by default, so a leaked key cannot mint its successors", async () => {
     armCreate();
 
-    await generateApiKey("org_1", "CI pipeline", prisma);
+    await generateApiKey("org_1",OWNER, "CI pipeline", prisma);
     const data = prisma.organizationMember.create.mock.calls[0]?.[0]?.data as {
       role: string;
     };
@@ -217,7 +232,7 @@ describe("a key becomes a member of its organization", () => {
   test("the role is overridable for a read-only integration", async () => {
     armCreate();
 
-    await generateApiKey("org_1", "Status page", prisma, { role: "VIEWER" });
+    await generateApiKey("org_1",OWNER, "Status page", prisma, { role: "VIEWER" });
     const data = prisma.organizationMember.create.mock.calls[0]?.[0]?.data as {
       role: string;
     };
@@ -323,7 +338,7 @@ describe("revoking a key", () => {
   test("it is scoped to the organization, not only the key id", async () => {
     armExisting(null);
 
-    await revokeApiKey("key_1", "org_1", prisma);
+    await revokeApiKey("key_1", "org_1", OWNER, prisma);
 
     // Holding a key id must not be enough to turn off another tenant's
     // credential — or to learn that it is real.
@@ -336,7 +351,7 @@ describe("revoking a key", () => {
   test("another organization's key is simply not found", async () => {
     armExisting(null);
 
-    expect(await revokeApiKey("key_1", "other_org", prisma)).toBeNull();
+    expect(await revokeApiKey("key_1", "other_org", OWNER, prisma)).toBeNull();
     expect(prisma.apiKey.update).not.toHaveBeenCalled();
   });
 
@@ -359,7 +374,7 @@ describe("revoking a key", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     prisma.organizationMember.deleteMany.mockResolvedValue({ count: 1 } as any);
 
-    const revoked = await revokeApiKey("key_1", "org_1", prisma);
+    const revoked = await revokeApiKey("key_1", "org_1", OWNER, prisma);
 
     // The audit trail still needs to say which key did something last month and
     // when it was turned off. A deleted row takes that answer with it.
@@ -387,7 +402,7 @@ describe("revoking a key", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     prisma.organizationMember.deleteMany.mockResolvedValue({ count: 1 } as any);
 
-    await revokeApiKey("key_1", "org_1", prisma);
+    await revokeApiKey("key_1", "org_1", OWNER, prisma);
 
     expect(prisma.organizationMember.deleteMany).toHaveBeenCalledWith({
       where: { organizationId: "org_1", userId: "apikey:key_1" },
@@ -404,7 +419,7 @@ describe("revoking a key", () => {
       revokedAt: alreadyRevoked,
     });
 
-    const result = await revokeApiKey("key_1", "org_1", prisma);
+    const result = await revokeApiKey("key_1", "org_1", OWNER, prisma);
 
     // When it stopped working is a fact, and the second call did not change it.
     expect(result?.revokedAt).toBe(alreadyRevoked.toISOString());
@@ -418,7 +433,7 @@ describe("listing keys", () => {
   });
 
   test("every read is scoped to one organization", async () => {
-    await listApiKeys("org_1", prisma);
+    await listApiKeys("org_1", OWNER, prisma);
 
     // There is deliberately no unscoped variant: a listing that spanned
     // organizations would be a map of every tenant's credentials.
@@ -428,7 +443,7 @@ describe("listing keys", () => {
   });
 
   test("revoked keys are included by default", async () => {
-    await listApiKeys("org_1", prisma);
+    await listApiKeys("org_1", OWNER, prisma);
 
     // Part of the answer to "who had access", which is the question this list
     // exists for.
@@ -438,7 +453,7 @@ describe("listing keys", () => {
   });
 
   test("they can be filtered out when only live access matters", async () => {
-    await listApiKeys("org_1", prisma, { activeOnly: true });
+    await listApiKeys("org_1", OWNER, prisma, { activeOnly: true });
 
     expect(prisma.apiKey.findMany.mock.calls[0]?.[0]?.where).toEqual({
       organizationId: "org_1",

@@ -8,7 +8,7 @@ import {
   type OrgRoleName,
 } from "@staticforge/core";
 
-import { organizationOfProject } from "./access.js";
+import { organizationOfProject, requireCapability } from "./access.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -112,19 +112,32 @@ export interface GenerateApiKeyOptions {
  * rather than as the half-finished write it is.
  *
  * @param organizationId - The organization this key acts as.
+ * @param actingUserId - Who is minting it. Required, not optional: an optional
+ * identity is one a caller omits, and the caller that omits it is the route
+ * somebody adds in a hurry.
  * @param name - What it is for, in the operator's words.
  * @param prisma - The client to write with.
  * @param options - Role.
  * @returns The stored record and the plaintext, once.
+ * @throws {AccessDeniedError} Unless the caller holds `member:manage` — OWNER.
+ * A key is an access grant, so issuing one is managing membership by another
+ * name, and an EDITOR who could mint an OWNER key would hold OWNER.
  * @throws If the organization does not exist — the foreign key refuses it,
  * rather than leaving a key that authenticates as nobody.
  */
 export async function generateApiKey(
   organizationId: string,
+  actingUserId: string,
   name: string,
   prisma: PrismaClient,
   options: GenerateApiKeyOptions = {},
 ): Promise<MintedApiKey> {
+  // First line, before anything is generated. Phase 29 put this check in the
+  // routes and left the function itself open, which made the whole model rest
+  // on every future caller remembering — and the one that forgets mints an
+  // OWNER credential.
+  await requireCapability(organizationId, actingUserId, "member:manage", prisma);
+
   const plaintext = generateApiKeySecret();
   const keyHash = hashApiKey(plaintext);
   const role: OrgRoleName = options.role ?? "EDITOR";
@@ -247,14 +260,21 @@ export async function verifyApiKey(
  * The membership row is deleted rather than left behind — a principal that can
  * never authenticate again should not still appear in a list of who has access.
  *
+ * @param actingUserId - Who is revoking it.
  * @returns The updated summary, or `null` when no such key belongs to that
  * organization.
+ * @throws {AccessDeniedError} Unless the caller holds `member:manage`. Revoking
+ * is the other half of issuing: an EDITOR who could turn off the OWNER's
+ * integration key holds a lever over the organization it does not own.
  */
 export async function revokeApiKey(
   apiKeyId: string,
   organizationId: string,
+  actingUserId: string,
   prisma: PrismaClient,
 ): Promise<ApiKeySummary | null> {
+  await requireCapability(organizationId, actingUserId, "member:manage", prisma);
+
   return withDbRetry(() =>
     prisma.$transaction(async (tx) => {
       const existing = await tx.apiKey.findFirst({
@@ -306,12 +326,20 @@ export async function revokeApiKey(
  *
  * Revoked keys are included by default. A key that was turned off is part of
  * the answer to "who had access", which is the question this list exists for.
+ *
+ * @throws {AccessDeniedError} Unless the caller holds `member:manage`. This
+ * listing is the organization's access-control list: which integrations exist,
+ * when they were issued, which were withdrawn. It carries no secret and it is
+ * still not something a VIEWER should be able to enumerate.
  */
 export async function listApiKeys(
   organizationId: string,
+  actingUserId: string,
   prisma: PrismaClient,
   options: { activeOnly?: boolean } = {},
 ): Promise<ApiKeySummary[]> {
+  await requireCapability(organizationId, actingUserId, "member:manage", prisma);
+
   const rows = await withDbRetry(() =>
     prisma.apiKey.findMany({
       where: {

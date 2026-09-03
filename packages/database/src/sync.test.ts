@@ -1,6 +1,8 @@
 import type { PrismaClient } from "@prisma/client";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { mockDeep, type DeepMockProxy } from "vitest-mock-extended";
+
+import { armQuotaGate, holdsWritten } from "./quota.fixtures.js";
 import type { Location, Service } from "@staticforge/schemas";
 
 import {
@@ -37,6 +39,9 @@ beforeEach(() => {
   // access, and an unarmed membership would make every one of them fail for the
   // wrong reason.
   armRole("OWNER");
+  // No quota configured, which is what every suite outside the quota one
+  // assumes. The quota tests arm their own.
+  armQuotaGate(prisma, { limit: null });
 });
 
 /** Arm the membership lookup the authorisation gate reads. */
@@ -944,13 +949,8 @@ describe("an EDITOR may sync", () => {
  */
 describe("an exhausted quota refuses a sync", () => {
   /** Arm the quota row and the usage sum behind it. */
-  function armQuota(limit: number, used: number): void {
-    prisma.organizationQuota.findUnique.mockResolvedValue(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      { limit, resetDate: new Date(Date.now() - 3600_000) } as any,
-    );
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    prisma.usageRecord.aggregate.mockResolvedValue({ _sum: { amount: used } } as any);
+  function armQuota(limit: number | null, used = 0): void {
+    armQuotaGate(prisma, { limit, used });
   }
 
   test("syncProject throws QuotaExceeded when there is no allowance left", async () => {
@@ -1022,7 +1022,7 @@ describe("an exhausted quota refuses a sync", () => {
     // A caller who may not touch this project at all should learn that, not
     // learn how much quota the organization has left.
     expect(error?.name).toBe("AccessDeniedError");
-    expect(prisma.organizationQuota.findUnique).not.toHaveBeenCalled();
+    expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
   });
 
   test("a dry run is not refused, because it is not metered", async () => {
@@ -1044,7 +1044,10 @@ describe("an exhausted quota refuses a sync", () => {
     );
 
     expect(result?.changed).toBe(true);
-    expect(prisma.organizationQuota.findUnique).not.toHaveBeenCalled();
+    expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
+    // And nothing was held either, so a dry run cannot be used to drain a
+    // tenant's allowance by asking what a sheet would do.
+    expect(prisma.usageRecord.create).not.toHaveBeenCalled();
   });
 
   test("room left lets the sync through", async () => {
@@ -1088,7 +1091,7 @@ describe("an exhausted quota refuses a sync", () => {
       },
     ]);
     armRole("EDITOR");
-    prisma.organizationQuota.findUnique.mockResolvedValue(null as never);
+    armQuota(null);
 
     // Quotas are opt-in. Every tenant that existed before this table did must
     // keep working.
@@ -1113,11 +1116,43 @@ describe("an exhausted quota refuses a sync", () => {
       enqueueJob: vi.fn().mockResolvedValue("job_1"),
     });
 
-    expect(prisma.organizationQuota.findUnique.mock.calls[0]?.[0]?.where).toEqual({
-      organizationId_metric: {
+    // One unit held, whatever the sync touched. A sync is one operation
+    // whether it changes nothing or five hundred pages.
+    expect(holdsWritten(prisma)).toEqual([
+      {
         organizationId: "org-1",
         metric: "SYNC_OPERATIONS",
+        amount: 1,
+        resourceId: "prj_1",
       },
+    ]);
+  });
+
+  test("the gate holds the unit it admits, so concurrent syncs cannot all pass", async () => {
+    armTwoServiceProject();
+    armPageTable([]);
+    armRole("EDITOR");
+    armQuota(100, 0);
+
+    await syncProject("prj_1", "editor-user", editFirstService(), prisma, {
+      enqueueJob: vi.fn().mockResolvedValue("job_1"),
     });
+
+    // The write is the whole fix. Checking without writing leaves nothing for
+    // the next caller's sum to find, so serialising the checks would change
+    // their order and not their answer — and all of them would still pass.
+    expect(prisma.usageRecord.create).toHaveBeenCalledTimes(1);
+  });
+
+  test("a refused sync holds nothing", async () => {
+    armTwoServiceProject();
+    armRole("EDITOR");
+    armQuota(5, 5);
+
+    await syncProject("prj_1", "editor-user", editFirstService(), prisma, {
+      enqueueJob: vi.fn(),
+    }).catch(() => undefined);
+
+    expect(prisma.usageRecord.create).not.toHaveBeenCalled();
   });
 });

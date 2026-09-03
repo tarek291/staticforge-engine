@@ -15,6 +15,7 @@ import {
   type UsageWriter,
 } from "@staticforge/core";
 
+import { installCrashGuard } from "./crash-guard.js";
 import { runEngine } from "./run-engine.js";
 import {
   startWorker,
@@ -192,14 +193,27 @@ export async function startDatabaseWorker(
   const deps = await createWorkerDeps();
   const log = options.log ?? (() => {});
 
+  // Installed before any plugin can start a promise. The bus abandons listeners
+  // that overrun its deadline and never sees the ones a plugin fires without
+  // awaiting, so a detached rejection would otherwise end this process — taking
+  // a half-finished paid build with it, on every worker at once, because they
+  // are all running the same plugin.
+  installCrashGuard({ log });
+
   // Built here, in the composition root, and handed to the plugin rather than
   // reached for by it.
-  const { createAuditWriter, prisma, recordUsage } = await import(
+  const { createAuditWriter, prisma, settleQuotaReservation } = await import(
     "@staticforge/database"
   );
   const auditWriter = createAuditWriter(prisma);
-  const usageWriter: UsageWriter = async (event) => {
-    await recordUsage(event, prisma);
+
+  // Settles rather than records. The quota gate held an estimate when this work
+  // was admitted, so writing the true figure on top of it would count the
+  // operation twice; what goes in the ledger is the difference, which is
+  // negative when a run authored less than it held and zero when the estimate
+  // was exact.
+  const usageWriter: UsageWriter = async ({ reservedUnits, ...event }) => {
+    await settleQuotaReservation(event, reservedUnits, prisma);
   };
 
   return startWorker(
@@ -216,5 +230,6 @@ export async function startDatabaseWorker(
   );
 }
 
+export * from "./crash-guard.js";
 export * from "./worker.js";
 export * from "./run-engine.js";

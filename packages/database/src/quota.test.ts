@@ -325,6 +325,7 @@ describe("setting a quota", () => {
 
     await setQuota(
       { organizationId: "org_1", metric: "AI_GENERATED_PAGES", limit: 500 },
+      "local-operator",
       prisma,
     );
 

@@ -10,6 +10,7 @@ import type {
   Service,
 } from "@staticforge/schemas";
 
+import { organizationOfProject, requireCapability } from "./access.js";
 import { projectVisibleTo } from "./scope.js";
 import { withDbRetry } from "./retry.js";
 
@@ -430,6 +431,16 @@ export async function saveGeneratedPages(
   prisma: PrismaClient,
   options: SaveGeneratedPagesOptions = {},
 ): Promise<SaveGeneratedPagesResult> {
+  // The role check, before the transaction rather than inside a caller. This
+  // function replaces every page a project has; the ownership proof inside the
+  // transaction establishes *reachability*, and reachability is not permission
+  // — a VIEWER can reach a project and must not be able to rewrite its site.
+  const organizationId = await organizationOfProject(projectId, prisma);
+
+  if (organizationId !== null) {
+    await requireCapability(organizationId, userId, "project:write", prisma);
+  }
+
   const source: PageSource = options.source ?? "TEMPLATE";
   const slugs = pages.map((page) => page.slug);
 

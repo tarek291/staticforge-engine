@@ -24,8 +24,15 @@ import {
 
 let prisma: DeepMockProxy<PrismaClient>;
 
+/** Who the tests read as. An OWNER: the trail needs `member:manage`. */
+const OWNER = "owner-user";
+
 beforeEach(() => {
   prisma = mockDeep<PrismaClient>();
+  // Phase 31 put the role check inside `listAuditEvents`, so a reader needs a
+  // role. Armed as OWNER by default; the refusal is tested on its own.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  prisma.organizationMember.findUnique.mockResolvedValue({ role: "OWNER" } as any);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   prisma.auditLog.create.mockResolvedValue({ id: "audit_1" } as any);
 });
@@ -93,7 +100,7 @@ describe("a record becomes a row", () => {
     prisma.auditLog.findMany.mockResolvedValue([]);
 
     await recordAuditEvent(RECORD, prisma);
-    await listAuditEvents("org_1", prisma);
+    await listAuditEvents("org_1", OWNER, prisma);
 
     // Append-only by construction. A trail the acting credential can edit is a
     // trail that answers whatever the last writer wanted it to.
@@ -120,6 +127,7 @@ describe("the plugin's records reach the table through the injected writer", () 
       exitCode: 0,
       resumed: false,
       pageCount: 9,
+      reservedUnits: 1,
       durationMs: 1000,
       completedAt: "2026-08-28T00:00:00.000Z",
     });
@@ -153,6 +161,7 @@ describe("the plugin's records reach the table through the injected writer", () 
       locationsUpdated: 0,
       locationsRemoved: 0,
       scopedPages: 3,
+    reservedUnits: 1,
       syncedAt: "2026-08-28T00:00:00.000Z",
     });
 
@@ -178,7 +187,7 @@ describe("reading a trail cannot cross a tenant", () => {
   }
 
   test("every read is scoped to one organization", async () => {
-    await listAuditEvents("org_1", prisma);
+    await listAuditEvents("org_1", OWNER, prisma);
 
     // There is deliberately no unscoped read in this module. The first
     // convenience function returning "all recent activity" is the one that ends
@@ -187,7 +196,7 @@ describe("reading a trail cannot cross a tenant", () => {
   });
 
   test("filters narrow the scope, they never replace it", async () => {
-    await listAuditEvents("org_1", prisma, {
+    await listAuditEvents("org_1", OWNER, prisma, {
       action: "job.completed",
       resourceId: "job_7",
     });
@@ -200,7 +209,7 @@ describe("reading a trail cannot cross a tenant", () => {
   });
 
   test("newest first", async () => {
-    await listAuditEvents("org_1", prisma);
+    await listAuditEvents("org_1", OWNER, prisma);
 
     const call = prisma.auditLog.findMany.mock.calls[0]?.[0] as { orderBy: unknown };
 
@@ -208,13 +217,13 @@ describe("reading a trail cannot cross a tenant", () => {
   });
 
   test("an absurd page size is capped rather than honoured", async () => {
-    await listAuditEvents("org_1", prisma, { limit: 100_000 });
+    await listAuditEvents("org_1", OWNER, prisma, { limit: 100_000 });
 
     expect(readArgs().take).toBe(MAX_AUDIT_PAGE);
   });
 
   test("a nonsense page size falls back to something renderable", async () => {
-    await listAuditEvents("org_1", prisma, { limit: 0 });
+    await listAuditEvents("org_1", OWNER, prisma, { limit: 0 });
     expect(readArgs().take).toBeGreaterThan(0);
   });
 
@@ -232,7 +241,7 @@ describe("reading a trail cannot cross a tenant", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ] as any);
 
-    const [entry] = await listAuditEvents("org_1", prisma);
+    const [entry] = await listAuditEvents("org_1", OWNER, prisma);
 
     expect(entry?.details).toEqual({});
     expect(entry?.createdAt).toBe("2026-08-28T00:00:00.000Z");

@@ -202,6 +202,22 @@ model GenerationJob {
   /// without reading the log.
   failedCount Int @default(0)
 
+  /// Quota units held for this run when it was admitted.
+  ///
+  /// Written by the atomic gate in `reserveQuota`, in the same transaction that
+  /// created this row, so a concurrent caller's quota check sees the hold
+  /// immediately. It is a *hold*, not a charge: the meter nets the real page
+  /// count against it when the run finishes, and a run that fails or authors
+  /// nothing writes the whole amount back as a refund.
+  ///
+  /// It has to live on the row because the two halves happen in different
+  /// processes — the API admits the job, the worker completes it — so there is
+  /// nowhere else the number can be waiting when the refund is due.
+  ///
+  /// Zero for a job admitted with no quota configured, where nothing was held
+  /// and nothing is owed back.
+  reservedUnits Int @default(0)
+
   /// Which server instance claimed this job, and until when that claim holds.
   ///
   /// A job row outlives the process updating it, so "RUNNING" alone cannot mean
@@ -336,8 +352,8 @@ model Business {
   /// is validated with `.uuid()`.
   id String @id @default(uuid()) @db.Uuid
 
-  name String
-  slug String
+  name        String
+  slug        String
   /// 50–500 characters, per `BusinessSchema`.
   description String
   niche       Niche
@@ -371,7 +387,7 @@ model ContentTemplate {
   heroTitleTemplate    String
   heroSubtitleTemplate String
 
-  ctaPrimary String
+  ctaPrimary   String
   /// Label for the optional secondary CTA. Empty string means "no secondary".
   ctaSecondary String @default("")
 
@@ -559,8 +575,11 @@ model Organization {
   workspaces Workspace[]
   projects   Project[]
   apiKeys    ApiKey[]
-  usage      UsageRecord[]
   quotas     OrganizationQuota[]
+
+  /// No `usage UsageRecord[]` here, deliberately. Restoring that back-relation
+  /// reintroduces the foreign key — and with it a delete that empties the
+  /// billing ledger. Usage is queried by `organizationId` directly.
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -788,11 +807,27 @@ enum UsageMetric {
 /// somebody can edit is a usage table a customer is right to distrust — and
 /// because two writers updating one running total is the race the token bucket
 /// needed raw SQL to avoid.
+///
+/// ## Why there is no relation to Organization
+///
+/// There was one, with `onDelete: Cascade`, and it meant that deleting an
+/// organization silently erased every record of what it had consumed. The
+/// last month of an account that churns is exactly the month nobody has
+/// invoiced yet, so the cascade destroyed revenue and left no trace that
+/// anything had been destroyed — a `DELETE` on one table quietly emptying the
+/// billing ledger of another.
+///
+/// So the column is a plain `String`, the same shape `AuditLog` uses and for
+/// the same reason: a financial record must outlive its subject. The trade is
+/// that nothing enforces the id still resolves, which is correct here — an
+/// invoice for a closed account has to remain explicable after the account is
+/// gone. Reaping these rows is a deliberate retention decision somebody makes
+/// on a schedule, not a side effect of a customer pressing Delete.
 model UsageRecord {
   id String @id @default(cuid())
 
+  /// Not a foreign key. See the note above: billing outlives the tenant.
   organizationId String
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   metric UsageMetric
 
