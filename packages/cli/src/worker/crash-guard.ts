@@ -50,6 +50,50 @@
  * guessing.
  */
 
+/**
+ * Render a rejection reason as text that cannot itself throw.
+ *
+ * `String(value)` is not total. `String(Object.create(null))` throws, because
+ * the object has no prototype and therefore no `toString`; so does anything
+ * whose `toString` or `Symbol.toPrimitive` throws, and reading `.message` off a
+ * getter that throws does the same.
+ *
+ * Ordinarily that would be a cosmetic bug in a log line. Here it is not: this
+ * runs *inside* the `unhandledRejection` handler, and a throw from inside that
+ * handler is an uncaught exception — which terminates the process. The guard
+ * installed to stop a worker dying on a rejected promise would be the thing
+ * that killed it, on exactly the malformed rejection it was there to absorb.
+ *
+ * So the formatting is wrapped, and the fallback is a fixed string with nothing
+ * derived from the value in it. Anything derived could throw for the same
+ * reason the first attempt did.
+ */
+function describe(reason: unknown): string {
+  try {
+    if (reason instanceof Error) {
+      // Both fields, separately: `name` and `message` are ordinary properties
+      // and either can be a getter, so one throwing must not lose the other.
+      const name = safely(() => String(reason.name)) ?? "Error";
+      const message = safely(() => String(reason.message)) ?? "(unreadable message)";
+
+      return `${name}: ${message}`;
+    }
+
+    return String(reason);
+  } catch {
+    return "(a rejection value that cannot be converted to text)";
+  }
+}
+
+/** Run a formatter, or give up on it. */
+function safely(render: () => string): string | undefined {
+  try {
+    return render();
+  } catch {
+    return undefined;
+  }
+}
+
 /** How many detached rejections are absorbed before the worker gives up. */
 export const REJECTION_BUDGET = 20;
 
@@ -116,10 +160,7 @@ export function installCrashGuard(options: CrashGuardOptions): CrashGuard {
 
     absorbed += 1;
 
-    const described =
-      reason instanceof Error
-        ? `${reason.name}: ${reason.message}`
-        : String(reason);
+    const described = describe(reason);
 
     log(
       `  ! unhandled rejection absorbed (${absorbed}/${budget} this minute): ${described}`,

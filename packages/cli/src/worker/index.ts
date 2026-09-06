@@ -202,9 +202,8 @@ export async function startDatabaseWorker(
 
   // Built here, in the composition root, and handed to the plugin rather than
   // reached for by it.
-  const { createAuditWriter, prisma, settleQuotaReservation } = await import(
-    "@staticforge/database"
-  );
+  const { createAuditWriter, prisma, reconcileStrandedHolds, settleUsageEvent } =
+    await import("@staticforge/database");
   const auditWriter = createAuditWriter(prisma);
 
   // Settles rather than records. The quota gate held an estimate when this work
@@ -212,12 +211,22 @@ export async function startDatabaseWorker(
   // operation twice; what goes in the ledger is the difference, which is
   // negative when a run authored less than it held and zero when the estimate
   // was exact.
-  const usageWriter: UsageWriter = async ({ reservedUnits, ...event }) => {
-    await settleQuotaReservation(event, reservedUnits, prisma);
+  //
+  // For a job the adjustment and the `settledAt` stamp commit together, which
+  // makes this idempotent: if the reconciler below has already given the hold
+  // back, this writes nothing rather than crediting the tenant twice.
+  const usageWriter: UsageWriter = async (event) => {
+    await settleUsageEvent(event, prisma);
   };
 
   return startWorker(
-    deps,
+    {
+      ...deps,
+      // The safety net under the line above. The bus is best-effort by design,
+      // so a settlement can be lost; this finds finished jobs still holding
+      // units and gives them back on the next idle tick.
+      reconcileHolds: () => reconcileStrandedHolds(prisma),
+    },
     {
       ...options,
       instanceId: options.instanceId ?? workerInstanceId(),

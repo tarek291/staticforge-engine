@@ -9,7 +9,7 @@ import type { Location, Service } from "@staticforge/schemas";
 
 import { requireCapability } from "./access.js";
 import { affectedSlugs, findAffectedPages } from "./impact.js";
-import { requireQuotaReservation } from "./quota.js";
+import { recordUsage, requireQuotaReservation } from "./quota.js";
 import { withDbRetry } from "./retry.js";
 
 /**
@@ -486,14 +486,39 @@ export async function syncProject(
   // unit is also the exact charge — a sync is one operation whatever it finds
   // — so the hold and the settlement are equal and the ledger ends with the
   // single row it always had.
+  //
+  // ## Why this needs its own transaction
+  //
+  // `reserveQuota` is three statements: lock the quota row `FOR UPDATE`, sum
+  // usage, insert the hold. Run against the base client each of those is its
+  // own implicit transaction — so the lock is taken and **released on the same
+  // statement that took it**, before the sum has even been sent.
+  //
+  // That is not a weaker guarantee, it is no guarantee. Two concurrent syncs
+  // each lock-and-release, each read the same total, and each insert: exactly
+  // the race the lock was added to close, with a `FOR UPDATE` sitting in the
+  // SQL looking like it was doing something. `enqueueJob` never had this
+  // because its reservation shares the transaction that writes the job row;
+  // this path had no transaction to share, so it needs one of its own.
+  //
+  // It is deliberately *not* folded into the write transaction further down.
+  // Two reasons: the gate must run before the impact query — a tenant out of
+  // allowance should not get to keep asking which of its pages would change —
+  // and the unchanged path returns before that transaction exists while still
+  // owing its unit, because a sync is one operation whether or not it finds
+  // anything.
   const reservation =
     (options.enqueue ?? true)
-      ? await requireQuotaReservation(
-          snapshot.organizationId,
-          "SYNC_OPERATIONS",
-          1,
-          prisma,
-          projectId,
+      ? await withDbRetry(() =>
+          prisma.$transaction((tx) =>
+            requireQuotaReservation(
+              snapshot.organizationId,
+              "SYNC_OPERATIONS",
+              1,
+              tx,
+              projectId,
+            ),
+          ),
         )
       : { reserved: 0 };
 
@@ -554,77 +579,102 @@ export async function syncProject(
     };
   }
 
-  await withDbRetry(() =>
-    prisma.$transaction(async (tx) => {
-      // Ownership again, inside the transaction. The snapshot proved it a
-      // moment ago; a check before a transaction is a check with a window.
-      const owned = await tx.project.findFirst({
-        where: { id: projectId, userId },
-        select: { id: true },
-      });
-
-      if (owned === null) {
-        throw new Error(`Project "${projectId}": not found.`);
-      }
-
-      if (payload.services !== undefined) {
-        const keep = payload.services.map((service: Service) => service.id);
-
-        await tx.service.deleteMany({
-          where: { projectId, id: { notIn: keep } },
+  // Refunded if this throws. Every path that *returns* announces itself, and
+  // announcing is what settles the hold — so a throw is the one way out of this
+  // function that leaves a unit charged for a sync that did not happen.
+  try {
+    await withDbRetry(() =>
+      prisma.$transaction(async (tx) => {
+        // Ownership again, inside the transaction. The snapshot proved it a
+        // moment ago; a check before a transaction is a check with a window.
+        const owned = await tx.project.findFirst({
+          where: { id: projectId, userId },
+          select: { id: true },
         });
 
-        for (const service of payload.services) {
-          const fields = {
-            name: service.name,
-            slug: service.slug,
-            description: service.description,
-            benefits: service.benefits,
-            priceFrom: service.pricing?.from ?? null,
-            priceTo: service.pricing?.to ?? null,
-            priceCurrency: service.pricing?.currency ?? null,
-            templateId: service.templateId ?? null,
-            contentProfileId: service.contentProfileId ?? null,
-          };
-
-          await tx.service.upsert({
-            where: { id: service.id },
-            create: { id: service.id, projectId, ...fields },
-            update: fields,
-          });
+        if (owned === null) {
+          throw new Error(`Project "${projectId}": not found.`);
         }
-      }
 
-      if (payload.locations !== undefined) {
-        const keep = payload.locations.map((location: Location) => location.id);
+        if (payload.services !== undefined) {
+          const keep = payload.services.map((service: Service) => service.id);
 
-        await tx.location.deleteMany({
-          where: { projectId, id: { notIn: keep } },
-        });
-
-        for (const location of payload.locations) {
-          const fields = {
-            // A location's display name is not part of the sync contract, so it
-            // tracks the city rather than being invented or left stale.
-            name: location.city,
-            slug: location.id,
-            city: location.city,
-            state: location.state,
-            country: location.country,
-            postalCode: location.postalCode ?? null,
-            latitude: location.coordinates?.lat ?? null,
-            longitude: location.coordinates?.lng ?? null,
-          };
-
-          await tx.location.upsert({
-            where: { id: location.id },
-            create: { id: location.id, projectId, ...fields },
-            update: fields,
+          await tx.service.deleteMany({
+            where: { projectId, id: { notIn: keep } },
           });
+
+          for (const service of payload.services) {
+            const fields = {
+              name: service.name,
+              slug: service.slug,
+              description: service.description,
+              benefits: service.benefits,
+              priceFrom: service.pricing?.from ?? null,
+              priceTo: service.pricing?.to ?? null,
+              priceCurrency: service.pricing?.currency ?? null,
+              templateId: service.templateId ?? null,
+              contentProfileId: service.contentProfileId ?? null,
+            };
+
+            await tx.service.upsert({
+              where: { id: service.id },
+              create: { id: service.id, projectId, ...fields },
+              update: fields,
+            });
+          }
         }
-      }
-    }),
-  );
+
+        if (payload.locations !== undefined) {
+          const keep = payload.locations.map((location: Location) => location.id);
+
+          await tx.location.deleteMany({
+            where: { projectId, id: { notIn: keep } },
+          });
+
+          for (const location of payload.locations) {
+            const fields = {
+              // A location's display name is not part of the sync contract, so it
+              // tracks the city rather than being invented or left stale.
+              name: location.city,
+              slug: location.id,
+              city: location.city,
+              state: location.state,
+              country: location.country,
+              postalCode: location.postalCode ?? null,
+              latitude: location.coordinates?.lat ?? null,
+              longitude: location.coordinates?.lng ?? null,
+            };
+
+            await tx.location.upsert({
+              where: { id: location.id },
+              create: { id: location.id, projectId, ...fields },
+              update: fields,
+            });
+          }
+        }
+      }),
+    );
+  } catch (error: unknown) {
+    // A negative row rather than a deletion: the ledger is append-only, and a
+    // charge has to stay readable next to its correction.
+    //
+    // Best-effort, and swallowed deliberately. The refund failing is a smaller
+    // problem than the write failing, and letting it replace the original error
+    // would hide the cause of the outage behind a billing footnote.
+    if (reservation.reserved > 0) {
+      await recordUsage(
+        {
+          organizationId: snapshot.organizationId,
+          metric: "SYNC_OPERATIONS",
+          amount: -reservation.reserved,
+          resourceId: projectId,
+        },
+        prisma,
+      ).catch(() => undefined);
+    }
+
+    throw error;
+  }
 
   if (options.enqueueJob === undefined) {
     // The data was applied, but this caller supplied no way to queue a run.

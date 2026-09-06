@@ -4,7 +4,11 @@ import { mockDeep, type DeepMockProxy } from "vitest-mock-extended";
 
 import { generateApiKey, listApiKeys, revokeApiKey } from "./api-key.js";
 import { listAuditEvents } from "./audit.js";
-import { PLATFORM_OPERATOR_ENV_VAR, isPlatformOperator } from "./platform.js";
+import {
+  PLATFORM_OPERATOR_ENV_VAR,
+  isPlatformOperator,
+  requirePlatformOperator,
+} from "./platform.js";
 import { setQuota } from "./quota.js";
 import { armQuotaGate } from "./quota.fixtures.js";
 import { saveRefreshedPage } from "./tenant.js";
@@ -232,6 +236,84 @@ describe("a quota is not something the tenant it bills can raise", () => {
     ).toBe(true);
   });
 
+  test("production with no configured operator has no platform operator", () => {
+    // The fallback used to apply everywhere: an unset variable meant
+    // `"local-operator"`, which is the identity the CLI runs as and the OWNER
+    // the seed installs — a guessable constant holding platform authority.
+    //
+    // Nothing reachable over HTTP can currently *be* that string, so this was
+    // not an open door. It was a door held shut by facts about other modules,
+    // and the list of ways a `userId` gets set is exactly the list of things
+    // that change.
+    expect(
+      isPlatformOperator("local-operator", { NODE_ENV: "production" }),
+    ).toBe(false);
+  });
+
+  test("production with an operator named accepts exactly that one", () => {
+    const env = { NODE_ENV: "production", [PLATFORM_OPERATOR_ENV_VAR]: "ops-alice" };
+
+    expect(isPlatformOperator("ops-alice", env)).toBe(true);
+    expect(isPlatformOperator("local-operator", env)).toBe(false);
+  });
+
+  test("a laptop keeps the default, so the seed runs without ceremony", () => {
+    // The alternative is a required variable with an obvious value, which is a
+    // variable that gets exported in a shell profile and then copied into
+    // production.
+    expect(isPlatformOperator("local-operator", { NODE_ENV: "development" })).toBe(
+      true,
+    );
+    expect(isPlatformOperator("local-operator", {})).toBe(true);
+  });
+
+  test("a lost NODE_ENV gets the stricter behaviour, not the looser one", () => {
+    // Anything that is not literally "production" is development. That reads
+    // backwards until you ask which way it fails: the opposite default would
+    // hand the fallback to exactly the deployment careless enough to misspell
+    // its own environment.
+    expect(
+      isPlatformOperator("local-operator", { NODE_ENV: "Production" }),
+    ).toBe(true);
+  });
+
+  test("the refusal names the missing variable when there is no operator", () => {
+    // Only when there genuinely is none. A fail-closed default that refuses
+    // without saying why is a fail-closed outage: an operator stares at
+    // "not the platform operator" with no idea that the answer is a variable
+    // nobody set.
+    const refused = ((): { detail?: string } | null => {
+      try {
+        requirePlatformOperator("local-operator", { NODE_ENV: "production" });
+
+        return null;
+      } catch (error: unknown) {
+        return error as { detail?: string };
+      }
+    })();
+
+    expect(refused?.detail ?? "").toMatch(/no platform operator is configured/i);
+    expect(refused?.detail ?? "").toContain(PLATFORM_OPERATOR_ENV_VAR);
+  });
+
+  test("a configured deployment does not blame the variable", () => {
+    const refused = ((): { detail?: string } | null => {
+      try {
+        requirePlatformOperator("someone-else", {
+          NODE_ENV: "production",
+          [PLATFORM_OPERATOR_ENV_VAR]: "ops-alice",
+        });
+
+        return null;
+      } catch (error: unknown) {
+        return error as { detail?: string };
+      }
+    })();
+
+    // The variable is set; the caller is simply not it. Suggesting they set it
+    // would send them to change a working configuration.
+    expect(refused?.detail ?? "").not.toMatch(/no platform operator is configured/i);
+  });
   test("an absent or malformed identity is not the platform", () => {
     // `undefined` reaching a gate is how an optional parameter fails, and
     // `""` is what a trimmed header leaves behind. Neither is a principal.

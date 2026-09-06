@@ -62,6 +62,22 @@ export type AuthenticatedPrincipal =
       userId: string;
       email: string;
       label: string;
+      /**
+       * Whether the browser attached this credential rather than the caller.
+       *
+       * The difference decides whether the request needs an origin proof. A
+       * cookie is sent automatically to this origin — including on a request
+       * some other page caused — so a cookie-authenticated *mutation* has to
+       * show it came from us. A bearer token is not attached by anybody but the
+       * caller, so demanding an `Origin` from one would refuse every
+       * integration in the product while preventing nothing.
+       *
+       * Required rather than optional, and on the type rather than inferred at
+       * the call site: an optional flag defaults to `false`, and `false` here
+       * means "skip the CSRF check" — which is the wrong way for a default to
+       * fail.
+       */
+      viaCookie: boolean;
     };
 
 /** What {@link authenticateRequest} needs beyond the database. */
@@ -132,6 +148,8 @@ export async function authenticateRequest(
         userId: person.id,
         email: person.email,
         label: person.name ?? person.email,
+        // The browser sent this, not the caller. See `viaCookie`.
+        viaCookie: true,
       };
     }
 
@@ -171,6 +189,9 @@ export async function authenticateRequest(
   const user = await verifyUserSession(token, verifier);
 
   return {
+    // A bearer token, deliberately sent by this caller. Not exposed to CSRF:
+    // an attacker cannot make a browser attach a header it does not know.
+    viaCookie: false,
     kind: "session",
     userId: user.id,
     email: user.email,
