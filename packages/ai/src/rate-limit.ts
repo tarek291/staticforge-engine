@@ -104,6 +104,10 @@ export interface AwaitTokensOptions {
    * Caps a pathological wait computed from a very slow refill rate, and keeps
    * the loop coming back often enough that a lease renewal is never starved by
    * one enormous sleep.
+   *
+   * Raised to {@link MIN_PAUSE_MS} if it is set below it. A ceiling under the
+   * floor is not a shorter wait, it is no wait — and the resulting loop is a
+   * denial of service against this engine's own database.
    */
   maxPauseMs?: number;
   /** Injected so a test can observe *that* it waited, not spend the time. */
@@ -197,7 +201,22 @@ export async function awaitTokens(
   // that flows straight through — and `waited + pause > NaN` is `false`, which
   // disables the timeout as completely as a poisoned `waited` does.
   const budgetMs = asDurationMs(options.budgetMs) ?? DEFAULT_RATE_LIMIT_BUDGET_MS;
-  const maxPauseMs = asDurationMs(options.maxPauseMs) ?? DEFAULT_MAX_PAUSE_MS;
+
+  // Raised to the floor, not just validated. `Math.min(maxPauseMs, …)` applies
+  // the ceiling *after* the floor, so a ceiling below the floor wins — and a
+  // caller passing `maxPauseMs: 0`, or anything under a second, turns the pause
+  // into zero. `setTimeout(fn, 0)` returns immediately, `waited` stops growing,
+  // and the loop hammers the limiter's database as fast as the event loop
+  // allows: the same spin the `NaN` guard closed, arriving through a value that
+  // is a perfectly good duration.
+  //
+  // The iteration cap below bounds it — that is what the cap is for — but
+  // bounding a hammer loop is not the same as not having one. It would still
+  // fire a hundred-odd queries and then report a timeout that never happened.
+  const maxPauseMs = Math.max(
+    MIN_PAUSE_MS,
+    asDurationMs(options.maxPauseMs) ?? DEFAULT_MAX_PAUSE_MS,
+  );
   const sleepFn = options.sleepFn ?? sleep;
 
   // A structural backstop, and the reason it exists is worth stating.

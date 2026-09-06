@@ -42,6 +42,14 @@ beforeEach(() => {
   // No quota configured, which is what every suite outside the quota one
   // assumes. The quota tests arm their own.
   armQuotaGate(prisma, { limit: null });
+  // Runs its callback against the same mock, so writes inside a transaction
+  // stay observable. Needed by two callers now: the quota reservation takes a
+  // transaction of its own so its row lock is actually held, and the sync write
+  // has always had one.
+  prisma.$transaction.mockImplementation(((run: (tx: typeof prisma) => Promise<unknown>) =>
+    typeof run === "function"
+      ? run(prisma)
+      : Promise.resolve([])) as unknown as typeof prisma.$transaction);
 });
 
 /** Arm the membership lookup the authorisation gate reads. */
@@ -168,7 +176,13 @@ describe("nothing changed means nothing happens", () => {
     expect(result?.changed).toBe(false);
     expect(result?.jobId).toBeNull();
     expect(enqueue).not.toHaveBeenCalled();
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    // Named directly rather than asserted through `$transaction`, which the
+    // quota hold now uses too. An unchanged sync still owes its unit — a sync
+    // is one operation whatever it finds — so a transaction *does* run here;
+    // what must not happen is a write.
+    expect(prisma.service.upsert).not.toHaveBeenCalled();
+    expect(prisma.location.upsert).not.toHaveBeenCalled();
+    expect(prisma.service.deleteMany).not.toHaveBeenCalled();
   });
 });
 
@@ -307,7 +321,15 @@ describe("a real change is detected and queued", () => {
     // A sync that failed half-way would leave a project describing services it
     // no longer has locations for, and the run queued after it would publish
     // exactly that.
-    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    //
+    // Two transactions, not one, and they are deliberately separate. The quota
+    // hold takes its own so that its `FOR UPDATE` is held across the read and
+    // the write — on the base client each statement autocommits and the lock is
+    // released before the sum is even sent, which is a lock that guards
+    // nothing. It cannot be folded into the write below because the gate has to
+    // run before the impact query, and because a sync that changes nothing
+    // still owes its unit and never reaches that write.
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -985,7 +1007,11 @@ describe("an exhausted quota refuses a sync", () => {
       enqueueJob: enqueue,
     }).catch(() => undefined);
 
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    // Asserted on the write itself rather than on `$transaction`, which the
+    // refused reservation now also uses. The property is that nothing was
+    // *written*, and naming the write says so directly.
+    expect(prisma.service.upsert).not.toHaveBeenCalled();
+    expect(prisma.location.upsert).not.toHaveBeenCalled();
     expect(enqueue).not.toHaveBeenCalled();
   });
 

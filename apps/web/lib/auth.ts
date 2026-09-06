@@ -1,6 +1,8 @@
 import {
   UnauthorizedError,
+  checkRequestOrigin,
   createSessionVerifier,
+  readAllowedHosts,
   type OrgCapability,
   type OrgRoleName,
 } from "@staticforge/core";
@@ -43,6 +45,20 @@ import { readCookieUser } from "../utils/supabase/server";
  * this origin, including ones an integration makes through it, so a caller that
  * bothered to send a header meant that header — and checking the cookie first
  * would answer as whoever happened to be logged in on that machine.
+ *
+ * ## Cookie callers must also prove where they came from
+ *
+ * The same fact that makes the ordering matter — a browser attaches the cookie
+ * by itself — is what makes a cookie session forgeable by a page the person did
+ * not mean to trust. `SameSite=Lax` stops the classic cross-*site* form post and
+ * does **not** stop a sibling subdomain: `SameSite` compares registrable
+ * domains, so anything under the same `example.com` is same-site and its POSTs
+ * carry the cookie.
+ *
+ * So a cookie-authenticated *mutation* is checked against `Origin`. A bearer
+ * caller is not: it is not exposed to the attack, and demanding an `Origin` from
+ * `curl` would break every integration while preventing nothing. The rule lives
+ * in `@staticforge/core` where it is tested; this reads the request.
  */
 
 /** A caller who proved who they are, or the refusal to send back. */
@@ -61,6 +77,49 @@ function unauthorized(): Response {
     { error: "Unauthorized." },
     { status: 401, headers: { "WWW-Authenticate": "Bearer" } },
   );
+}
+
+/**
+ * Look for a browser session, treating an unconfigured provider as "none".
+ *
+ * The same reasoning the lazy verifier below is built on, applied to the half
+ * that was missing it. `readCookieUser` needs Supabase configuration, and it is
+ * consulted on **every request that arrives without a header** — including one
+ * that carries no credential at all. So on a deployment with no Supabase
+ * project, an anonymous request to any route threw `ServerEnvError` and was
+ * answered `500`.
+ *
+ * That is wrong three ways. The caller sent nothing, so the honest answer is
+ * `401`. A `500` tells an unauthenticated stranger that the server is
+ * misconfigured, which is a fact about the deployment they have no business
+ * learning. And every drive-by scanner then registers as a server fault in
+ * whatever watches the error rate.
+ *
+ * A missing identity provider means no cookie session exists — nobody can have
+ * signed in — so `null` is the truthful answer, and the absent-credential path
+ * raises `UnauthorizedError` exactly as it does when Supabase *is* configured
+ * and the caller simply is not signed in.
+ *
+ * This deliberately does **not** soften the case where a session token was
+ * actually presented: that still reaches `resolveSessionVerifier`, still throws,
+ * and is still a `500`. A caller who offered a credential we cannot check is
+ * owed a different answer from one who offered nothing at all.
+ */
+async function resolveCookieUser(routeLabel: string) {
+  try {
+    return await readCookieUser();
+  } catch (error: unknown) {
+    if (error instanceof ServerEnvError) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[${routeLabel}] no browser sessions are possible: ${error.message}`,
+      );
+
+      return null;
+    }
+
+    throw error;
+  }
 }
 
 /**
@@ -107,9 +166,43 @@ export async function requireApiAuth(
         // request-scoped store, which is why this is a callback rather than a
         // value: the *ordering* lives in `@staticforge/database`, where it is
         // tested, and only the mechanics live here.
-        cookieUser: readCookieUser,
+        cookieUser: () => resolveCookieUser(routeLabel),
       },
     );
+
+    // Only for cookie callers, and only for methods that change something. See
+    // the note at the top of this file: a bearer credential is not attached by
+    // a browser, so it is not exposed to this and must not be asked for proof.
+    if (principal.kind === "session" && principal.viaCookie) {
+      const verdict = checkRequestOrigin({
+        method: request.method,
+        origin: request.headers.get("origin"),
+        // What the browser addressed. Behind a proxy this is the public name,
+        // which is the one the browser's `Origin` will carry.
+        host: request.headers.get("host"),
+        allowedHosts: readAllowedHosts(),
+      });
+
+      if (!verdict.ok) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[${routeLabel}] refused a cookie ${request.method}: ${verdict.reason} ` +
+            `(origin ${verdict.origin ?? "absent"}, expected ${verdict.expected ?? "unknown"})`,
+        );
+
+        return {
+          ok: false,
+          response: Response.json(
+            {
+              error:
+                "This request did not come from an allowed origin. " +
+                "Use an API key for programmatic access.",
+            },
+            { status: 403 },
+          ),
+        };
+      }
+    }
 
     return { ok: true, principal };
   } catch (error: unknown) {

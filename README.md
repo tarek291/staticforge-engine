@@ -1468,3 +1468,5 @@ template, without touching the canonical site.
 > **Step 21B added a static, additive template preview route** — it makes the
 > registry's templates viewable in real builds while leaving canonical output and
 > sample data untouched.
+
+<!-- Trigger CodeRabbit Audit -->

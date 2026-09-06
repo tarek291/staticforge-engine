@@ -426,3 +426,57 @@ describe("a budget that is not a number cannot disable the timeout", () => {
     expect(error).toBeInstanceOf(RateLimitTimeoutError);
   });
 });
+
+describe("a pause ceiling cannot sink below the floor", () => {
+  test("a zero ceiling does not become a zero wait", async () => {
+    const { fn, waits } = recordingSleep();
+    const { limiter } = scripted(deny(5000));
+
+    await awaitTokens(limiter, 100, { maxPauseMs: 0, sleepFn: fn });
+
+    // `Math.min(ceiling, Math.max(floor, reported))` applies the ceiling last,
+    // so a ceiling under the floor wins outright. `setTimeout(fn, 0)` returns
+    // immediately, `waited` stops growing, and the loop hammers the limiter's
+    // database as fast as the event loop allows — the same spin the NaN guard
+    // closed, arriving through a value that is a perfectly good duration.
+    expect(waits).toEqual([MIN_PAUSE_MS]);
+  });
+
+  test("a ceiling between zero and the floor is raised too", async () => {
+    const { fn, waits } = recordingSleep();
+    const { limiter } = scripted(deny(5000));
+
+    await awaitTokens(limiter, 100, { maxPauseMs: 50, sleepFn: fn });
+
+    expect(waits).toEqual([MIN_PAUSE_MS]);
+  });
+
+  test("it does not turn into a hammer loop against the limiter", async () => {
+    let calls = 0;
+    const limiter: RateLimiter = () => {
+      calls += 1;
+
+      return Promise.resolve(calls > 1 ? allow() : deny(5000));
+    };
+
+    await awaitTokens(limiter, 100, {
+      maxPauseMs: 0,
+      sleepFn: () => Promise.resolve(),
+    });
+
+    // Refused once, waited, allowed. Before the floor was applied this made a
+    // hundred-odd queries and then reported a timeout that never happened.
+    expect(calls).toBe(2);
+  });
+
+  test("a ceiling above the floor is still honoured", async () => {
+    const { fn, waits } = recordingSleep();
+    const { limiter } = scripted(deny(90_000));
+
+    await awaitTokens(limiter, 100, { maxPauseMs: 2000, sleepFn: fn });
+
+    // The ceiling still exists — it keeps the loop coming back often enough
+    // that a lease renewal is never starved by one enormous sleep.
+    expect(waits).toEqual([2000]);
+  });
+});

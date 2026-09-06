@@ -53,6 +53,22 @@ export interface WorkerDeps {
    * meter simply has nothing to charge without it.
    */
   readCompletedPages?: (jobId: string, userId: string) => Promise<number>;
+  /**
+   * Give back quota holds whose settlement event never landed.
+   *
+   * Called on the idle tick, where by definition there is nothing more urgent
+   * to do. The meter runs on the plugin bus, which absorbs listener failures so
+   * that a billing plugin can never abort a paid run — a trade worth making,
+   * and one that means "the event fired" is not evidence the settlement was
+   * written. A worker that dies between the two loses the only record that
+   * anything was owed back.
+   *
+   * This is what turns that from permanent into late. Optional, so a caller
+   * that has not wired it keeps working — it degrades to the previous
+   * behaviour, which over-counts a tenant's own usage against their ceiling
+   * rather than under-counting it.
+   */
+  reconcileHolds?: () => Promise<{ settled: number; adjusted: number }>;
   runEngine: typeof runEngine;
 }
 
@@ -353,6 +369,8 @@ export function startWorker(
     await hooks.emit("afterQueueDrained", payload);
   };
 
+  const report = options.log ?? ((): void => {});
+
   const done = (async () => {
     while (running) {
       const tick = await runWorkerOnce(deps, options);
@@ -375,6 +393,32 @@ export function startWorker(
       // The queue was observed empty, which is the only evidence this worker
       // ever gets that the content is settled.
       await announceDrain("queue-empty");
+
+      // An idle worker is the right place to give back holds whose settlement
+      // event was lost. Never while jobs are waiting: this reads and writes the
+      // same tables the queue does, and a reconciler that competed with real
+      // work would trade a billing correction for a slower build.
+      //
+      // Failures are absorbed and reported. Reconciliation is a correction, and
+      // a correction that could stop a worker claiming its next job would be a
+      // worse fault than the one it fixes.
+      if (deps.reconcileHolds !== undefined) {
+        try {
+          const reconciled = await deps.reconcileHolds();
+
+          if (reconciled.settled > 0) {
+            report(
+              `  · settled ${reconciled.settled} stranded quota hold(s), ` +
+                `${reconciled.adjusted} unit(s) adjusted`,
+            );
+          }
+        } catch (error: unknown) {
+          report(
+            `  ! could not reconcile quota holds: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
 
       if (running) {
         await sleepFn(idleMs);

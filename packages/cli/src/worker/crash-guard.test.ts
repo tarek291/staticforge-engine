@@ -223,3 +223,107 @@ describe("the guard can be taken back off", () => {
     expect(() => guard.uninstall()).not.toThrow();
   });
 });
+
+describe("the guard against crashes does not crash", () => {
+  /** Values that throw when JavaScript tries to make them text. */
+  const unprintable: ReadonlyArray<[string, () => unknown]> = [
+    // No prototype, so no `toString`. `String()` on one throws outright.
+    ["a null-prototype object", () => Object.create(null)],
+    [
+      "an object whose toString throws",
+      () => ({
+        toString() {
+          throw new Error("nope");
+        },
+      }),
+    ],
+    [
+      "an object whose Symbol.toPrimitive throws",
+      () => ({
+        [Symbol.toPrimitive]() {
+          throw new Error("nope");
+        },
+      }),
+    ],
+    [
+      "an Error whose message getter throws",
+      () => {
+        const error = new Error("x");
+
+        Object.defineProperty(error, "message", {
+          get() {
+            throw new Error("nope");
+          },
+        });
+
+        return error;
+      },
+    ],
+  ];
+
+  for (const [label, make] of unprintable) {
+    test(`${label} is absorbed rather than fatal`, () => {
+      const host = fakeHost();
+      const logged: string[] = [];
+
+      installCrashGuard({ log: (message) => logged.push(message), host });
+
+      // This runs *inside* the `unhandledRejection` handler, so a throw here is
+      // an uncaught exception — which terminates the process. The guard
+      // installed to stop a worker dying on a rejected promise would be the
+      // thing that killed it, on exactly the malformed rejection it exists to
+      // absorb.
+      expect(() => host.fire(make())).not.toThrow();
+      expect(host.exits).toEqual([]);
+      expect(logged).toHaveLength(1);
+    });
+  }
+
+  test("an Error whose name throws still reports its message", () => {
+    const host = fakeHost();
+    const logged: string[] = [];
+    const error = new Error("connection refused");
+
+    Object.defineProperty(error, "name", {
+      get() {
+        throw new Error("nope");
+      },
+    });
+
+    installCrashGuard({ log: (message) => logged.push(message), host });
+    host.fire(error);
+
+    // Rendered field by field, so one unreadable half does not lose the other.
+    // The message is the part an operator needs.
+    expect(logged[0]).toContain("connection refused");
+  });
+
+  test("the fallback text derives nothing from the value", () => {
+    const host = fakeHost();
+    const logged: string[] = [];
+
+    installCrashGuard({ log: (message) => logged.push(message), host });
+    host.fire(Object.create(null));
+
+    // Anything derived could throw for the same reason the first attempt did.
+    expect(logged[0]).toContain("cannot be converted to text");
+  });
+
+  test("the budget still counts an unprintable rejection", () => {
+    const host = fakeHost();
+
+    installCrashGuard({ log: () => {}, host, now: () => 0, budget: 3 });
+
+    try {
+      host.fire(Object.create(null));
+      host.fire(Object.create(null));
+      host.fire(Object.create(null));
+    } catch {
+      // The exit.
+    }
+
+    // A rejection nobody can read is still a rejection. Not counting it would
+    // let a worker failing on every job look healthy for ever.
+    expect(host.exits).toEqual([1]);
+  });
+});

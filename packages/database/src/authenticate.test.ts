@@ -147,6 +147,9 @@ describe("a person's session is accepted", () => {
 
     expect(principal).toEqual({
       kind: "session",
+      // A header the caller chose to send. Not attached by a browser, so not
+      // exposed to CSRF and not asked for an origin proof.
+      viaCookie: false,
       userId: "user-uuid",
       email: "alice@example.com",
       label: "Alice",
@@ -416,9 +419,13 @@ describe("a browser session is accepted when no header arrives", () => {
     });
 
     // The same shape a bearer session produces, so no route had to change to
-    // gain this.
+    // gain this — with one field that differs, because the difference matters.
+    // The browser attached this credential, which is what makes a mutation
+    // carrying it forgeable by a sibling subdomain, so it is the one the origin
+    // check applies to.
     expect(principal).toEqual({
       kind: "session",
+      viaCookie: true,
       userId: "user-uuid",
       email: "alice@example.com",
       label: "Alice",
