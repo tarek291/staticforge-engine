@@ -129,9 +129,48 @@ async function resolveCookieUser(routeLabel: string) {
  * API keys. Building this eagerly would turn one misconfiguration into two
  * outages — every machine caller refused because the *human* login is
  * unconfigured.
+ *
+ * ## Why an unconfigured provider returns `undefined` rather than throwing
+ *
+ * Because that is what `authenticateRequest` was written to expect. It already
+ * has the branch — "no identity provider configured, so a session token cannot
+ * be verified" — and it already refuses with `UnauthorizedError`, on the stated
+ * grounds that *sessions are not configured here* is a fact about the
+ * deployment an unauthenticated caller has no business learning.
+ *
+ * Throwing from here reached past that branch. The result was that **any**
+ * bearer token which is not a well-formed API key — a random string, a stale
+ * JWT, a scanner's junk — was answered `500` on a deployment without Supabase,
+ * which is the exact information leak that branch exists to prevent, arriving
+ * through the door next to the one it was guarding. Found by running it.
+ *
+ * The counter-argument is that a person holding a genuinely valid token is now
+ * told "unauthorized" when the truth is "we cannot check". That is real, and it
+ * is the lesser harm: the operator still gets the reason in the log below,
+ * because the misconfiguration is reported the moment anybody tries — while the
+ * alternative hands the same diagnosis to everyone who sends a bearer header at
+ * all.
+ *
+ * @returns The verifier, or `undefined` when no provider is configured.
  */
-function resolveSessionVerifier() {
-  const env = readServerEnv();
+function resolveSessionVerifier(routeLabel: string) {
+  let env;
+
+  try {
+    env = readServerEnv();
+  } catch (error: unknown) {
+    if (error instanceof ServerEnvError) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[${routeLabel}] a session token was presented and cannot be verified: ` +
+          `${error.message}`,
+      );
+
+      return undefined;
+    }
+
+    throw error;
+  }
 
   // The validated values build the client, rather than reaching back into
   // `process.env` for whatever it holds by now.
@@ -161,7 +200,7 @@ export async function requireApiAuth(
       request.headers.get("authorization"),
       prisma,
       {
-        sessionVerifier: resolveSessionVerifier,
+        sessionVerifier: () => resolveSessionVerifier(routeLabel),
         // Consulted only when no header arrived. Reading cookies needs Next's
         // request-scoped store, which is why this is a callback rather than a
         // value: the *ordering* lives in `@staticforge/database`, where it is

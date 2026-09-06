@@ -1,21 +1,36 @@
-import { UnauthorizedError, createSessionVerifier } from "@staticforge/core";
-import {
-  authenticateRequest,
-  listProjectsForPrincipal,
-  prisma,
-} from "@staticforge/database";
+import { listProjectsForPrincipal, prisma } from "@staticforge/database";
 
-import { ServerEnvError, readServerEnv } from "../../../../lib/env";
+import { requireApiAuth } from "../../../../lib/auth";
 
 /**
- * The first authenticated read surface.
+ * The projects a caller may see.
  *
- * Every other dashboard route in this app still acts as the `local-operator`
- * constant. This one asks who is calling and answers accordingly — a person
- * with a Supabase session, or an integration with a Phase 25 API key, through
- * one door.
+ * ## Why this route is three lines now
  *
- * ## What it does not do
+ * It used to be forty. This was the *first* authenticated surface — Phase 28
+ * wired the auth by hand, here, before there was a helper — and Phase 29 built
+ * `requireApiAuth` and converted every other route to it. This one was left
+ * behind, still carrying its own copy.
+ *
+ * That copy did not rot in the way the Phase 29 note predicted. The check was
+ * still there and still correct for the credential it knew about. What happened
+ * instead is that the shared guard *grew* and this one did not:
+ *
+ * - Phase 30 added cookie sessions. `requireApiAuth` passes a `cookieUser`
+ *   resolver; the copy never did — so the one endpoint the dashboard calls
+ *   could not read a browser session at all. Every other route could.
+ * - The CodeRabbit remediation made an unconfigured provider answer `401`
+ *   rather than telling a stranger the server is misconfigured. The copy went
+ *   on answering `500` to any bearer token that is not a well-formed API key.
+ * - The same round added the `Origin` check that stops a sibling subdomain
+ *   spending a cookie session. The copy had nothing to apply it to.
+ *
+ * Found by running it: the dashboard signed in and then could not list a single
+ * project, because the route it asks was the one route that does not know what
+ * a cookie is. Two implementations of "who is calling" do not stay identical;
+ * they diverge in the direction of whichever one somebody remembered to update.
+ *
+ * ## What it still does not do
  *
  * It does not create anything. A caller who verifies but has never been
  * provisioned into the `User` table has no memberships and sees an empty list,
@@ -26,64 +41,19 @@ import { ServerEnvError, readServerEnv } from "../../../../lib/env";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request): Promise<Response> {
-  // The session verifier is built lazily, and only if a session token is what
-  // actually arrives. A deployment with no Supabase project can still serve
-  // integrations holding API keys; building it eagerly would turn one
-  // misconfiguration into two outages.
-  const resolveSessionVerifier = () => {
-    const env = readServerEnv();
+  const auth = await requireApiAuth(request, "dashboard/projects");
 
-    // Passed as the validated record rather than reaching back into
-    // `process.env`, so what was checked is what builds the client.
-    return createSessionVerifier({
-      SUPABASE_URL: env.SUPABASE_URL,
-      SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY,
-    });
-  };
-
-  let principal;
-
-  try {
-    principal = await authenticateRequest(request.headers.get("authorization"), prisma, {
-      sessionVerifier: resolveSessionVerifier,
-    });
-  } catch (error: unknown) {
-    if (error instanceof ServerEnvError) {
-      // 500, not 401. This is our fault, not the caller's, and a 401 would send
-      // an operator looking at their token while the server sits misconfigured.
-      //
-      // The detail goes to the log, not the body. An operator reads logs; an
-      // unauthenticated caller reads responses, and which environment variables
-      // a deployment is missing is not something to tell one. The status code
-      // already says "our side", which is all the caller needs.
-      // eslint-disable-next-line no-console
-      console.error(`[dashboard/projects] ${error.message}`);
-
-      return Response.json(
-        { error: "The server is misconfigured. Contact the operator." },
-        { status: 500 },
-      );
-    }
-
-    if (error instanceof UnauthorizedError) {
-      // One answer for every failure — absent, malformed, unknown, revoked,
-      // expired. The reason lives on the error for a log and never in the body.
-      return Response.json(
-        { error: "Unauthorized." },
-        { status: 401, headers: { "WWW-Authenticate": "Bearer" } },
-      );
-    }
-
-    throw error;
+  if (!auth.ok) {
+    return auth.response;
   }
 
-  const projects = await listProjectsForPrincipal(principal.userId, prisma);
+  const projects = await listProjectsForPrincipal(auth.principal.userId, prisma);
 
   return Response.json({
     // Echoed so a client can show who it is acting as, and so an integrator
     // debugging an empty list can see which principal was resolved. Neither
     // field is a credential.
-    principal: { kind: principal.kind, label: principal.label },
+    principal: { kind: auth.principal.kind, label: auth.principal.label },
     projects,
   });
 }

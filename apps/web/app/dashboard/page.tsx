@@ -2,6 +2,8 @@ import type { ReactElement } from "react";
 
 import { isDatabaseReachable, prisma } from "@staticforge/database";
 
+import { ProjectsList } from "./projects-list";
+
 /**
  * The dashboard index.
  *
@@ -14,18 +16,25 @@ import { isDatabaseReachable, prisma } from "@staticforge/database";
  * on the strength of a hardcoded string is a tenancy boundary that exists
  * everywhere except here.
  *
- * Removing the constant leaves this page with no way to know who is asking. A
- * server component receives no `Authorization` header, and there is no session
- * cookie yet — Phase 27 verifies a bearer token, and nothing has been built to
- * turn a browser session into one. So the page stops pretending, and points at
- * the endpoint that does authenticate.
+ * Removing the constant left this page with no way to know who was asking, so
+ * it rendered a shell that pointed at the authenticated API. That was a real
+ * loss of function and the correct trade: the alternative was keeping an
+ * unauthenticated read of tenant data because it was convenient, which is the
+ * shape of every "temporary" hole that ships.
  *
- * That is a real loss of function and it is the correct trade. The alternative
- * was keeping an unauthenticated read of tenant data because it was convenient,
- * which is the shape of every "temporary" hole that ships.
+ * ## What Phase 32 changed
  *
- * The next step is a session cookie and a client-side fetch against
- * `GET /api/dashboard/projects`, which already enforces exactly this.
+ * The shell is gone. There is a session cookie now, and the list is fetched
+ * from the browser against `GET /api/dashboard/projects` — the same endpoint an
+ * API key calls, with the same membership scoping.
+ *
+ * Deliberately *not* read server-side from Prisma, even though a Server
+ * Component could and it would save a round trip. That would be a second
+ * authorisation path, and a second path is where the two quietly diverge the
+ * first time a rule changes in one of them. One door.
+ *
+ * This page stays a Server Component for the one thing it can still answer
+ * without knowing who is asking: whether there is a database at all.
  */
 export const dynamic = "force-dynamic";
 
@@ -45,31 +54,12 @@ export default async function DashboardPage(): Promise<ReactElement> {
       <header className="flex flex-col gap-2">
         <h1 className="text-2xl font-semibold tracking-tight">Projects</h1>
         <p className="text-sm text-neutral-500">
-          This view is not signed in. Project data is tenant data, and the web
-          server no longer reads it without a credential.
+          Every organization you belong to, through the same authenticated
+          endpoint an integration calls.
         </p>
       </header>
 
-      <div className="flex flex-col gap-4 rounded-md border border-neutral-200 p-6 text-sm dark:border-neutral-800">
-        <p className="text-neutral-600 dark:text-neutral-300">
-          Every project listing goes through the authenticated API. Ask it with
-          a Supabase session token, or with an organization API key:
-        </p>
-
-        <pre className="overflow-x-auto rounded bg-neutral-100 p-4 font-mono text-xs dark:bg-neutral-900">
-          {`curl -H "Authorization: Bearer <token-or-sf_org_key>" \\
-  http://localhost:3000/api/dashboard/projects`}
-        </pre>
-
-        <p className="text-neutral-500">
-          Mint a key with{" "}
-          <code>
-            corepack pnpm staticforge api-keys create --org-id &lt;id&gt; --name
-            &quot;local&quot;
-          </code>
-          .
-        </p>
-      </div>
+      <ProjectsList />
 
       {!reachable && (
         <p className="rounded-md border border-neutral-200 p-6 text-sm text-neutral-500 dark:border-neutral-800">

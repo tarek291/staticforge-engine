@@ -1,7 +1,9 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
+
+import { LOGIN_PATH } from "./protected-paths.js";
 
 /**
  * Every API route in the web app authenticates.
@@ -115,6 +117,93 @@ describe("every API route authenticates", () => {
     for (const route of PUBLIC_ROUTES) {
       expect(ROUTES, `${route} is exempted but does not exist`).toContain(route);
     }
+  });
+});
+
+describe("there is one implementation of who is calling", () => {
+  test("no route builds its own session verifier", () => {
+    // This is the failure that actually happened, and it is not the one the
+    // Phase 29 note predicted. The copy in `dashboard/projects` did not rot —
+    // it stayed correct for the credential it knew about while the *shared*
+    // guard grew past it. Phase 30 added cookie sessions to `requireApiAuth`
+    // and the copy never got them, so the single endpoint the dashboard calls
+    // was the one endpoint that could not read a browser session.
+    //
+    // Two implementations of "who is calling" do not stay identical. They
+    // diverge toward whichever one somebody remembered to update.
+    for (const route of ROUTES) {
+      if (PUBLIC_ROUTES.has(route)) {
+        continue;
+      }
+
+      const source = readFileSync(join(APP_DIR, route), "utf8")
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("*") && !line.trim().startsWith("//"))
+        .join("\n");
+
+      expect(source.includes("createSessionVerifier"), route).toBe(false);
+      expect(source.includes("authenticateRequest"), route).toBe(false);
+    }
+  });
+
+  test("the guard the routes share is the one that reads cookies", () => {
+    const guard = readFileSync(resolve(APP_DIR, "../lib/auth.ts"), "utf8");
+
+    // If this ever stops passing a cookie resolver, every route loses browser
+    // sessions at once — which is louder, and therefore safer, than one route
+    // losing them quietly.
+    expect(guard).toContain("cookieUser");
+    expect(guard).toContain("checkRequestOrigin");
+  });
+});
+
+describe("the page the middleware redirects to exists", () => {
+  test("/login is a real page", () => {
+    // Phase 30 built the login route, the cookies, the middleware and the
+    // session refresh, and left the page itself unbuilt — so every redirect the
+    // guard produced landed on a 404. The whole authentication stack was
+    // reachable only by `curl`.
+    expect(existsSync(join(APP_DIR, "login/page.tsx"))).toBe(true);
+  });
+
+  test("it is the path the guard actually sends people to", () => {
+    // Pinned against `LOGIN_PATH` rather than hardcoded twice. Renaming the
+    // constant without moving the directory is exactly how this regresses back
+    // to a redirect into nothing.
+    const directory = LOGIN_PATH.replace(/^\//, "");
+
+    expect(existsSync(join(APP_DIR, directory, "page.tsx"))).toBe(true);
+  });
+
+  test("the form does not import the package root", () => {
+    const source = readFileSync(join(APP_DIR, "login/login-form.tsx"), "utf8")
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("*") && !line.trim().startsWith("//"))
+      .join("\n");
+
+    // The root barrel reaches for `node:crypto` — the API-key hashing among
+    // other things — which has no business in a browser bundle. The middleware
+    // hit the same wall on the Edge runtime and the same subpath is the answer.
+    expect(source).toContain("@staticforge/core/auth-paths");
+    expect(source).not.toMatch(/from "@staticforge\/core"/);
+  });
+
+  test("the browser never holds the session itself", () => {
+    // Comments stripped, like every other source check here. The file's own
+    // docblock names the approach it rejects, and a substring test that could
+    // not tell an explanation from an import would fail on the explanation.
+    const source = readFileSync(join(APP_DIR, "login/login-form.tsx"), "utf8")
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("*") && !line.trim().startsWith("//"))
+      .join("\n");
+
+    // `createBrowserClient` + `signInWithPassword` in the page is what most
+    // examples show, and it puts the access token in JavaScript's reach —
+    // trading away the one protection `HttpOnly` buys. The form posts to the
+    // route and reads a status code.
+    expect(source).not.toContain("createBrowserClient");
+    expect(source).not.toContain("signInWithPassword");
+    expect(source).toContain("/api/auth/login");
   });
 });
 

@@ -51,6 +51,11 @@ moved out of the routes and *into* the data layer, the quota gate became atomic
 by holding what it admits, the billing ledger stopped cascading away with its
 tenant, and the worker stopped dying on a promise nobody awaited.
 
+The code has since been audited twice — an internal adversarial pass and an
+external review — producing thirteen findings, all fixed and merged. The second
+pass is the one worth noting for anyone assessing risk: it found that the first
+pass's own headline fix had been applied to one of the two paths that needed it.
+
 What is missing is the `/login` page itself and the Supabase credentials behind
 it: the route works, the form does not exist, and nobody has actually signed
 in.
@@ -778,9 +783,11 @@ by roughly the volume of work in flight when it crossed the line.
 
 The gate was also not atomic: two callers arriving together both read the same
 total and both pass, exactly as a read-then-write token bucket would.
-**Phase 31 closed this** — see 3.21. The reasoning that follows is kept because
-the *asymmetry* it describes is still true, and is what made the fix
-non-obvious: a lock alone does not help a total that nothing has written to. That was
+**Phase 31 closed this for `enqueueJob`, and the external audit found it still
+open for `syncProject`** — see 3.21 and 3.22. The reasoning that follows is kept
+because the *asymmetry* it describes is still true, and is what made the fix
+non-obvious twice over: a lock alone does not help a total nothing has written
+to, and a lock outside a transaction is not a lock at all. That was
 refused in Phase 24 and is accepted here, and the difference is what is being
 protected. The rate limiter guards someone else's hard ceiling, where
 overshooting produces 429s in the middle of a paid run, so it is a single atomic
@@ -1198,14 +1205,169 @@ platform operator, refused even though the id matches exactly.
 
 ---
 
-### 3.22 SEO publishing and internal linking *(Phases 05–06)*
+### 3.22 The external audit *(CodeRabbit, 2026-09-06)*
+
+The same code was then reviewed externally. Seven more findings, all real. Two
+are worth reading in full: one was **worse** than reported, and one arrived with
+a fix that would have broken two invariants.
+
+#### CSRF on cookie sessions
+
+`SameSite=Lax` reads like it settles this, and it does kill the classic
+cross-*site* form post. The gap is that "site" is not "origin". `SameSite`
+compares **registrable domains**, so `blog.example.com`, `staging.example.com`
+and `app.example.com` are one site — and a POST from any of them to any other is
+same-site, which means the cookie is attached.
+
+Anyone able to put content on a sibling subdomain could therefore forge
+authenticated mutations: a marketing page on a shared domain, an old staging host
+nobody decommissioned, a subdomain takeover of a dangling DNS record.
+
+Cookie-authenticated mutations now carry an `Origin` proof. Bearer callers
+deliberately do not — an attacker cannot make a browser attach a header it does
+not know, so they are not exposed, and demanding an `Origin` from `curl` would
+break every integration while preventing nothing.
+
+That distinction required the principal to know *how* it authenticated, so the
+session variant gained a required `viaCookie`. Required rather than optional,
+because an optional flag defaults to `false` and `false` here means "skip the
+check" — the wrong way for a default to fail.
+
+The match is on the exact host including the port. `endsWith("example.com")`
+accepts `evil-example.com`, and matching the registrable domain accepts the
+sibling subdomain the guard exists to refuse. A missing `Origin` is refused
+rather than allowed: if absent meant allow, the attack would be to arrange for
+absent.
+
+#### The sync quota lock was doing nothing
+
+Reported as "the reservation uses the root client before the transaction". The
+consequence is larger than that phrasing suggests.
+
+`reserveQuota` is three statements — lock the quota row `FOR UPDATE`, sum usage,
+insert the hold. Against the base client each of those is its own implicit
+transaction, so **the lock was released on the statement that took it**, before
+the sum had even been sent. Not a weaker guarantee: no guarantee, with a
+`FOR UPDATE` sitting in the SQL looking like one.
+
+`enqueueJob` never had this, because its reservation shares the transaction that
+writes the job row. `syncProject` had no transaction to share.
+
+Measured against live Postgres, 40 concurrent callers against a limit of 10:
+
+| Gate | Admitted |
+| --- | --- |
+| Phase 26 read-only check | 40 of 40 |
+| Phase 31 reserve, base client | **37 of 40** |
+| Phase 31 reserve, in a transaction | 10 of 40 |
+
+**The suggested fix was refused.** Folding the reservation into the write
+transaction further down would break two things: the gate must run before the
+impact query, or a tenant out of allowance keeps getting to ask which of its
+pages would change; and the unchanged path returns before that transaction
+exists while still owing its unit, because a sync is one operation whether or
+not it finds anything. It takes a transaction of its own instead.
+
+A sync whose write throws now refunds its hold. Every path that *returns*
+announces itself, and announcing is what settles — so a throw was the one exit
+that left a unit charged for a sync that did not happen.
+
+#### Settlement is durable
+
+The meter runs on the plugin bus, which absorbs listener failures **on purpose**
+so that a billing plugin can never abort a paid, hour-long build. That trade is
+right and it left a hole: a worker dying between finishing a job and writing the
+adjustment loses the event, and with it the only record that anything was owed
+back. Retrying does not help — a retry loop lives in the process that died.
+
+No outbox was needed. The hold is already durable (it is a `UsageRecord`) and the
+amount is already on the job row. What was missing was a way to tell a settled
+job from an unsettled one, which is one nullable column.
+
+`GenerationJob.settledAt` is stamped in the **same transaction** as the
+adjustment, which makes it both the durable record and the idempotency key —
+settling twice would double-count the correction it was meant to fix.
+`reconcileStrandedHolds` sweeps finished jobs holding units with no stamp, on the
+worker's idle tick and never while jobs are waiting.
+
+Only finished jobs. Refunding a running one would let a tenant exceed the ceiling
+by exactly the work in flight, which is the race the hold exists to prevent.
+
+#### The crash guard could crash
+
+`String(Object.create(null))` throws — no prototype, so no `toString` — and so
+does anything whose `toString`, `Symbol.toPrimitive` or `message` getter throws.
+
+Ordinarily a cosmetic bug in a log line. Here it is not: that formatting runs
+*inside* the `unhandledRejection` handler, and a throw from inside that handler
+is an uncaught exception, which terminates the process. The guard installed to
+stop a worker dying on a rejected promise would have been the thing that killed
+it — on exactly the malformed rejection it exists to absorb.
+
+Formatting is now total, rendered field by field so one unreadable half does not
+lose the other, with a fallback that derives nothing from the value.
+
+#### An unconfigured provider no longer answers 500 to a stranger
+
+`readCookieUser` needs Supabase configuration and is consulted on **every request
+that arrives without a header** — including one carrying no credential at all. So
+on a deployment with no Supabase project, an anonymous request to any route threw
+`ServerEnvError` and was answered `500`.
+
+Wrong three ways: the caller sent nothing, so the honest answer is `401`; a `500`
+tells an unauthenticated stranger the server is misconfigured, which is a fact
+about the deployment they have no business learning; and every drive-by scanner
+then registers as a server fault in whatever watches the error rate.
+
+It degrades to "no cookie session", which is the truth — with no provider
+configured, nobody can be signed in. A session token that was *actually
+presented* still answers `500`: a caller who offered a credential we cannot check
+is owed a different answer from one who offered nothing.
+
+#### Two smaller ones
+
+**A pause ceiling below the floor was a hammer loop.** `Math.min(ceiling,
+Math.max(floor, reported))` applies the ceiling last, so `maxPauseMs: 0` won
+outright — `setTimeout(fn, 0)` returns immediately, `waited` stops growing, and
+the loop hammers the limiter's database. The same spin the `NaN` guard closed,
+arriving through a value that is a perfectly good duration. The iteration cap
+bounded it, but bounding a hammer loop is not the same as not having one.
+
+**The platform operator had a guessable production default.** An unset variable
+meant `"local-operator"`, the identity the CLI runs as and the OWNER the seed
+installs. Nothing reachable over HTTP can currently *be* that string, so this was
+hardening rather than an open door — but it was a door held shut by facts about
+other modules, and the list of ways a `userId` gets set is exactly the list of
+things that change. Outside development an unset variable now means there is no
+platform operator at all, and every platform operation refuses.
+
+Anything that is not literally `"production"` is treated as development, which
+reads backwards until you ask which way it fails: the opposite default would hand
+the fallback to exactly the deployment careless enough to misspell its own
+`NODE_ENV`.
+
+#### How these were checked
+
+Five mutations, all caught, all reverted: a suffix host match fails one test;
+allowing a missing `Origin` fails two; dropping the settlement compare-and-set
+fails one; removing the pause floor fails two; restoring unguarded
+stringification fails seven.
+
+And one measurement no mock could have made. The sync lock was verified against
+the live database in both configurations, because the property is Postgres's
+rather than TypeScript's — a mocked client has no notion of a row lock and would
+have reported the broken version as working.
+
+---
+
+### 3.23 SEO publishing and internal linking *(Phases 05–06)*
 
 Sitemaps, robots, canonical metadata and structured data are generated as part
 of the build rather than bolted on. An internal link graph is computed across
 the whole page set with contextual linking rules, so pages reference their
 siblings meaningfully instead of carrying a footer link dump.
 
-### 3.23 Zero-JavaScript presentation layer
+### 3.24 Zero-JavaScript presentation layer
 
 Two views are registered: a clean default and a dark, high-ticket "luxury
 landing" design. Any page can be previewed through any template on a dedicated
@@ -1224,25 +1386,31 @@ serve a German cleaning company and an English security firm without a fork.
 An unregistered template identifier fails the build loudly rather than silently
 falling back, so a typo surfaces in CI rather than as a wrong-looking page.
 
-### 3.24 Test coverage
+### 3.25 Test coverage
 
-**1286 tests across 64 files in six packages**, all under Vitest, all passing.
+**1334 tests across 67 files in six packages**, all under Vitest, all passing.
 
 | Package | Tests | Coverage |
 | --- | --- | --- |
-| `ai` | 255 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop and its refusal of any wait that is not a duration |
-| `core` | 379 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, the session guard, the server-env contract, the route-coverage sweep, tenant paths, job budget, the settlement of quota holds, and the forgery-resistant client address |
-| `database` | 384 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle, the quota gate, the unified auth door, the two gates a locked-down write route runs, the atomic reservation gate under a simulated running total, and the data-layer role checks — entirely against a mocked Prisma client |
+| `ai` | 259 | Schema-constrained output, grounding and bypass attempts, cache integrity, retry, prompt versioning, money detection, gap analysis, the rate-limit wait loop and its refusal of any wait that is not a duration |
+| `core` | 396 | CSV import, link graph, content hashing, block-path patching, plugin isolation, sync adapters, outbound-URL guard, build trigger, the role model, the database audit logger, the token-bucket arithmetic, the API-key format and hashing, the billing meter, the session guard, the server-env contract, the route-coverage sweep, tenant paths, job budget, the settlement of quota holds, the forgery-resistant client address, and the same-origin rule that a `SameSite` cookie does not give you |
+| `database` | 404 | Repository read mapping, atomic write path, queue claim, impact analysis, the incremental queuing rule, the authorisation gate, the audit trail, the rate limiter's statement shape and the API-key lifecycle, the quota gate, the unified auth door, the two gates a locked-down write route runs, the atomic reservation gate under a simulated running total, the data-layer role checks, and the once-only settlement of a hold — entirely against a mocked Prisma client |
 | `generator` | 168 | Page assembly, slug collision, eligibility, placeholder rejection, SEO output, AI merge, run scoping, output persistence |
 | `schemas` | 41 | The shared data contracts themselves |
-| `cli` | 59 | Pipeline stages, the standalone worker, queue-drain detection, and the crash guard that keeps a worker alive through a detached rejection |
+| `cli` | 66 | Pipeline stages, the standalone worker, queue-drain detection, and the crash guard that keeps a worker alive through a detached rejection, including one whose reason cannot be turned into text |
 
 **Mocks cannot prove a concurrency property**, and the quota gate's guarantee is
 Postgres's rather than TypeScript's. So it was also checked against the live
-database, with a control run: 40 concurrent transactions on separate
-connections against a limit of 10 admitted 40 under the old read-only check and
-10 under the reserving gate. Both probe tenants were deleted afterwards and the
-database confirmed clean.
+database, twice, each time with a control run: 40 concurrent callers on separate
+connections against a limit of 10 admitted **40** under the original read-only
+check, **37** under a reservation taken outside a transaction, and **10** inside
+one.
+
+The middle number is the point. The mocked suite passed against that version,
+because a mocked client has no notion of a row lock — it would have gone on
+reporting a `FOR UPDATE` that Postgres was releasing immediately as working
+protection. Probe tenants were deleted afterwards and the database confirmed
+clean.
 
 The database suite never opens a connection — one test asserts that explicitly,
 so the guarantee cannot rot silently. AI suites run against injected stubs, so
@@ -1420,6 +1588,11 @@ mean something.
   as a required parameter, so a caller that forgets is a compile error rather
   than an open door. `saveGeneratedPages` and `saveRefreshedPage` are gated too:
   reaching a page was never permission to rewrite it.
+- ~~**A cookie session could be spent by a sibling subdomain.**~~ **Closed.**
+  `SameSite=Lax` compares registrable domains, so `evil.example.com` posting to
+  `app.example.com` is same-site and carries the cookie. Cookie-authenticated
+  mutations now require a matching `Origin`; bearer callers do not, because they
+  are not exposed to it.
 - **The audit trail is best-effort**, written after the action by a listener the
   bus may abandon. Failures are loud, but a lost row is possible.
 - **The rate limiter has never held back a real provider call.** With no
@@ -1449,11 +1622,17 @@ mean something.
   support engineer with read-only access to billing. It is honest for a system
   with one operator and it is the one place a real platform-admin role would
   replace.
-- ~~**The quota gate is not atomic.**~~ **Closed in Phase 31.** The gate now
-  holds what it admits, so a concurrent caller's sum sees the admission. Proven
-  live: 40 concurrent transactions against a limit of 10 admitted 40 before and
-  10 after. A residual softness remains and is smaller and named — an unsettled
-  hold stays charged, which counts *against* the tenant rather than for them.
+- ~~**The quota gate is not atomic.**~~ **Closed in Phase 31 for `enqueueJob`
+  and in the CodeRabbit remediation for `syncProject`** — the first fix covered
+  only the path that already had a transaction to share, and the sync path went
+  on admitting 37 of 40 concurrent callers against a limit of 10 until the
+  external audit found it. Both now hold what they admit inside a transaction,
+  and both admit exactly 10 of 40.
+- ~~**An unsettled hold stays charged for ever.**~~ **Closed.**
+  `GenerationJob.settledAt` is stamped in the same transaction as the
+  adjustment, and `reconcileStrandedHolds` sweeps finished jobs on the worker's
+  idle tick — so a settlement event lost by the best-effort plugin bus is late
+  rather than permanent.
 - Businesses and content templates cannot be imported from CSV, only services
   and locations.
 - `refresh-page` does not yet pass the realigned `schemaOrg` through
