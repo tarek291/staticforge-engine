@@ -18,9 +18,6 @@
     "db:seed": "prisma db seed",
     "db:seed:scale": "tsx prisma/seed-scale.ts"
   },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
-  },
   "dependencies": {
     "@prisma/client": "^6.19.0",
     "@staticforge/core": "workspace:*",

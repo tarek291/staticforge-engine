@@ -8,6 +8,10 @@
     "rootDir": ".",
     "outDir": "./dist"
   },
-  "include": ["src/**/*", "prisma/**/*.ts"],
+  // `prisma.config.ts` is listed explicitly. It sits at the package root rather
+  // than under `src`, so the globs above miss it — and a config the compiler
+  // never sees is one whose typo surfaces as a Prisma CLI failure in a deploy
+  // log instead of as a red squiggle.
+  "include": ["src/**/*", "prisma/**/*.ts", "prisma.config.ts"],
   "exclude": ["dist", "node_modules"]
 }
