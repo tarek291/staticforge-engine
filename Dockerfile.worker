@@ -1,0 +1,113 @@
+# The queue worker, as its own deployable.
+#
+# ## Why this is not on Vercel
+#
+# Vercel runs functions: they are invoked, they answer, they stop. This worker
+# does the opposite — it claims a job, holds a lease it renews while it works,
+# and runs a generation that can take an hour. There is no request to hang it
+# off, and a function that returned early would drop the lease and let another
+# instance redo the tail of the run.
+#
+# So it goes somewhere that runs processes: Railway, Render, Fly, or any box
+# with Docker. What it needs is a long-lived container, `DATABASE_URL`, and a
+# `SIGTERM` on shutdown.
+#
+# ## What SIGTERM has to mean
+#
+# The CLI handles it cooperatively: the first signal finishes the job in flight
+# and then exits, a second exits immediately. **Give it a stop timeout long
+# enough to finish a job** — 30 seconds is the usual platform default and is far
+# too short for a run measured in minutes. A worker killed mid-run loses
+# nothing durable (that is what the lease and the resume are for), but it does
+# waste whatever the run had already paid for.
+#
+# Set the grace period to the longest run you expect, or accept the re-run.
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+FROM node:20-slim AS build
+
+# OpenSSL, which Prisma's engines link against. The slim image does not ship it,
+# and the failure is an engine that will not load — reported as a connection
+# error, several layers away from the missing package.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Corepack honours the `packageManager` pin in package.json, so the image builds
+# with the pnpm version the lockfile was written by.
+RUN corepack enable
+
+# Manifests and the lockfile first, so a change to source does not invalidate
+# the dependency layer. The workspace globs mean every package manifest has to
+# be present before `pnpm install` will resolve.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/schemas/package.json ./packages/schemas/
+COPY packages/core/package.json ./packages/core/
+COPY packages/ai/package.json ./packages/ai/
+COPY packages/database/package.json ./packages/database/
+COPY packages/generator/package.json ./packages/generator/
+COPY packages/cli/package.json ./packages/cli/
+COPY apps/web/package.json ./apps/web/
+# No `packages/templates` here: it is still a `.gitkeep` with no manifest, and
+# COPYing a file that does not exist fails the build.
+
+# The schema is copied before installing because `@staticforge/database` runs
+# `prisma generate` on postinstall, and that reads it. Without it here the
+# install fails on a file that is about to be copied anyway.
+COPY packages/database/prisma ./packages/database/prisma
+
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+# Regenerated after the full copy, in case the schema changed between the two.
+RUN pnpm --filter @staticforge/database exec prisma generate
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+FROM node:20-slim AS runtime
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+RUN corepack enable
+
+COPY --from=build /app ./
+
+# Not root. A worker that spawns the engine as a child process is a worker whose
+# compromise is worth limiting, and `node` is a user this image already has.
+USER node
+
+ENV NODE_ENV=production
+
+# Identity for the lease. A worker's claim is "this instance's own leftovers may
+# be reclaimed on boot", which is only safe if the id is stable across a restart
+# of the *same* instance and distinct between instances. A container id is
+# neither — it changes on every deploy — so most platforms' instance name is the
+# right value and it has to be passed in.
+#
+# Left unset it falls back to the hostname, which is correct on a platform that
+# gives a container a stable one and wrong on a platform that does not.
+# ENV STATICFORGE_INSTANCE_ID=worker-1
+
+# Run from the package that owns `tsx`, and invoke node directly.
+#
+# The obvious `pnpm staticforge worker` is three processes deep — pnpm spawns
+# pnpm spawns tsx — and SIGTERM to PID 1 does not reliably reach the bottom of
+# that chain. The cooperative shutdown described above would simply not run, and
+# the container would be killed mid-job on every deploy.
+#
+# This is one process. It is PID 1, and the signal reaches the handler that
+# knows how to finish a job before exiting.
+WORKDIR /app/packages/cli
+
+# `exec` form. The shell form puts a shell at PID 1, which does not forward
+# signals either.
+CMD ["node", "--import", "tsx", "src/cli.ts", "worker"]

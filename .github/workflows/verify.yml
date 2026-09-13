@@ -1,0 +1,76 @@
+name: verify
+
+# Every push and every pull request. `pnpm verify` has been the gate since the
+# first phase and has been run by hand every time — which means the guarantee it
+# provides has always been "somebody remembered", and the one commit nobody
+# remembers is the one that needed it.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# A second push to the same branch cancels the first. A queue of superseded runs
+# on a branch somebody is iterating on costs minutes and tells nobody anything.
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only. This workflow builds and tests; it does not need to write to the
+# repository, and a token that can is a token that can be misused by anything
+# that finds its way into a dependency.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # Generous rather than default. A cold pnpm store plus a Next build is
+    # several minutes, and a job killed at the default would look like a flake.
+    timeout-minutes: 20
+
+    # No secrets, deliberately, and this is a property worth keeping.
+    #
+    # `data/input` is committed, so the generator runs from files with no
+    # database. Every database test asserts against a mocked client — one of them
+    # asserts that *no connection is opened*, so the guarantee cannot rot — and
+    # every AI suite runs against injected doubles. So a fork's pull request gets
+    # the same verification a trusted branch does.
+    #
+    # The moment this needs a `DATABASE_URL`, that stops being true, and the
+    # first sign will be a green tick on a fork that ran nothing.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable corepack
+        # The repository pins `packageManager: pnpm@11.6.0`. Corepack honours
+        # that pin, so CI runs the version the lockfile was written by rather
+        # than whatever the runner image ships this month.
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install
+        # Frozen, so a lockfile that disagrees with the manifests fails here
+        # rather than resolving to something nobody has run locally.
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify
+        # generate → typecheck → test → web build, in that order and in one
+        # command, because that is the same command a developer runs. Two
+        # definitions of "does it pass" is one definition too many.
+        run: pnpm verify
+
+      - name: Check the build produced a site, not an empty shell
+        # The build succeeds with no generated content and silently ships zero
+        # pages — found by testing exactly that. A green deploy serving nothing
+        # is worse than a failed one, because nobody looks at it.
+        run: |
+          pages=$(node -e "const m=require('./data/output/manifest.json');console.log((m.pages??m).length)")
+          echo "manifest lists $pages page(s)"
+          if [ "$pages" -lt 1 ]; then
+            echo "::error::The build produced no pages. The manifest is empty."
+            exit 1
+          fi
