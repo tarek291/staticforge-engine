@@ -2,8 +2,22 @@ packages:
   - "apps/*"
   - "packages/*"
 allowBuilds:
-  # Prisma's postinstall fetches the query engine and generates the client.
-  '@prisma/client': true
+  # `@prisma/client`'s postinstall tries to run `prisma generate` from wherever
+  # the package was installed, searching upward for a schema in the default
+  # locations. In a pnpm workspace it lands in the virtual store, several
+  # directories away from `packages/database/prisma/schema.prisma`, so it finds
+  # nothing and says so on every install:
+  #
+  #   prisma:warn We could not find your Prisma schema in the default locations
+  #
+  # The warning is accurate and the work is redundant: `@staticforge/database`
+  # runs `prisma generate` in its own postinstall, from the package that owns
+  # the schema, and that is what actually produces the client. Turning this off
+  # removes a warning and an attempt that was never going to succeed.
+  #
+  # `@prisma/engines` stays on — it fetches the query engine binaries, which is
+  # a different job and one nothing else does.
+  '@prisma/client': false
   '@prisma/engines': true
   esbuild: true
   prisma: true
