@@ -38,13 +38,22 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const projectId = process.env["STATICFORGE_PROJECT_ID"]?.trim();
 const locale = process.env["STATICFORGE_LOCALE"]?.trim() ?? "de";
 
-/** Run a workspace script, inheriting stdio so its output is the build log. */
+/**
+ * Run a workspace script, inheriting stdio so its output is the build log.
+ *
+ * `pnpm` directly, not `corepack pnpm`. Corepack is how this repository pins its
+ * package manager and it is the right thing locally — but on Vercel it is
+ * gated behind `ENABLE_EXPERIMENTAL_COREPACK`, which is off by default. The
+ * builder already has pnpm on `PATH`, because it detected the lockfile and used
+ * pnpm to install; going through corepack adds a dependency on a flag nobody
+ * sets and fails with a missing binary rather than anything about pnpm.
+ */
 function run(args, env = {}) {
-  execFileSync("corepack", ["pnpm", ...args], {
+  execFileSync("pnpm", args, {
     cwd: ROOT,
     stdio: "inherit",
     env: { ...process.env, ...env },
-    // `shell` on Windows, where `corepack` is a `.cmd` and cannot be executed
+    // `shell` on Windows, where `pnpm` is a `.cmd` and cannot be executed
     // directly. Harmless elsewhere, and the alternative is a script that only
     // works on the CI runner.
     shell: process.platform === "win32",
@@ -106,4 +115,29 @@ console.log(`[generate-site] ${String(pages.length)} page(s) ready at ${manifest
 // step: an instruction is not a mechanism.
 run(["build:web"], { STATICFORGE_OUTPUT_DIR: dirname(manifest) });
 
-console.log("[generate-site] Built the site from that manifest.");
+// The artifact has to be where the host will look for it, and "where" is
+// `outputDirectory` resolved against the Root Directory — `apps/web/.next`.
+//
+// Getting that wrong does not fail the build. It fails *after* the build, on the
+// host, as "output directory not found", which reads like a missing build rather
+// than a misconfigured path — and the value that produced it is in a dashboard
+// field nobody is looking at. `apps/web/.next` set against a root of `apps/web`
+// resolves to `apps/web/apps/web/.next`, and that is exactly the shape of the
+// mistake.
+//
+// Checked here so the error arrives in the build log, next to the thing that
+// caused it.
+const built = join(ROOT, "apps/web/.next");
+
+if (!existsSync(join(built, "BUILD_ID"))) {
+  console.error(
+    `[generate-site] The web build finished and left no BUILD_ID at
+` +
+      `                ${built}
+` +
+      `                Nothing downstream can serve this.`,
+  );
+  process.exit(1);
+}
+
+console.log(`[generate-site] Built the site from that manifest, into ${built}`);

@@ -43,6 +43,7 @@ would read the wrong place and find nothing.
 | **Include source files outside of the Root Directory** | **on** |
 | Build Command | leave empty — `apps/web/vercel.json` supplies it |
 | Install Command | leave empty — same |
+| Output Directory | leave empty — same |
 
 `apps/web/vercel.json` is read because Vercel reads `vercel.json` **from the
 Root Directory**, not from the repository root. That is the whole reason this
@@ -86,8 +87,29 @@ A correct build shows both kinds in its output: `●` for prerendered pages and
 `ƒ` for the dynamic routes and middleware. If the `ƒ` entries are missing, the
 preset is wrong.
 
-**Clear any Build Command typed into the Vercel UI.** A value there overrides
-`vercel.json`, which is how a fixed configuration comes undone later.
+### Clear the UI overrides, all three of them
+
+`vercel.json` takes precedence over the dashboard for these fields, so the
+values below are pinned in the file. But a value left in the dashboard from an
+earlier attempt is invisible in the repository and outlives every fix committed
+to it, so clear Build Command, Install Command **and Output Directory**.
+
+Output Directory is the one that bites, because it is interpreted **relative to
+the Root Directory**. `apps/web/.next` typed into the field, with a root of
+`apps/web`, means `apps/web/apps/web/.next` — and the deploy fails after a
+successful build with:
+
+```
+Error: No Output Directory named "apps/web/.next" found after the Build completed.
+```
+
+which reads like the build produced nothing. It produced the right thing in the
+right place; the path was doubled.
+
+The correct value is `.next`, and it is in `apps/web/vercel.json` so nobody has
+to know that. The build script also asserts that `apps/web/.next/BUILD_ID`
+exists before it exits, so a future version of this mistake fails in the build
+log rather than after it.
 
 ### Environment variables
 
