@@ -41,16 +41,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable corepack
-        # The repository pins `packageManager: pnpm@11.6.0`. Corepack honours
-        # that pin, so CI runs the version the lockfile was written by rather
-        # than whatever the runner image ships this month.
-        run: corepack enable
+      # Installs pnpm, reading the `packageManager: pnpm@11.6.0` pin from
+      # package.json — so CI runs the version the lockfile was written by rather
+      # than whatever the runner image ships this month.
+      #
+      # It has to come *before* setup-node. The `cache: pnpm` option below works
+      # by running `pnpm store path` to find the directory to cache, so pnpm has
+      # to already be resolvable when that step runs. `corepack enable` alone is
+      # not enough: it installs shims that resolve the real binary lazily, on
+      # first use, and setup-node's cache lookup is the first use — which fails
+      # with "Unable to locate executable file: pnpm" before anything is
+      # installed or tested.
+      #
+      # That is how the first five runs of this workflow failed, every one of
+      # them at the same step, while the build passed locally and on Vercel.
+      - uses: pnpm/action-setup@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
+
+      - name: Enable corepack
+        # Still needed, separately. The root package scripts call
+        # `corepack pnpm ...` internally, so `pnpm verify` shells out through
+        # corepack even though pnpm itself is installed above.
+        run: corepack enable
 
       - name: Install
         # Frozen, so a lockfile that disagrees with the manifests fails here
