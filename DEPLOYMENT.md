@@ -115,13 +115,54 @@ log rather than after it.
 
 | Variable | Required | What it does |
 | --- | --- | --- |
-| `DATABASE_URL` | yes | Postgres. Needed at **build** time as well as runtime, because the build generates content from it. |
+| `DATABASE_URL` | yes | Postgres. Needed at **build** time as well as runtime, because the build generates content from it. **Must be the pooler URL, not `db.<ref>.supabase.co`** — see below. |
 | `SUPABASE_URL` | yes | The project sessions are verified against. |
 | `SUPABASE_ANON_KEY` | yes | The **anon** key. Never the service-role key — see `apps/web/.env.example`. |
 | `STATICFORGE_PROJECT_ID` | yes | Which tenant's site this deployment serves. Without it the build falls back to `data/input`, which is sample data. |
 | `STATICFORGE_LOCALE` | no | Defaults to `de`. |
 | `STATICFORGE_ALLOWED_ORIGINS` | no | Extra hosts a cookie session may post from. Only if the dashboard is served from a different host than the API. |
 | `STATICFORGE_PLATFORM_OPERATOR` | no | Who may set quotas. **Unset in production means nobody can** — that is deliberate, see `packages/database/src/platform.ts`. |
+
+### `DATABASE_URL` must be the pooler, not the direct host
+
+This is the one that will look like a broken deploy and is a connection string.
+
+Supabase's direct host — `db.<ref>.supabase.co` — publishes **no A record**.
+It is IPv6 only:
+
+```
+$ getaddrinfo db.<ref>.supabase.co
+  IPv4 (A)    none
+  IPv6 (AAAA) 2a05:d018:...
+```
+
+Vercel's serverless functions have no IPv6 outbound, so that host is not slow
+from there — it is **unresolvable**. Everything that does not touch the database
+works perfectly, which is what makes it confusing: static pages render, the
+login route answers, the session cookie is set, the middleware lets you through,
+and then the dashboard shows a `500` from the projects endpoint.
+
+Use the **transaction pooler** connection string, which resolves to IPv4:
+
+```
+postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres?pgbouncer=true&connection_limit=1
+```
+
+Copy it from Supabase → Project Settings → Database → Connection string →
+**Transaction pooler**. Note the username is `postgres.<ref>`, not `postgres`.
+
+`?pgbouncer=true` tells Prisma not to use prepared statements, which a
+transaction-mode pooler cannot support. `connection_limit=1` keeps each function
+instance to one connection, because a serverless platform will happily start
+more instances than the pooler has slots.
+
+**Keep the direct URL locally.** A laptop has IPv6, `prisma db push` and
+`prisma db seed` want a direct session, and the pooler is the wrong shape for
+schema changes. The two environments legitimately use different URLs.
+
+The dashboard reports this specifically rather than generically: signed in, with
+an unreachable database, it names the host and says whether the problem is an
+unset variable, a malformed URL, or exactly this.
 
 ### Things to check on the first deploy
 
