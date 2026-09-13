@@ -193,6 +193,40 @@ docker build -f Dockerfile.worker -t staticforge-worker .
 docker run --env DATABASE_URL=... staticforge-worker
 ```
 
+### On Railway
+
+`railway.json` points the builder at `Dockerfile.worker`, so there is nothing to
+configure in the UI beyond the variables below. Create a service from this
+repository and Railway reads it.
+
+Restart policy is `ON_FAILURE` with ten retries rather than `ALWAYS`. A worker
+that exits deliberately — the crash guard giving up after twenty absorbed
+rejections in a minute — should stay down long enough to be noticed. `ALWAYS`
+would restart it into the same pathology forever and turn a loud failure into a
+quiet one.
+
+**Set the stop timeout to at least a few minutes** in the service settings.
+Railway's default grace period is far shorter than a generation run, and the
+CLI's shutdown is cooperative: the first `SIGTERM` finishes the job in flight.
+
+### The worker uses a *different* connection string from the web app
+
+Both go through the pooler, on different ports, and the difference is not
+cosmetic:
+
+| | Port | Why |
+| --- | --- | --- |
+| Web (Vercel) | **6543** transaction | Serverless. Many short-lived instances, each holding a connection for one request. Needs `?pgbouncer=true` because transaction mode cannot hold prepared statements. |
+| Worker (Railway) | **5432** session | One long-lived process. Keeps its own session, so prepared statements work and no flag is needed. |
+
+Pointing the worker at 6543 would work and then behave oddly under load, because
+a transaction-mode pooler hands the same process different backends between
+statements. Pointing the web app at 5432 would exhaust the pool as serverless
+instances multiply.
+
+Verified against this project: the session URL on 5432 connects and reads the
+queue table.
+
 ### Environment
 
 | Variable | Required | What it does |

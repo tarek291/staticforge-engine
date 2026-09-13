@@ -60,10 +60,17 @@ COPY apps/web/package.json ./apps/web/
 # No `packages/templates` here: it is still a `.gitkeep` with no manifest, and
 # COPYing a file that does not exist fails the build.
 
-# The schema is copied before installing because `@staticforge/database` runs
-# `prisma generate` on postinstall, and that reads it. Without it here the
-# install fails on a file that is about to be copied anyway.
+# The schema *and its config* are copied before installing, because
+# `@staticforge/database` runs `prisma generate` on postinstall and reads both.
+#
+# `prisma.config.ts` is easy to miss here and the way it fails is worse than an
+# error: without it Prisma falls back to searching the default locations, finds
+# `prisma/schema.prisma` anyway, and generates — so the install succeeds while
+# behaving differently from every other environment. Then `COPY . .` brings the
+# config in and the *second* generate below uses it. Two generates, two
+# configurations, one image.
 COPY packages/database/prisma ./packages/database/prisma
+COPY packages/database/prisma.config.ts ./packages/database/
 
 RUN pnpm install --frozen-lockfile
 
