@@ -21,10 +21,10 @@ exit code either way.
 A deploy that fails is an incident. A deploy that succeeds and serves an empty
 site is an incident nobody opens, because every signal says it worked.
 
-So the build generates its own content. `pnpm vercel-build` runs
-`scripts/generate-site.mjs`, which generates, **refuses to continue if the
-manifest is empty**, and then runs the web build with `STATICFORGE_OUTPUT_DIR`
-pointed at whatever it just wrote.
+So the build generates its own content. `scripts/generate-site.mjs` generates,
+**refuses to continue if the manifest is empty**, and then runs the web build
+with `STATICFORGE_OUTPUT_DIR` pointed at whatever it just wrote. Vercel runs it
+as the build command; locally it is `pnpm build:site`.
 
 That last part matters: database mode writes to a per-project subdirectory, and
 the app's fallback points at the root. Left to a printed instruction, a build
@@ -34,59 +34,60 @@ would read the wrong place and find nothing.
 
 ## Web app — Vercel
 
-### Root Directory decides everything else. Read this part.
-
-Vercel reads `vercel.json` **from the Root Directory**, not from the repository
-root. Point Root Directory at `apps/web` and the `vercel.json` in this
-repository is never opened — no build command, no install command, no output
-directory. None of the configuration below applies, and the failure surfaces as
-something unrelated:
-
-```
-Running "pnpm vercel-build"
-[ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL] Command "vercel-build" not found
-```
-
-That error is about the script; the cause is the setting.
-
-**Set Root Directory to the repository root — leave the field empty, or `.`**
-
-That is the configuration this repository is built for, and it is not a
-preference. The build runs the generator, which lives in a sibling workspace
-package, and writes to `data/output` at the repository root. `apps/web` on its
-own cannot build this site.
-
-With Root Directory empty, `vercel.json` supplies the rest and there is nothing
-to type into the UI:
+### The settings, in full
 
 | Setting | Value |
 | --- | --- |
-| Build command | `pnpm vercel-build` |
-| Install command | `pnpm install --frozen-lockfile` |
-| Output directory | `apps/web/.next` |
+| **Root Directory** | `apps/web` |
+| **Framework Preset** | Next.js |
+| **Include source files outside of the Root Directory** | **on** |
+| Build Command | leave empty — `apps/web/vercel.json` supplies it |
+| Install Command | leave empty — same |
 
-**Clear any Build Command you typed into the Vercel UI.** A value there
-overrides `vercel.json`, which is how the setting above goes wrong quietly.
+`apps/web/vercel.json` is read because Vercel reads `vercel.json` **from the
+Root Directory**, not from the repository root. That is the whole reason this
+file lives where it does, and it is worth knowing before something goes wrong:
+point Root Directory somewhere else and this configuration is silently not
+applied.
 
-### If you keep Root Directory at `apps/web`
+### Why Root Directory is `apps/web` and not the repository root
 
-`apps/web/package.json` also has a `vercel-build`, so the command resolves and
-Vercel's Next.js detection runs it without a custom Build Command. It delegates
-to the same script, which finds the repository root from its own location rather
-than from the working directory.
+Vercel detects the framework by reading `next` from the **Root Directory's**
+`package.json`. The repository root's manifest has one dependency — `cross-env`
+— so pointing Root Directory there produces:
 
-Two things to check in that configuration, because `vercel.json` is still being
-ignored:
+```
+Warning: Could not identify Next.js version, ensure it is defined as a project dependency.
+Error: No Next.js version detected.
+```
 
-- **Enable "Include source files outside of the Root Directory in the Build
-  Step."** Without it the sibling packages are not there and the generator
-  cannot run.
-- Set the environment variables on the project as normal; they are read the same
-  way either way.
+The build command still works from `apps/web`: `generate-site.mjs` resolves the
+repository root from its own file location rather than from the working
+directory, so the generator and the workspace packages are all reachable. What
+does *not* work from the repository root is Vercel's framework detection, and
+that is not something a build command can fix.
 
-The repository-root configuration is the one that is exercised locally and in
-CI. This one is a convenience, and if it misbehaves the first thing to try is
-moving Root Directory back.
+**"Include source files outside of the Root Directory" must be on.** Without it
+the sibling workspace packages are not in the build context, and the generator
+cannot run.
+
+### Do not set Framework Preset to "Other"
+
+It resolves the detection error and breaks the application, which is the worse
+of the two outcomes because nothing reports it.
+
+"Other" tells Vercel to publish a directory of static files. This app is not
+that. It has six API routes — sign-in, three dashboard endpoints, the sync
+webhook — and a `middleware.ts` that guards `/dashboard`. Under "Other" none of
+them are built as serverless functions. The marketing pages would render, every
+authenticated path would 404, and the deploy would be green.
+
+A correct build shows both kinds in its output: `●` for prerendered pages and
+`ƒ` for the dynamic routes and middleware. If the `ƒ` entries are missing, the
+preset is wrong.
+
+**Clear any Build Command typed into the Vercel UI.** A value there overrides
+`vercel.json`, which is how a fixed configuration comes undone later.
 
 ### Environment variables
 
