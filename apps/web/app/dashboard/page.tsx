@@ -138,8 +138,70 @@ function diagnoseDatabase(): DatabaseDiagnosis {
 
   return {
     headline: "DATABASE_URL is set, but the database did not answer.",
-    detail:
-      `The host is ${host}. Check that it accepts connections from this ` +
-      "deployment, and that the credential and database name are right.",
+    detail: describeConnection(url, host),
   };
+}
+
+/**
+ * Describe a connection string precisely enough to fix it, without leaking it.
+ *
+ * "Check that the credential is right" is not a diagnosis, it is a shrug. The
+ * fields that are actually wrong in practice are structural and none of them are
+ * secret: the pooler needs a *different username* from the direct host, and
+ * copying the direct URL and swapping only the hostname is the mistake almost
+ * everybody makes — it fails as an authentication error, which reads like a
+ * wrong password and sends people to reset one that was fine.
+ *
+ * The password is never rendered, only whether one is present. Everything else
+ * here — username, port, query flags — is already implied by the host, and a
+ * signed-in operator staring at a broken dashboard needs it.
+ */
+function describeConnection(url: string, host: string): string {
+  let parsed: URL;
+
+  try {
+    parsed = new URL(url);
+  } catch {
+    return `The host is ${host}.`;
+  }
+
+  const user = decodeURIComponent(parsed.username);
+  const port = parsed.port === "" ? "(default)" : parsed.port;
+  const pooled = host.includes("pooler.supabase.com");
+
+  // On the pooler the username carries the project reference, which the
+  // hostname also carries — so this comparison needs nothing secret to make.
+  const ref = host.split(".")[0]?.split("-").slice(3).join("-") ?? "";
+  const looksDirect = pooled && !user.includes(".");
+
+  const parts = [
+    `host ${host}`,
+    `port ${port}`,
+    `user ${user === "" ? "(none)" : user}`,
+    parsed.password === "" ? "no password" : "password present",
+    parsed.searchParams.get("pgbouncer") === "true"
+      ? "pgbouncer=true"
+      : "no pgbouncer flag",
+  ];
+
+  const summary = parts.join(" · ");
+
+  if (looksDirect) {
+    return (
+      `${summary}. The username has no project reference, which the pooler ` +
+      `requires: it must be postgres.<project-ref>, not postgres. Copying the ` +
+      `direct connection string and changing only the hostname leaves this ` +
+      `wrong, and the pooler rejects it as a failed login rather than as a ` +
+      `malformed user${ref === "" ? "" : ` — the reference is in the host`}.`
+    );
+  }
+
+  if (pooled && parsed.port === "6543" && parsed.searchParams.get("pgbouncer") !== "true") {
+    return (
+      `${summary}. Port 6543 is the transaction pooler, which cannot hold ` +
+      `prepared statements — add ?pgbouncer=true so Prisma stops using them.`
+    );
+  }
+
+  return `${summary}. Check the credential and that this deployment may connect.`;
 }
