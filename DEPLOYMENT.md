@@ -34,16 +34,59 @@ would read the wrong place and find nothing.
 
 ## Web app — Vercel
 
-Import the repository and set **Root Directory** to the repository root, not
-`apps/web`. The build needs the whole workspace.
+### Root Directory decides everything else. Read this part.
 
-`vercel.json` sets the rest:
+Vercel reads `vercel.json` **from the Root Directory**, not from the repository
+root. Point Root Directory at `apps/web` and the `vercel.json` in this
+repository is never opened — no build command, no install command, no output
+directory. None of the configuration below applies, and the failure surfaces as
+something unrelated:
+
+```
+Running "pnpm vercel-build"
+[ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL] Command "vercel-build" not found
+```
+
+That error is about the script; the cause is the setting.
+
+**Set Root Directory to the repository root — leave the field empty, or `.`**
+
+That is the configuration this repository is built for, and it is not a
+preference. The build runs the generator, which lives in a sibling workspace
+package, and writes to `data/output` at the repository root. `apps/web` on its
+own cannot build this site.
+
+With Root Directory empty, `vercel.json` supplies the rest and there is nothing
+to type into the UI:
 
 | Setting | Value |
 | --- | --- |
 | Build command | `pnpm vercel-build` |
 | Install command | `pnpm install --frozen-lockfile` |
 | Output directory | `apps/web/.next` |
+
+**Clear any Build Command you typed into the Vercel UI.** A value there
+overrides `vercel.json`, which is how the setting above goes wrong quietly.
+
+### If you keep Root Directory at `apps/web`
+
+`apps/web/package.json` also has a `vercel-build`, so the command resolves and
+Vercel's Next.js detection runs it without a custom Build Command. It delegates
+to the same script, which finds the repository root from its own location rather
+than from the working directory.
+
+Two things to check in that configuration, because `vercel.json` is still being
+ignored:
+
+- **Enable "Include source files outside of the Root Directory in the Build
+  Step."** Without it the sibling packages are not there and the generator
+  cannot run.
+- Set the environment variables on the project as normal; they are read the same
+  way either way.
+
+The repository-root configuration is the one that is exercised locally and in
+CI. This one is a convenience, and if it misbehaves the first thing to try is
+moving Root Directory back.
 
 ### Environment variables
 

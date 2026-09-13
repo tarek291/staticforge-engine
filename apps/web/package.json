@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "vercel-build": "node ../../scripts/generate-site.mjs",
     "start": "next start",
     "typecheck": "tsc --noEmit"
   },
