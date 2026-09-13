@@ -59,7 +59,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # 22, not 20, because pnpm 11.6.0 refuses to run below Node 22.13 —
+          # which is what actually failed the first six runs of this workflow,
+          # at this step, with pnpm's own message buried in an annotation:
+          #
+          #   warn: This version of pnpm requires at least Node.js v22.13
+          #
+          # It looked like a caching or corepack-ordering problem and was
+          # neither. `engines.node` in package.json said `>=20` and was wrong;
+          # it now says what the pinned package manager needs.
+          node-version: 22
           cache: pnpm
 
       - name: Enable corepack

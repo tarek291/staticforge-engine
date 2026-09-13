@@ -5,7 +5,7 @@
   "description": "StaticForge Engine — schema-driven static site generation monorepo.",
   "packageManager": "pnpm@11.6.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "workspaces": [
     "apps/*",

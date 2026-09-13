@@ -30,7 +30,8 @@ import { defineConfig } from "prisma/config";
  *
  * ## Why `process.loadEnvFile` and not `dotenv`
  *
- * It is built into Node from 20.12, and the repository already requires Node 20.
+ * It is built into Node from 20.12, and this repository requires Node 22.13 —
+ * the floor its pinned pnpm imposes.
  * Adding a dependency to read a file the runtime can already read would be a
  * package to keep updated for no capability.
  *
